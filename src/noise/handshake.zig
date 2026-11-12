@@ -82,23 +82,12 @@ pub const Local = struct {
     }
 };
 
-/// Session key material for the session module. `send`/`recv` are already
-/// oriented for this side. Wipe after copying into the keypair.
-pub const Keys = struct {
-    send: SymKey,
-    recv: SymKey,
-    /// Our index: incoming transport messages carry it as receiver.
-    local_index: u32,
-    /// Peer's index: we put it in outgoing transport messages.
-    remote_index: u32,
-    /// The responder must not send transport data until it has received
-    /// some from the initiator (whitepaper 5.4.6 / kernel keypair confirmation).
-    is_initiator: bool,
-
-    pub fn wipe(self: *Keys) void {
-        crypto.wipe(self);
-    }
-};
+/// Session key material, handed to `session.Peer.initiatorSession` /
+/// `responderSession`: {send, recv, local_index, remote_index, is_initiator},
+/// already oriented for this side. The responder must not send transport
+/// data until it has received some from the initiator (whitepaper 5.4.6).
+/// Wipe after use.
+pub const Keys = @import("../session/root.zig").Seed;
 
 pub const State = enum { zeroed, created_initiation, consumed_initiation, created_response, consumed_response };
 

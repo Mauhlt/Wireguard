@@ -520,3 +520,37 @@ test "mutation fuzz (deterministic; std.testing.fuzz is not available on Windows
         try exercise(ctx, buf[0..len]);
     }
 }
+
+test "end to end: handshake seeds drive session.Peer transport both ways" {
+    const session = @import("../session/root.zig");
+    var pair = try Pair.init(psk);
+    var a = session.Peer.init(.none);
+    var b = session.Peer.init(.none);
+    _ = a.start();
+    _ = b.start();
+    const t: i64 = 5 * ns_per_s;
+
+    const m1 = try pair.initiate(e_i, wall, t);
+    a.initiationSent(t);
+    try pair.receive(&m1, t);
+    const m2 = try pair.respond(t);
+    var sr = try pair.hr.deriveKeys();
+    _ = b.responderSession(&sr, t);
+    try testing.expect(crypto.isZero(32, &sr.send)); // wiped by session
+    try pair.hi.consumeResponse(&pair.li, &m2);
+    var si = try pair.hi.deriveKeys();
+    _ = a.initiatorSession(&si, t);
+
+    var pkt: [256]u8 = undefined;
+    var out: [256]u8 = undefined;
+    // Initiator confirms with data; responder can then answer.
+    const tx = try a.encrypt(t, "ping", 1420, &pkt);
+    const rx = try b.decrypt(t, pkt[0..tx.len], &out);
+    try testing.expect(rx.confirmed);
+    try testing.expectEqualSlices(u8, "ping", rx.plaintext[0..4]);
+    const tx2 = try b.encrypt(t, "pong", 1420, &pkt);
+    const rx2 = try a.decrypt(t, pkt[0..tx2.len], &out);
+    try testing.expectEqualSlices(u8, "pong", rx2.plaintext[0..4]);
+    _ = a.deinit();
+    _ = b.deinit();
+}
