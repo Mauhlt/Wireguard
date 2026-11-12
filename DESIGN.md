@@ -100,7 +100,7 @@ be encoded the same way each time (recommended: IP bytes || BE16 port).
 Constants: initiations accepted at most once per 1/50 s per peer
 (`min_initiation_interval_ns`), cookie secret 120 s, stored cookie used for
 115 s (120 - 5 s latency), timestamps whitened to 2^24 ns — all as the kernel.
-Golden vectors: testdata/noise_ref.py (independent Python implementation).
+Golden vectors: produced by an independent reference implementation (not in this repo; Zig-only rule); the recorded bytes live in src/noise/tests.zig.
 
 ## session (src/session)
 
