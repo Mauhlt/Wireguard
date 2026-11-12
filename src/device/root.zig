@@ -8,7 +8,9 @@ pub const AllowedIps = allowed_ips.AllowedIps;
 pub const os = @import("os.zig");
 pub const index_table = @import("index_table.zig");
 pub const ratelimit = @import("ratelimit.zig");
+pub const show = @import("show.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("wg_compat_test.zig");
 }
