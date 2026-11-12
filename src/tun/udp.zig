@@ -98,6 +98,12 @@ pub const UdpTun = struct {
         return u.local_port;
     }
 
+    /// Driver side: send writes to 127.0.0.1:`peer_port` (instead of waiting
+    /// to learn the peer from the first received datagram).
+    pub fn setPeerPort(u: *UdpTun, peer_port: u16) void {
+        u.peer = loopbackAddr(peer_port);
+    }
+
     pub fn tun(u: *UdpTun) Tun {
         return .{ .ptr = u, .vtable = &vtable };
     }
@@ -281,7 +287,7 @@ test "UdpTun: driver -> read, write -> driver (loopback, two sockets)" {
     try std.testing.expectEqual(@as(u64, 1), dev.dropped_no_peer);
 
     // Driver -> device: the driver needs a peer, so point it at the device.
-    drv.peer = loopbackAddr(dev.port());
+    drv.setPeerPort(dev.port());
     try d.write("\x45ping");
     try @import("queue.zig").waitReadable(t.waitHandle(), 2000);
     try std.testing.expectEqualStrings("\x45ping", (try t.read(&buf)).?);
