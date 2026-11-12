@@ -6,6 +6,8 @@ pub const config = @import("config.zig");
 pub const allowed_ips = @import("allowed_ips.zig");
 pub const AllowedIps = allowed_ips.AllowedIps;
 pub const os = @import("os.zig");
+pub const index_table = @import("index_table.zig");
+pub const ratelimit = @import("ratelimit.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
