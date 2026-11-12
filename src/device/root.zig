@@ -5,6 +5,7 @@ pub const ip = @import("ip.zig");
 pub const config = @import("config.zig");
 pub const allowed_ips = @import("allowed_ips.zig");
 pub const AllowedIps = allowed_ips.AllowedIps;
+pub const os = @import("os.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
