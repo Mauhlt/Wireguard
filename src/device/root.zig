@@ -3,6 +3,8 @@
 pub const keys = @import("keys.zig");
 pub const ip = @import("ip.zig");
 pub const config = @import("config.zig");
+pub const allowed_ips = @import("allowed_ips.zig");
+pub const AllowedIps = allowed_ips.AllowedIps;
 
 test {
     @import("std").testing.refAllDecls(@This());
