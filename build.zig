@@ -50,4 +50,71 @@ pub fn build(b: *std.Build) void {
         tun_check.dependOn(&check.step);
     }
     test_step.dependOn(tun_check);
+
+    // Interop / known-answer harness (tests/interop, see its README.md).
+    const interop = b.step("interop", "Known-answer + cross-implementation tests, FakeTun/UdpTun loopback");
+    const golden = b.addTest(.{
+        .name = "interop-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/interop/golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "WireGuard", .module = mod }},
+        }),
+    });
+    interop.dependOn(&b.addRunArtifact(golden).step);
+
+    // Two zwg processes over 127.0.0.1 with UdpTun TUNs (SKIPs until zwg
+    // advertises `up <conf> --tun udp:<port>`).
+    const loopback = b.addExecutable(.{
+        .name = "zwg-interop-loopback",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/interop/loopback.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "WireGuard", .module = mod }},
+        }),
+    });
+    const run_loopback = b.addRunArtifact(loopback);
+    run_loopback.addArtifactArg(exe);
+    interop.dependOn(&run_loopback.step);
+
+    // The same runner against refpeer (reference model + UdpTun): proves the
+    // harness and UdpTun across real processes before zwg exists.
+    const refpeer = b.addExecutable(.{
+        .name = "zwg-interop-refpeer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/interop/refpeer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "WireGuard", .module = mod }},
+        }),
+    });
+    const run_loopback_ref = b.addRunArtifact(loopback);
+    run_loopback_ref.addArtifactArg(refpeer);
+    interop.dependOn(&run_loopback_ref.step);
+
+    // Cross-implementation over real processes: zwg (A) <-> refpeer (B).
+    const run_loopback_cross = b.addRunArtifact(loopback);
+    run_loopback_cross.addArtifactArg(exe);
+    run_loopback_cross.addArtifactArg(refpeer);
+    interop.dependOn(&run_loopback_cross.step);
+
+    // Live interop with WireGuard for Windows: built here, run by hand from an
+    // elevated prompt (tests/interop/README.md).
+    if (target.result.os.tag == .windows) {
+        const live = b.addExecutable(.{
+            .name = "zwg-interop-live",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/interop/live.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "WireGuard", .module = mod }},
+            }),
+        });
+        const live_step = b.step("interop-live", "Build zwg-interop-live.exe (run it elevated; see tests/interop/README.md)");
+        live_step.dependOn(&b.addInstallArtifact(live, .{}).step);
+        live_step.dependOn(b.getInstallStep());
+        interop.dependOn(&live.step); // keep it compiling
+    }
 }

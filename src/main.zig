@@ -22,6 +22,8 @@ const usage =
     \\  pubkey                 read a private key on stdin, print its public key
     \\  show <file.conf>       show a configuration (keys other than public ones hidden)
     \\  up <file.conf>         bring the tunnel up (foreground; needs Administrator on Windows)
+    \\  up <file.conf> --tun udp:<port>
+    \\                         test mode: the TUN is a 127.0.0.1 UDP socket (tests/interop)
     \\  down <name|file.conf>  stop a tunnel started with `zwg up`
     \\
 ;
@@ -86,10 +88,14 @@ fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.I
         try dev.show.write(out, interfaceName(args[1]), &c, null, null, 0);
         return 0;
     }
-    if (std.mem.eql(u8, cmd, "up") and args.len == 2) {
+    if (std.mem.eql(u8, cmd, "up") and (args.len == 2 or (args.len == 4 and std.mem.eql(u8, args[2], "--tun")))) {
+        const test_tun: ?u16 = if (args.len == 4) wg.tun.UdpTun.parseSpec(args[3]) catch {
+            try errw.writeAll("zwg: --tun expects udp:<port>\n");
+            return 1;
+        } else null;
         var c = (try loadConfig(gpa, io, args[1], errw)) orelse return 1;
         defer c.deinit();
-        return up(gpa, io, interfaceName(args[1]), &c, out, errw);
+        return up(gpa, io, interfaceName(args[1]), &c, test_tun, out, errw);
     }
     if (std.mem.eql(u8, cmd, "down") and args.len == 2) {
         const name = interfaceName(args[1]);
@@ -134,7 +140,7 @@ fn loadConfig(gpa: std.mem.Allocator, io: std.Io, path: []const u8, errw: *std.I
     return c;
 }
 
-fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Config, out: *std.Io.Writer, errw: *std.Io.Writer) !u8 {
+fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Config, test_tun: ?u16, out: *std.Io.Writer, errw: *std.Io.Writer) !u8 {
     const builtin = @import("builtin");
     const tun = wg.tun;
     if (comptime builtin.os.tag == .ios) {
@@ -169,22 +175,39 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
     }
 
     const mtu = c.interface.mtu orelse tun.default_mtu;
-    var native = tun.Native.open(name, .{ .mtu = mtu }) catch |err| {
-        switch (err) {
-            error.AccessDenied => if (comptime builtin.os.tag == .windows)
-                try errw.print("zwg: {s}\n", .{tun.windows.elevation_hint})
-            else
-                try errw.writeAll("zwg: creating a TUN interface needs root / CAP_NET_ADMIN\n"),
-            else => if (comptime builtin.os.tag == .windows and @hasDecl(tun.windows, "wintun_hint")) {
-                if (err == error.WintunNotFound) {
-                    try errw.print("zwg: {s}\n", .{tun.windows.wintun_hint});
-                } else try errw.print("zwg: cannot create the TUN interface: {s}\n", .{@errorName(err)});
-            } else try errw.print("zwg: cannot create the TUN interface: {s}\n", .{@errorName(err)}),
-        }
-        return 1;
+    // Test mode (tests/interop): a UdpTun on 127.0.0.1 instead of an OS
+    // adapter; no privileges needed, addresses and routes are no-ops.
+    var udp_tun: tun.UdpTun = undefined;
+    var native: tun.Native = undefined;
+    var tun_open = false;
+    defer if (tun_open) {
+        if (test_tun != null) udp_tun.close() else native.close();
     };
-    defer native.close();
-    const t = native.tun();
+    const t: tun.Tun = if (test_tun) |port| blk: {
+        udp_tun = tun.UdpTun.open(port, mtu) catch |err| {
+            try errw.print("zwg: --tun udp:{d}: {s}\n", .{ port, @errorName(err) });
+            return 1;
+        };
+        tun_open = true;
+        break :blk udp_tun.tun();
+    } else blk: {
+        native = tun.Native.open(name, .{ .mtu = mtu }) catch |err| {
+            switch (err) {
+                error.AccessDenied => if (comptime builtin.os.tag == .windows)
+                    try errw.print("zwg: {s}\n", .{tun.windows.elevation_hint})
+                else
+                    try errw.writeAll("zwg: creating a TUN interface needs root / CAP_NET_ADMIN\n"),
+                else => if (comptime builtin.os.tag == .windows and @hasDecl(tun.windows, "wintun_hint")) {
+                    if (err == error.WintunNotFound) {
+                        try errw.print("zwg: {s}\n", .{tun.windows.wintun_hint});
+                    } else try errw.print("zwg: cannot create the TUN interface: {s}\n", .{@errorName(err)});
+                } else try errw.print("zwg: cannot create the TUN interface: {s}\n", .{@errorName(err)}),
+            }
+            return 1;
+        };
+        tun_open = true;
+        break :blk native.tun();
+    };
     for (c.interface.addresses) |a| try t.setAddress(toTunCidr(a));
     for (c.peers) |*p| for (p.allowed_ips) |a| t.addRoute(toTunCidr(a)) catch |err| {
         try errw.print("zwg: warning: route {f}: {s}\n", .{ a, @errorName(err) });
