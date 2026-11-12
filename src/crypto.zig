@@ -334,7 +334,7 @@ test "BLAKE2s-256: RFC 7693 appendix B ('abc'), split parts" {
 
 test "WireGuard initial chaining key and hash" {
     // Ci = Hash(construction), Hi = Hash(Ci || identifier); cross-checked
-    // with Python hashlib.blake2s (testdata/noise_ref.py).
+    // with an independent BLAKE2s reference (recorded values).
     const ck = hash(&.{"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"});
     try testing.expectEqual(hexTo(32, "60e26daef327efc02ec335e2a025d2d016eb4206f87277f52d38d1988b78cd36"), ck);
     const h = hash(&.{ &ck, "WireGuard v1 zx2c4 Jason@zx2c4.com" });
