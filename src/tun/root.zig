@@ -28,6 +28,16 @@ pub const Cidr = @import("cidr.zig").Cidr;
 pub const queue = @import("queue.zig");
 pub const FakeTun = @import("fake.zig").FakeTun;
 
+/// Per-OS backend modules (empty structs on other targets).
+pub const windows = if (builtin.os.tag == .windows) @import("windows.zig") else struct {};
+
+/// The real TUN for the target OS. Each has `open(name, options)`, `close()`
+/// and `tun() Tun` (iOS differs: see ios.zig).
+pub const Native = switch (builtin.os.tag) {
+    .windows => windows.Wintun,
+    else => void,
+};
+
 /// What the event loop waits on. Windows: a waitable HANDLE (use
 /// WaitForMultipleObjects). Elsewhere: a file descriptor that polls readable
 /// (POLLIN / EVFILT_READ).
@@ -120,4 +130,5 @@ test {
     _ = @import("cidr.zig");
     _ = @import("queue.zig");
     _ = @import("fake.zig");
+    if (builtin.os.tag == .windows) _ = @import("windows.zig");
 }
