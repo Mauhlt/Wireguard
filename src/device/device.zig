@@ -80,8 +80,6 @@ pub const Options = struct {
     private_key: crypto.PrivateKey,
     /// null or 0 = any free port.
     listen_port: ?u16 = null,
-    /// Bind only 127.0.0.1 / ::1 (tests).
-    loopback_only: bool = false,
     peers: []const PeerConfig = &.{},
 };
 
@@ -192,7 +190,7 @@ pub const Device = struct {
         limiter.* = .init(d.rng);
         errdefer d.teardown();
 
-        try d.bind(options.listen_port orelse 0, options.loopback_only);
+        try d.bind(options.listen_port orelse 0);
         for (options.peers) |*pc| _ = try d.addPeer(pc);
         return d;
     }
@@ -227,8 +225,7 @@ pub const Device = struct {
         d.gpa.free(d.flush_buf);
     }
 
-    fn bind(d: *Device, port: u16, loopback_only: bool) InitError!void {
-        _ = loopback_only; // sockets bind the wildcard; loopback tests address 127.0.0.1
+    fn bind(d: *Device, port: u16) InitError!void {
         d.udp4 = try os.Udp.open(.v4, port);
         d.listen_port = d.udp4.?.localPort();
         // Same port for IPv6; a host without IPv6 just runs IPv4-only.
@@ -245,7 +242,7 @@ pub const Device = struct {
         if (d.udp6) |*u| u.close();
         d.udp4 = null;
         d.udp6 = null;
-        try d.bind(port, false);
+        try d.bind(port);
     }
 
     pub fn addPeer(d: *Device, pc: *const PeerConfig) InitError!PeerId {
@@ -311,7 +308,6 @@ pub const Device = struct {
                 handles[n] = h;
                 n += 1;
             }
-            const first_source = n;
             if (d.udp4) |*u| {
                 handles[n] = u.waitHandle();
                 n += 1;
@@ -322,7 +318,6 @@ pub const Device = struct {
             }
             handles[n] = d.tun.waitHandle();
             n += 1;
-            _ = first_source;
 
             const timeout: ?u64 = if (more) 0 else if (deadline) |t| @intCast(@max(t - now, 0)) else null;
             const ready = os.wait(handles[0..n], timeout) catch return error.Unexpected;
