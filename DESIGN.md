@@ -68,17 +68,39 @@ pub fn hexTo(comptime n: usize, comptime s: []const u8) [n]u8;        // test-ve
 
 ## noise (src/noise)
 
-Pure, no I/O, no clock reads (time passed in). Message structs with exact wire
-layout (little-endian, type byte + 3 reserved zero bytes):
-`Initiation` (148 B, type 1), `Response` (92 B, type 2), `CookieReply` (64 B,
-type 3). API: `Handshake.init(local static, peer static, psk)`,
-`createInitiation(now, sender_index) -> Initiation`,
-`consumeInitiation(msg, now) -> peer static + state`, `createResponse`,
-`consumeResponse`, `deriveKeys() -> session.Keypair seeds {send, recv, local_index, remote_index}`.
-MAC1 always; MAC2 + cookie mechanism (`CookieChecker`, `CookieGenerator`, under-load
-handling with a caller-supplied `under_load: bool`). Replay protection on
-initiations via TAI64N monotonic timestamp per peer. Constant-time compares.
-Known-answer tests against published vectors / values produced by `wg`.
+Pure, no I/O, no clock reads. Callers pass `wall_ns: i96` (wall clock, only
+for the TAI64N timestamp), `now: i64` (monotonic ns: rate limiting, cookie
+ages) and a `std.Random` (use a CSPRNG, e.g. `std.Random.IoSource`) for
+ephemerals, cookie nonces and cookie secrets. Not thread-safe: the device
+serialises. A failed step never modifies the handshake.
+
+Wire layouts (extern structs of byte arrays, align 1, comptime-asserted sizes;
+first 4 bytes = LE u32 type, so non-zero reserved bytes are rejected; exact
+lengths): `Initiation` (148, type 1), `Response` (92, type 2), `CookieReply`
+(64, type 3). `messageType(bytes) ?MessageType` classifies a datagram
+(transport = type 4, len >= 32). `X.parse(bytes) !*const X` views without copying.
+
+```zig
+Local.init(private) -> Local {private, public}
+CookieChecker.init(&local.public)                          // one per device
+  .check(msg_bytes, src_bytes, now, under_load, rng) -> .invalid | .ok | .need_cookie
+  .createReply(msg_bytes, src_bytes, now, rng) -> CookieReply   // on .need_cookie
+Handshake.init(&local, peer_public, psk)                   // one per peer; .cookie = CookieGenerator
+  .createInitiation(&local, wall_ns, now, sender_index, rng) !Initiation   (macs filled)
+consumeInitiationStatic(&local, *const Initiation) !InitiationStart  // -> .remote_static: look up peer
+  peer.hs.consumeInitiation(&start, now) !void             // timestamp replay + flood check
+  peer.hs.createResponse(now, sender_index, rng) !Response
+  peer.hs.consumeResponse(&local, *const Response) !void   // device found hs by receiverIndex()
+  peer.hs.deriveKeys() !session.Seed {send, recv, local_index, remote_index, is_initiator}
+  peer.hs.cookie.consumeReply(*const CookieReply, now) !void
+```
+`.ok` under load means mac2 was valid; the device still applies its
+per-source-IP handshake rate limiter. `src_bytes` is opaque to noise but must
+be encoded the same way each time (recommended: IP bytes || BE16 port).
+Constants: initiations accepted at most once per 1/50 s per peer
+(`min_initiation_interval_ns`), cookie secret 120 s, stored cookie used for
+115 s (120 - 5 s latency), timestamps whitened to 2^24 ns — all as the kernel.
+Golden vectors: testdata/noise_ref.py (independent Python implementation).
 
 ## session (src/session)
 
