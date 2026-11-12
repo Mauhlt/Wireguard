@@ -27,21 +27,43 @@ No module reaches into another's internals; only the public API below.
 
 ## Shared types (src/crypto.zig, owned by noise agent, frozen early)
 
+As implemented (all allocation-free; see the file's doc comments for buffer rules):
+
 ```zig
-pub const key_len = 32;
+pub const key_len = 32;  hash_len = 32;  mac_len = 16;  tag_len = 16;  xnonce_len = 24;  tai64n_len = 12;
 pub const PrivateKey = [32]u8;   // clamped X25519 scalar
 pub const PublicKey  = [32]u8;
 pub const PresharedKey = [32]u8; // all zero = none
 pub const SymKey = [32]u8;
-pub fn publicKey(priv: PrivateKey) PublicKey;
+pub const Tai64n = [12]u8;
+pub const AuthError = error{AuthenticationFailed};
+pub fn clampPrivateKey(k: *PrivateKey) void;
+pub fn generatePrivateKey(io: std.Io) PrivateKey;                    // clamped
+pub fn publicKey(priv: PrivateKey) PublicKey;                         // clamps internally, = `wg pubkey`
 pub fn dh(priv: PrivateKey, pub_: PublicKey) error{IdentityElement}![32]u8;
-pub fn hash(parts: []const []const u8) [32]u8;              // BLAKE2s-256
-pub fn mac(key: []const u8, parts: []const []const u8) [16]u8;  // keyed BLAKE2s-128
-pub fn hmac(key: []const u8, data: []const u8) [32]u8;      // HMAC-BLAKE2s
-pub fn kdf1/kdf2/kdf3(key, input) ...                       // HKDF per spec
-pub fn aead(...) / xaead(...)                                // ChaCha20Poly1305 / XChaCha20Poly1305
-pub fn tai64n(now_ns: i96) [12]u8;
-pub fn secureZero(...)                                        // wipe helpers
+pub fn hash(parts: []const []const u8) [32]u8;                       // BLAKE2s-256
+pub fn mac(key: []const u8, parts: []const []const u8) [16]u8;       // keyed BLAKE2s-128
+pub fn hmac(key: []const u8, data: []const u8) [32]u8;               // HMAC-BLAKE2s
+pub fn hmacParts(key: []const u8, parts: []const []const u8) [32]u8;
+pub fn kdf1(key: *const [32]u8, input: []const u8) [32]u8;           // whitepaper KDF_n
+pub fn kdf2(key: *const [32]u8, input: []const u8) [2][32]u8;
+pub fn kdf3(key: *const [32]u8, input: []const u8) [3][32]u8;
+pub fn aeadNonce(counter: u64) [12]u8;                                // 4 zero bytes || LE64
+// out.len == plain.len + 16; out may alias plain exactly (in place)
+pub fn aeadEncrypt(out: []u8, key: *const SymKey, counter: u64, plain: []const u8, ad: []const u8) void;
+// out.len == sealed.len - 16; in place allowed; out zeroed on failure
+pub fn aeadDecrypt(out: []u8, key: *const SymKey, counter: u64, sealed: []const u8, ad: []const u8) AuthError!void;
+pub fn xaeadEncrypt(out: []u8, key: *const SymKey, nonce: *const [24]u8, plain: []const u8, ad: []const u8) void;
+pub fn xaeadDecrypt(out: []u8, key: *const SymKey, nonce: *const [24]u8, sealed: []const u8, ad: []const u8) AuthError!void;
+pub fn tai64n(now_ns: i96) Tai64n;                                    // wall clock, ns since Unix epoch
+pub fn tai64nAfter(a: *const Tai64n, b: *const Tai64n) bool;          // constant-time a > b
+pub fn eql(comptime n: usize, a: *const [n]u8, b: *const [n]u8) bool; // constant time
+pub fn isZero(comptime n: usize, a: *const [n]u8) bool;               // constant time
+pub fn wipe(ptr: anytype) void;                                       // *T or []T; secureZero is an alias
+pub const key_b64_len = 44;
+pub fn keyToBase64(key: *const [32]u8) [44]u8;                        // wg / .conf format
+pub fn keyFromBase64(s: []const u8) error{InvalidKey}![32]u8;          // strict, canonical only
+pub fn hexTo(comptime n: usize, comptime s: []const u8) [n]u8;        // test-vector helper
 ```
 
 ## noise (src/noise)
