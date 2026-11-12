@@ -27,36 +27,80 @@ No module reaches into another's internals; only the public API below.
 
 ## Shared types (src/crypto.zig, owned by noise agent, frozen early)
 
+As implemented (all allocation-free; see the file's doc comments for buffer rules):
+
 ```zig
-pub const key_len = 32;
+pub const key_len = 32;  hash_len = 32;  mac_len = 16;  tag_len = 16;  xnonce_len = 24;  tai64n_len = 12;
 pub const PrivateKey = [32]u8;   // clamped X25519 scalar
 pub const PublicKey  = [32]u8;
 pub const PresharedKey = [32]u8; // all zero = none
 pub const SymKey = [32]u8;
-pub fn publicKey(priv: PrivateKey) PublicKey;
+pub const Tai64n = [12]u8;
+pub const AuthError = error{AuthenticationFailed};
+pub fn clampPrivateKey(k: *PrivateKey) void;
+pub fn generatePrivateKey(io: std.Io) PrivateKey;                    // clamped
+pub fn publicKey(priv: PrivateKey) PublicKey;                         // clamps internally, = `wg pubkey`
 pub fn dh(priv: PrivateKey, pub_: PublicKey) error{IdentityElement}![32]u8;
-pub fn hash(parts: []const []const u8) [32]u8;              // BLAKE2s-256
-pub fn mac(key: []const u8, parts: []const []const u8) [16]u8;  // keyed BLAKE2s-128
-pub fn hmac(key: []const u8, data: []const u8) [32]u8;      // HMAC-BLAKE2s
-pub fn kdf1/kdf2/kdf3(key, input) ...                       // HKDF per spec
-pub fn aead(...) / xaead(...)                                // ChaCha20Poly1305 / XChaCha20Poly1305
-pub fn tai64n(now_ns: i96) [12]u8;
-pub fn secureZero(...)                                        // wipe helpers
+pub fn hash(parts: []const []const u8) [32]u8;                       // BLAKE2s-256
+pub fn mac(key: []const u8, parts: []const []const u8) [16]u8;       // keyed BLAKE2s-128
+pub fn hmac(key: []const u8, data: []const u8) [32]u8;               // HMAC-BLAKE2s
+pub fn hmacParts(key: []const u8, parts: []const []const u8) [32]u8;
+pub fn kdf1(key: *const [32]u8, input: []const u8) [32]u8;           // whitepaper KDF_n
+pub fn kdf2(key: *const [32]u8, input: []const u8) [2][32]u8;
+pub fn kdf3(key: *const [32]u8, input: []const u8) [3][32]u8;
+pub fn aeadNonce(counter: u64) [12]u8;                                // 4 zero bytes || LE64
+// out.len == plain.len + 16; out may alias plain exactly (in place)
+pub fn aeadEncrypt(out: []u8, key: *const SymKey, counter: u64, plain: []const u8, ad: []const u8) void;
+// out.len == sealed.len - 16; in place allowed; out zeroed on failure
+pub fn aeadDecrypt(out: []u8, key: *const SymKey, counter: u64, sealed: []const u8, ad: []const u8) AuthError!void;
+pub fn xaeadEncrypt(out: []u8, key: *const SymKey, nonce: *const [24]u8, plain: []const u8, ad: []const u8) void;
+pub fn xaeadDecrypt(out: []u8, key: *const SymKey, nonce: *const [24]u8, sealed: []const u8, ad: []const u8) AuthError!void;
+pub fn tai64n(now_ns: i96) Tai64n;                                    // wall clock, ns since Unix epoch
+pub fn tai64nAfter(a: *const Tai64n, b: *const Tai64n) bool;          // constant-time a > b
+pub fn eql(comptime n: usize, a: *const [n]u8, b: *const [n]u8) bool; // constant time
+pub fn isZero(comptime n: usize, a: *const [n]u8) bool;               // constant time
+pub fn wipe(ptr: anytype) void;                                       // *T or []T; secureZero is an alias
+pub const key_b64_len = 44;
+pub fn keyToBase64(key: *const [32]u8) [44]u8;                        // wg / .conf format
+pub fn keyFromBase64(s: []const u8) error{InvalidKey}![32]u8;          // strict, canonical only
+pub fn hexTo(comptime n: usize, comptime s: []const u8) [n]u8;        // test-vector helper
 ```
 
 ## noise (src/noise)
 
-Pure, no I/O, no clock reads (time passed in). Message structs with exact wire
-layout (little-endian, type byte + 3 reserved zero bytes):
-`Initiation` (148 B, type 1), `Response` (92 B, type 2), `CookieReply` (64 B,
-type 3). API: `Handshake.init(local static, peer static, psk)`,
-`createInitiation(now, sender_index) -> Initiation`,
-`consumeInitiation(msg, now) -> peer static + state`, `createResponse`,
-`consumeResponse`, `deriveKeys() -> session.Keypair seeds {send, recv, local_index, remote_index}`.
-MAC1 always; MAC2 + cookie mechanism (`CookieChecker`, `CookieGenerator`, under-load
-handling with a caller-supplied `under_load: bool`). Replay protection on
-initiations via TAI64N monotonic timestamp per peer. Constant-time compares.
-Known-answer tests against published vectors / values produced by `wg`.
+Pure, no I/O, no clock reads. Callers pass `wall_ns: i96` (wall clock, only
+for the TAI64N timestamp), `now: i64` (monotonic ns: rate limiting, cookie
+ages) and a `std.Random` (use a CSPRNG, e.g. `std.Random.IoSource`) for
+ephemerals, cookie nonces and cookie secrets. Not thread-safe: the device
+serialises. A failed step never modifies the handshake.
+
+Wire layouts (extern structs of byte arrays, align 1, comptime-asserted sizes;
+first 4 bytes = LE u32 type, so non-zero reserved bytes are rejected; exact
+lengths): `Initiation` (148, type 1), `Response` (92, type 2), `CookieReply`
+(64, type 3). `messageType(bytes) ?MessageType` classifies a datagram
+(transport = type 4, len >= 32). `X.parse(bytes) !*const X` views without copying.
+
+```zig
+Local.init(private) -> Local {private, public}
+CookieChecker.init(&local.public)                          // one per device
+  .check(msg_bytes, src_bytes, now, under_load, rng) -> .invalid | .ok | .need_cookie
+  .createReply(msg_bytes, src_bytes, now, rng) -> CookieReply   // on .need_cookie
+Handshake.init(&local, peer_public, psk)                   // one per peer; .cookie = CookieGenerator
+  .createInitiation(&local, wall_ns, now, sender_index, rng) !Initiation   (macs filled)
+consumeInitiationStatic(&local, *const Initiation) !InitiationStart  // -> .remote_static: look up peer
+  peer.hs.consumeInitiation(&start, now) !void             // timestamp replay + flood check
+  peer.hs.createResponse(now, sender_index, rng) !Response
+  peer.hs.consumeResponse(&local, *const Response) !void   // device found hs by receiverIndex()
+  peer.hs.deriveKeys() !session.Seed {send, recv, local_index, remote_index, is_initiator}
+  peer.hs.cookie.consumeReply(*const CookieReply, now) !void
+```
+`.ok` under load means mac2 was valid; the device still applies its
+per-source-IP handshake rate limiter. `src_bytes` is opaque to noise but must
+be encoded the same way each time (recommended: IP bytes || BE16 port).
+Constants: initiations accepted at most once per 1/50 s per peer
+(`min_initiation_interval_ns`), cookie secret 120 s, stored cookie used for
+115 s (120 - 5 s latency), timestamps whitened to 2^24 ns — all as the kernel.
+Golden vectors: produced by an independent reference implementation (not in this repo; Zig-only rule); the recorded bytes live in src/noise/tests.zig.
 
 ## session (src/session)
 
