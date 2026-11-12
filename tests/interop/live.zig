@@ -13,7 +13,7 @@
 //! report the handshake. With --record, the transcript is written as a Zig
 //! file the offline golden tests then replay forever.
 //!
-//! Phase B (once the device lands; skipped if zwg.exe lacks `--tun`): the
+//! Phase B (with --zwg): the
 //! same official tunnel, now with a real `zwg up <conf> --tun udp:<port>`
 //! process as the peer. zwg initiates this time (the other direction), and
 //! the driver feeds/reads raw IP packets through UdpTun. No Wintun needed.
@@ -99,12 +99,12 @@ pub fn main(init: std.process.Init) !void {
     defer if (sock_open) sock.close();
 
     drive.step("install official tunnel service '{s}'", .{tunnel_name});
-    if (!(try drive.run(gpa, io, &.{ wireguard_exe, "/installtunnelservice", conf_path })).ok)
+    if (!(try drive.run(init.arena.allocator(), io, &.{ wireguard_exe, "/installtunnelservice", conf_path })).ok)
         return drive.fail("wireguard.exe /installtunnelservice failed", .{});
-    defer _ = drive.run(gpa, io, &.{ wireguard_exe, "/uninstalltunnelservice", tunnel_name }) catch {};
+    defer _ = drive.run(init.arena.allocator(), io, &.{ wireguard_exe, "/uninstalltunnelservice", tunnel_name }) catch {};
 
-    _ = try drive.run(gpa, io, &.{ "netsh", "advfirewall", "firewall", "add", "rule", firewall_rule, "dir=in", "action=allow", "protocol=UDP", "localip=10.77.0.1", "localport=7777" });
-    defer _ = drive.run(gpa, io, &.{ "netsh", "advfirewall", "firewall", "delete", "rule", firewall_rule }) catch {};
+    _ = try drive.run(init.arena.allocator(), io, &.{ "netsh", "advfirewall", "firewall", "add", "rule", firewall_rule, "dir=in", "action=allow", "protocol=UDP", "localip=10.77.0.1", "localport=7777" });
+    defer _ = drive.run(init.arena.allocator(), io, &.{ "netsh", "advfirewall", "firewall", "delete", "rule", firewall_rule }) catch {};
 
     // ---- Phase A: official <-> reference model -----------------------------
     drive.step("phase A: official initiates, reference model responds", .{});
@@ -140,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
     }
     std.debug.print("  official keepalive decrypted with the derived keys\n", .{});
 
-    const show = try drive.run(gpa, io, &.{ wg_exe, "show", tunnel_name, "latest-handshakes" });
+    const show = try drive.run(init.arena.allocator(), io, &.{ wg_exe, "show", tunnel_name, "latest-handshakes" });
     if (!handshakeSeen(show.stdout)) return drive.fail("wg show reports no handshake:\n{s}", .{show.stdout});
     std.debug.print("  wg show latest-handshakes: {s}", .{show.stdout});
 
@@ -186,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- Phase B: official <-> zwg -------------------------------------------
     const zwg = opts.zwg orelse {
-        drive.step("phase B skipped (pass --zwg <path to zwg.exe> once the device is merged)", .{});
+        drive.step("phase B skipped (pass --zwg zig-out\bin\zwg.exe)", .{});
         return;
     };
     drive.step("phase B: zwg initiates to the official tunnel", .{});
@@ -227,7 +227,7 @@ pub fn main(init: std.process.Init) !void {
         const u = ip.parseUdp4(p) orelse continue;
         if (u.dport == 40001 and std.mem.eql(u8, u.payload, payload)) break;
     }
-    const show_b = try drive.run(gpa, io, &.{ wg_exe, "show", tunnel_name, "latest-handshakes" });
+    const show_b = try drive.run(init.arena.allocator(), io, &.{ wg_exe, "show", tunnel_name, "latest-handshakes" });
     if (!handshakeSeen(show_b.stdout)) return drive.fail("wg show reports no handshake with zwg", .{});
     drive.step("phase B passed: zwg <-> WireGuard for Windows, handshake + UDP echo both ways", .{});
 }

@@ -94,6 +94,12 @@ pub fn build(b: *std.Build) void {
     run_loopback_ref.addArtifactArg(refpeer);
     interop.dependOn(&run_loopback_ref.step);
 
+    // Cross-implementation over real processes: zwg (A) <-> refpeer (B).
+    const run_loopback_cross = b.addRunArtifact(loopback);
+    run_loopback_cross.addArtifactArg(exe);
+    run_loopback_cross.addArtifactArg(refpeer);
+    interop.dependOn(&run_loopback_cross.step);
+
     // Live interop with WireGuard for Windows: built here, run by hand from an
     // elevated prompt (tests/interop/README.md).
     if (target.result.os.tag == .windows) {

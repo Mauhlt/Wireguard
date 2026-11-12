@@ -11,11 +11,11 @@ zig build interop-live   # builds zig-out\bin\zwg-interop-live.exe (run it eleva
 | `golden.zig` | Known-answer tests: X25519 against `wg.exe pubkey` output (and RFC 7748), the initial chaining key / hash against the Linux kernel constants, wire layouts, crypto primitives, then noise + session against `spec.zig` in both roles (handshake, transport data both ways, MAC1, cookie reply / MAC2). |
 | `vectors/official.zig` | Transcript recorded from WireGuard for Windows by the live driver. A placeholder (`available = false`) until the live test has been run with `--record`; then the golden tests replay it offline forever. |
 | `loopback.zig` | Two peers as two real processes on 127.0.0.1, their TUNs replaced by `UdpTun` sockets the runner feeds and reads; UDP datagrams both ways. |
-| `refpeer.zig` | Minimal one-peer endpoint on the reference model with the same CLI as zwg. `zig build interop` runs the loopback against it today. |
+| `refpeer.zig` | Minimal one-peer endpoint on the reference model with the same CLI as zwg. `zig build interop` runs the loopback zwg+zwg, refpeer+refpeer and zwg+refpeer (cross-implementation, real processes). |
 | `live.zig` | Live interop driver against the installed WireGuard for Windows. |
 | `drive.zig`, `ip.zig` | Shared helpers: keys, `.conf` files, processes, IPv4/UDP packets. |
 
-## CLI contract for zwg (device agent)
+## CLI contract: `zwg up --tun udp:<port>`
 
 The loopback runner and phase B of the live test drive zwg like this:
 
@@ -27,9 +27,9 @@ zwg up <conf> --tun udp:<port>
   instead of the OS adapter (`UdpTun.parseSpec` parses the argument). Addresses
   and routes are not applied in this mode (`setAddress` / `addRoute` are no-ops
   on UdpTun).
-* `zwg` with no arguments prints a usage text that mentions `--tun`. Until it
-  does, `zig build interop` reports `SKIP` for the zwg loopback (the refpeer
-  loopback still runs).
+* `zwg` with no arguments prints a usage text that mentions `--tun` (if a
+  binary does not, the runner reports `SKIP` for it). Implemented in
+  src/main.zig.
 * The process is ended with a kill (TerminateProcess / SIGKILL) at the end of
   the test.
 
@@ -50,7 +50,7 @@ One admin prompt, one command:
    ```
    zig-out\bin\zwg-interop-live.exe --record tests\interop\vectors\official.zig --zwg zig-out\bin\zwg.exe
    ```
-   (`--zwg` only once the device is merged; without it phase B is skipped.)
+   (without `--zwg`, phase B is skipped.)
 3. Commit the recorded `tests/interop/vectors/official.zig` (throwaway keys).
    From then on `zig build interop` checks noise/session against bytes the
    official implementation produced, without admin.

@@ -2,7 +2,8 @@
 //! WireGuard to each other; their TUNs are UdpTun sockets this driver
 //! feeds and reads. No Wintun, no admin, any OS.
 //!
-//!     zwg-interop-loopback <path to zwg>      (zig build interop runs it)
+//!     zwg-interop-loopback <peer A> [<peer B>]    (zig build interop runs
+//!     zwg+zwg, refpeer+refpeer and zwg+refpeer)
 //!
 //! Contract with the device/CLI: `zwg up <conf> --tun udp:<port>` runs the
 //! device in the foreground with a UdpTun bound to 127.0.0.1:<port>, and
@@ -20,16 +21,18 @@ const addr_a = [4]u8{ 10, 88, 0, 1 };
 const addr_b = [4]u8{ 10, 88, 0, 2 };
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
     const io = init.io;
     var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.skip();
-    const zwg = args.next() orelse return drive.fail("usage: zwg-interop-loopback <zwg>", .{});
+    const zwg = args.next() orelse return drive.fail("usage: zwg-interop-loopback <peer A binary> [<peer B binary>]", .{});
+    const zwg_b = args.next() orelse zwg; // a different binary for B = cross-implementation
 
-    const usage_out = drive.run(gpa, io, &.{zwg}) catch return drive.fail("cannot run {s}", .{zwg});
-    if (std.mem.indexOf(u8, usage_out.stdout, "--tun") == null and std.mem.indexOf(u8, usage_out.stderr, "--tun") == null) {
-        std.debug.print("SKIP: {s} does not advertise `up <conf> --tun udp:<port>` yet\n", .{zwg});
-        return;
+    for ([_][]const u8{ zwg, zwg_b }) |bin| {
+        const usage_out = drive.run(init.arena.allocator(), io, &.{bin}) catch return drive.fail("cannot run {s}", .{bin});
+        if (std.mem.indexOf(u8, usage_out.stdout, "--tun") == null and std.mem.indexOf(u8, usage_out.stderr, "--tun") == null) {
+            std.debug.print("SKIP: {s} does not advertise `up <conf> --tun udp:<port>` yet\n", .{bin});
+            return;
+        }
     }
 
     const tmp = init.environ_map.get(if (builtin.os.tag == .windows) "TEMP" else "TMPDIR") orelse
@@ -60,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
     const arg_b = try std.fmt.allocPrint(init.arena.allocator(), "udp:{d}", .{tun_b});
     var child_a = try std.process.spawn(io, .{ .argv = &.{ zwg, "up", path_a, "--tun", arg_a } });
     defer child_a.kill(io);
-    var child_b = try std.process.spawn(io, .{ .argv = &.{ zwg, "up", path_b, "--tun", arg_b } });
+    var child_b = try std.process.spawn(io, .{ .argv = &.{ zwg_b, "up", path_b, "--tun", arg_b } });
     defer child_b.kill(io);
 
     var drv_a = try tun.UdpTun.open(0, 1500);
