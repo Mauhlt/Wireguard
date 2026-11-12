@@ -50,4 +50,17 @@ pub fn build(b: *std.Build) void {
         tun_check.dependOn(&check.step);
     }
     test_step.dependOn(tun_check);
+
+    // Interop / known-answer harness (tests/interop, see its README.md).
+    const interop = b.step("interop", "Known-answer + cross-implementation tests, FakeTun/UdpTun loopback");
+    const golden = b.addTest(.{
+        .name = "interop-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/interop/golden.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "WireGuard", .module = mod }},
+        }),
+    });
+    interop.dependOn(&b.addRunArtifact(golden).step);
 }
