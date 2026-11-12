@@ -9,8 +9,11 @@ pub const os = @import("os.zig");
 pub const index_table = @import("index_table.zig");
 pub const ratelimit = @import("ratelimit.zig");
 pub const show = @import("show.zig");
+pub const device = @import("device.zig");
+pub const Device = device.Device;
 
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("wg_compat_test.zig");
+    _ = @import("device_test.zig");
 }
