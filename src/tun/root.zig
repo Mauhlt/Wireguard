@@ -19,14 +19,35 @@
 //!   * windows: Wintun (`windows.zig`), wintun.dll loaded at runtime.
 //!   * linux:   /dev/net/tun, IFF_TUN | IFF_NO_PI (`linux.zig`).
 //!   * macos:   utun via PF_SYSTEM / SYSPROTO_CONTROL (`darwin.zig`).
-//!   * ios:     NEPacketTunnelProvider.packetFlow adapter (`ios.zig`).
-//!   * tests:   `FakeTun` (in-memory, any OS).
+//!   * ios:     NEPacketTunnelProvider.packetFlow adapter (`packetflow.zig`).
+//!   * tests:   `FakeTun` (in-memory, any OS) and `UdpTun` (packets over a
+//!              127.0.0.1 UDP socket, for driving a real `zwg` process).
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub const Cidr = @import("cidr.zig").Cidr;
 pub const queue = @import("queue.zig");
 pub const FakeTun = @import("fake.zig").FakeTun;
+
+pub const PacketFlowTun = @import("packetflow.zig").PacketFlowTun;
+pub const UdpTun = @import("udp.zig").UdpTun;
+pub const packetflow = @import("packetflow.zig");
+
+/// Per-OS backend modules (empty structs on other targets).
+pub const windows = if (builtin.os.tag == .windows) @import("windows.zig") else struct {};
+pub const linux = if (builtin.os.tag == .linux) @import("linux.zig") else struct {};
+pub const darwin = if (builtin.os.tag == .macos) @import("darwin.zig") else struct {};
+
+/// The real TUN for the target OS: `open(name, .{ .mtu = ... })`, `close()`,
+/// `tun() Tun`. On iOS it is the packetFlow adapter, created with
+/// `PacketFlowTun.init(gpa, .{ .write_fn = ... })` by the extension instead.
+pub const Native = switch (builtin.os.tag) {
+    .windows => windows.Wintun,
+    .linux => linux.LinuxTun,
+    .macos => darwin.Utun,
+    .ios => PacketFlowTun,
+    else => @compileError("tun: no backend for this OS"),
+};
 
 /// What the event loop waits on. Windows: a waitable HANDLE (use
 /// WaitForMultipleObjects). Elsewhere: a file descriptor that polls readable
@@ -120,4 +141,31 @@ test {
     _ = @import("cidr.zig");
     _ = @import("queue.zig");
     _ = @import("fake.zig");
+    _ = @import("packetflow.zig");
+    _ = @import("udp.zig");
+    _ = Native;
+    switch (builtin.os.tag) {
+        .windows => _ = @import("windows.zig"),
+        .linux => _ = @import("linux.zig"),
+        .macos => _ = @import("darwin.zig"),
+        else => {},
+    }
+}
+
+/// Forces semantic analysis of the target's backend. Used by the
+/// cross-compile checks in build.zig through `check.zig` (an object build:
+/// std.testing.refAllDecls is a no-op outside test builds, and the iOS test
+/// runner does not build with this std).
+pub fn analyzeBackend() void {
+    refAll(Native);
+    refAll(packetflow.c_api);
+    refAll(Cidr);
+    refAll(queue.Channel);
+    refAll(UdpTun);
+}
+
+fn refAll(comptime T: type) void {
+    inline for (comptime @typeInfo(T).@"struct".decl_names) |name| {
+        _ = &@field(T, name);
+    }
 }

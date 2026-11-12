@@ -135,10 +135,14 @@ pub const Waker = struct {
         if (builtin.os.tag == .windows) {
             _ = win.ResetEvent(w.handle);
         } else {
+            // Raw syscall (not std.posix.read): no error path pulls in
+            // std's stack-dump machinery, which does not build for iOS.
             var buf: [64]u8 = undefined;
             while (true) {
-                const n = std.posix.read(w.handle, &buf) catch return;
-                if (n < buf.len) return;
+                const rc = std.posix.system.read(w.handle, &buf, buf.len);
+                if (std.posix.errno(rc) == .INTR) continue;
+                if (std.posix.errno(rc) != .SUCCESS) return; // EAGAIN: drained
+                if (@as(usize, @intCast(rc)) < buf.len) return;
             }
         }
     }
@@ -148,9 +152,7 @@ pub const Waker = struct {
         if (builtin.os.tag == .windows) {
             return win.WaitForSingleObject(w.handle, 0) == win.WAIT_OBJECT_0;
         } else {
-            var pfd = [1]std.posix.pollfd{.{ .fd = w.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-            const n = std.posix.poll(&pfd, 0) catch return false;
-            return n > 0;
+            return pollIn(w.handle, 0);
         }
     }
 
@@ -232,9 +234,19 @@ pub fn waitReadable(h: WaitHandle, timeout_ms: u32) error{Timeout}!void {
     if (builtin.os.tag == .windows) {
         if (win.WaitForSingleObject(h, timeout_ms) != win.WAIT_OBJECT_0) return error.Timeout;
     } else {
-        var pfd = [1]std.posix.pollfd{.{ .fd = h, .events = std.posix.POLL.IN, .revents = 0 }};
-        const n = std.posix.poll(&pfd, @intCast(timeout_ms)) catch return error.Timeout;
-        if (n == 0) return error.Timeout;
+        if (!pollIn(h, @intCast(@min(timeout_ms, std.math.maxInt(i32))))) return error.Timeout;
+    }
+}
+
+fn pollIn(fd: std.posix.fd_t, timeout_ms: i32) bool {
+    var pfd = [1]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    while (true) {
+        const rc = std.posix.system.poll(&pfd, 1, timeout_ms);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return rc > 0,
+            .INTR => continue,
+            else => return false,
+        }
     }
 }
 
