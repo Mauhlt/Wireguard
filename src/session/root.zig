@@ -7,6 +7,8 @@ pub const keypair = @import("keypair.zig");
 pub const Keypair = keypair.Keypair;
 pub const Keypairs = keypair.Keypairs;
 pub const Seed = keypair.Seed;
+pub const timers = @import("timers.zig");
+pub const Timers = timers.Timers;
 
 test {
     @import("std").testing.refAllDecls(@This());
@@ -14,4 +16,5 @@ test {
     _ = @import("replay.zig");
     _ = @import("transport.zig");
     _ = @import("keypair.zig");
+    _ = @import("timers.zig");
 }
