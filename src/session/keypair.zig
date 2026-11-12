@@ -221,7 +221,9 @@ pub const Keypairs = struct {
     /// wiped) following the rotation rules at the top of this file.
     pub fn install(self: *Keypairs, seed: *Seed, now: i64) Retired {
         var retired: Retired = .{};
-        const kp = Keypair.init(seed, now);
+        var kp = Keypair.init(seed, now);
+        // Wipe the stack temporary once it has been copied into its slot.
+        defer kp.wipe();
         if (kp.is_initiator) {
             if (self.next != null) {
                 destroy(&self.previous, &retired);
