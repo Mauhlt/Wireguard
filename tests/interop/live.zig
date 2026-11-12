@@ -186,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- Phase B: official <-> zwg -------------------------------------------
     const zwg = opts.zwg orelse {
-        drive.step("phase B skipped (pass --zwg zig-out\bin\zwg.exe)", .{});
+        drive.step("phase B skipped (pass --zwg zig-out/bin/zwg.exe)", .{});
         return;
     };
     drive.step("phase B: zwg initiates to the official tunnel", .{});
