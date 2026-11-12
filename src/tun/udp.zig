@@ -3,8 +3,9 @@
 //! One IP packet per datagram. A test driver in another process sends IP
 //! packets to the bound port (the device reads them as if the OS routed them
 //! into the tunnel) and receives what the device writes (decrypted traffic).
-//! Replies go to the address the last packet came from, so the driver must
-//! send first. This is how the two-process loopback runner and the live
+//! Replies go to the address the last datagram came from, so the driver
+//! registers first with `hello()` (an empty datagram, never surfaced as a
+//! packet) or by sending a packet. This is how the two-process loopback runner and the live
 //! interop driver exercise real `zwg` processes without Wintun or admin
 //! rights (see tests/interop/README.md, `zwg up <conf> --tun udp:<port>`).
 //!
@@ -104,6 +105,11 @@ pub const UdpTun = struct {
         u.peer = loopbackAddr(peer_port);
     }
 
+    /// Driver side: register with the device end (an empty datagram).
+    pub fn hello(u: *UdpTun) void {
+        if (u.peer) |to| _ = sendTo(u.sock, "", &to);
+    }
+
     pub fn tun(u: *UdpTun) Tun {
         return .{ .ptr = u, .vtable = &vtable };
     }
@@ -142,6 +148,7 @@ pub const UdpTun = struct {
                 .packet => |n| {
                     if (!std.mem.eql(u8, &from.addr, &.{ 127, 0, 0, 1 })) continue; // loopback only
                     u.peer = from;
+                    if (n == 0) continue; // `hello`: the driver registering itself
                     if (n > buf.len) return error.BufferTooSmall;
                     return buf[0..n];
                 },
@@ -291,6 +298,11 @@ test "UdpTun: driver -> read, write -> driver (loopback, two sockets)" {
     try d.write("\x45ping");
     try @import("queue.zig").waitReadable(t.waitHandle(), 2000);
     try std.testing.expectEqualStrings("\x45ping", (try t.read(&buf)).?);
+    try std.testing.expectEqual(@as(?[]u8, null), try t.read(&buf));
+
+    // A hello registers without producing a packet.
+    drv.hello();
+    try @import("queue.zig").waitReadable(t.waitHandle(), 2000);
     try std.testing.expectEqual(@as(?[]u8, null), try t.read(&buf));
 
     // Device -> driver: goes back to where the ping came from.
