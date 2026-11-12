@@ -20,7 +20,8 @@
 //!   * linux:   /dev/net/tun, IFF_TUN | IFF_NO_PI (`linux.zig`).
 //!   * macos:   utun via PF_SYSTEM / SYSPROTO_CONTROL (`darwin.zig`).
 //!   * ios:     NEPacketTunnelProvider.packetFlow adapter (`packetflow.zig`).
-//!   * tests:   `FakeTun` (in-memory, any OS).
+//!   * tests:   `FakeTun` (in-memory, any OS) and `UdpTun` (packets over a
+//!              127.0.0.1 UDP socket, for driving a real `zwg` process).
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -29,6 +30,7 @@ pub const queue = @import("queue.zig");
 pub const FakeTun = @import("fake.zig").FakeTun;
 
 pub const PacketFlowTun = @import("packetflow.zig").PacketFlowTun;
+pub const UdpTun = @import("udp.zig").UdpTun;
 pub const packetflow = @import("packetflow.zig");
 
 /// Per-OS backend modules (empty structs on other targets).
@@ -140,6 +142,7 @@ test {
     _ = @import("queue.zig");
     _ = @import("fake.zig");
     _ = @import("packetflow.zig");
+    _ = @import("udp.zig");
     _ = Native;
     switch (builtin.os.tag) {
         .windows => _ = @import("windows.zig"),
@@ -158,6 +161,7 @@ pub fn analyzeBackend() void {
     refAll(packetflow.c_api);
     refAll(Cidr);
     refAll(queue.Channel);
+    refAll(UdpTun);
 }
 
 fn refAll(comptime T: type) void {
