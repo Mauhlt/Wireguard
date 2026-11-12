@@ -4,7 +4,7 @@
 //! written from the wireguard.com/protocol pseudocode (BLAKE2s, X25519,
 //! ChaCha20-Poly1305 and XChaCha20 each self-checked against their RFC vectors),
 //! kept outside this repo (owner rule: Zig only). The bytes below are the record.
-//! `wg genkey` output (see crypto.zig); everything else is fixed bytes.
+//! Static keys are `wg genkey` output (see crypto.zig); everything else is fixed bytes.
 const std = @import("std");
 const testing = std.testing;
 const crypto = @import("../crypto.zig");
