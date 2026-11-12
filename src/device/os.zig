@@ -66,3 +66,13 @@ test "stop signal" {
     s.signal();
     try std.testing.expectEqual(@as(?usize, 0), try wait(&.{s.waitHandle()}, 1 * std.time.ns_per_s));
 }
+
+test "zwg down: signal a running instance by name" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    try std.testing.expectError(error.NotRunning, StopSignal.signalExisting("zwg-test-down"));
+    var s = try StopSignal.create("zwg-test-down");
+    defer s.close();
+    try std.testing.expectError(error.AlreadyRunning, StopSignal.create("zwg-test-down"));
+    try StopSignal.signalExisting("zwg-test-down");
+    try std.testing.expectEqual(@as(?usize, 0), try wait(&.{s.waitHandle()}, 1 * std.time.ns_per_s));
+}

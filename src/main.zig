@@ -135,10 +135,116 @@ fn loadConfig(gpa: std.mem.Allocator, io: std.Io, path: []const u8, errw: *std.I
 }
 
 fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Config, out: *std.Io.Writer, errw: *std.Io.Writer) !u8 {
-    _ = gpa;
-    _ = io;
-    _ = c;
-    _ = out;
-    try errw.print("zwg: up {s}: the device loop is not wired in yet\n", .{name});
-    return 1;
+    const builtin = @import("builtin");
+    const tun = wg.tun;
+    if (comptime builtin.os.tag == .ios) {
+        try errw.writeAll("zwg: on iOS the tunnel runs inside the Network Extension, not from a CLI\n");
+        return 1;
+    }
+
+    // Only one `zwg up` per interface name; `zwg down <name>` signals this.
+    var stop = dev.os.StopSignal.create(name) catch |err| switch (err) {
+        error.AlreadyRunning => {
+            try errw.print("zwg: {s} is already up\n", .{name});
+            return 1;
+        },
+        else => return err,
+    };
+    defer stop.close();
+
+    // Resolve endpoints first: a typo should fail before an adapter appears.
+    const peers = try gpa.alloc(dev.device.PeerConfig, c.peers.len);
+    defer gpa.free(peers);
+    for (c.peers, peers) |*p, *pc| {
+        pc.* = .{
+            .public_key = p.public_key,
+            .preshared_key = p.preshared_key,
+            .allowed_ips = p.allowed_ips,
+            .persistent_keepalive = p.persistent_keepalive,
+            .endpoint = if (p.endpoint) |e| resolveEndpoint(io, e) catch |err| {
+                try errw.print("zwg: cannot resolve endpoint {f}: {s}\n", .{ e, @errorName(err) });
+                return 1;
+            } else null,
+        };
+    }
+
+    const mtu = c.interface.mtu orelse tun.default_mtu;
+    var native = tun.Native.open(name, .{ .mtu = mtu }) catch |err| {
+        switch (err) {
+            error.AccessDenied => if (comptime builtin.os.tag == .windows)
+                try errw.print("zwg: {s}\n", .{tun.windows.elevation_hint})
+            else
+                try errw.writeAll("zwg: creating a TUN interface needs root / CAP_NET_ADMIN\n"),
+            else => if (comptime builtin.os.tag == .windows and @hasDecl(tun.windows, "wintun_hint")) {
+                if (err == error.WintunNotFound) {
+                    try errw.print("zwg: {s}\n", .{tun.windows.wintun_hint});
+                } else try errw.print("zwg: cannot create the TUN interface: {s}\n", .{@errorName(err)});
+            } else try errw.print("zwg: cannot create the TUN interface: {s}\n", .{@errorName(err)}),
+        }
+        return 1;
+    };
+    defer native.close();
+    const t = native.tun();
+    for (c.interface.addresses) |a| try t.setAddress(toTunCidr(a));
+    for (c.peers) |*p| for (p.allowed_ips) |a| t.addRoute(toTunCidr(a)) catch |err| {
+        try errw.print("zwg: warning: route {f}: {s}\n", .{ a, @errorName(err) });
+    };
+    if (c.interface.dns.len + c.interface.dns_search.len != 0)
+        try errw.writeAll("zwg: warning: DNS is not configured by zwg yet; set it on the interface yourself\n");
+
+    var clock: dev.device.Clock = .{ .io = io };
+    const d = try dev.Device.create(gpa, &clock, t, .{
+        .private_key = c.interface.private_key,
+        .listen_port = c.interface.listen_port,
+        .peers = peers,
+    });
+    defer d.destroy();
+    d.external_stop = stop.waitHandle();
+    dev.os.stopOnInterrupt(&stop);
+
+    try out.print("interface {s} up, listening on UDP port {d} (Ctrl+C or `zwg down {s}` to stop)\n", .{ name, d.listen_port, name });
+    try out.flush();
+    d.run() catch |err| {
+        try errw.print("zwg: {s}: {s}\n", .{ name, @errorName(err) });
+        return 1;
+    };
+
+    // Final status, like `wg show`, then down.
+    const status = try gpa.alloc(dev.show.PeerStatus, c.peers.len);
+    defer gpa.free(status);
+    for (status, 0..) |*s, i| s.* = d.peerStatus(@intCast(i));
+    const now_unix: i64 = @intCast(@divFloor(clock.wall(), std.time.ns_per_s));
+    try dev.show.write(out, name, c, .{ .listen_port = d.listen_port }, status, now_unix);
+    try out.print("\ninterface {s} down\n", .{name});
+    return 0;
+}
+
+fn toTunCidr(c: dev.ip.Cidr) wg.tun.Cidr {
+    return switch (c.addr) {
+        .v4 => |b| wg.tun.Cidr.ip4(b, c.prefix),
+        .v6 => |b| wg.tun.Cidr.ip6(b, c.prefix),
+    };
+}
+
+/// IP literal, or a DNS lookup (IPv4 preferred: the device always has an
+/// IPv4 socket, IPv6 only when the host supports it).
+fn resolveEndpoint(io: std.Io, e: config.Endpoint) !std.Io.net.IpAddress {
+    if (e.literal()) |a| return a;
+    const host = try std.Io.net.HostName.init(e.host);
+    var buf: [32]std.Io.net.HostName.LookupResult = undefined;
+    var q: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buf);
+    try host.lookup(io, &q, .{ .port = e.port });
+    var got: [32]std.Io.net.HostName.LookupResult = undefined;
+    const n = q.get(io, &got, 0) catch 0;
+    var v6: ?std.Io.net.IpAddress = null;
+    for (got[0..n]) |r| switch (r) {
+        .address => |a| switch (a) {
+            .ip4 => return a,
+            .ip6 => if (v6 == null) {
+                v6 = a;
+            },
+        },
+        else => {},
+    };
+    return v6 orelse error.UnknownHostName;
 }

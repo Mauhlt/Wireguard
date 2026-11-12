@@ -226,3 +226,20 @@ test "under load: handshakes without a cookie get a cookie reply" {
     try testing.expect(d.load.underLoad(now));
     try testing.expect(d.stats.cookie_replies_sent >= 5);
 }
+
+test "run returns when the external stop handle (zwg down) is signaled" {
+    const gpa = testing.allocator;
+    var clock: dev.Clock = .{ .io = testing.io };
+    var priv: crypto.PrivateKey = undefined;
+    testing.io.random(&priv);
+    var fake: tun.FakeTun = try .init(gpa, .{});
+    defer fake.deinit();
+    const d = try Device.create(gpa, &clock, fake.tun(), .{ .private_key = priv });
+    defer d.destroy();
+    var stop = try os.StopSignal.create("zwg-test-run-stop");
+    defer stop.close();
+    d.external_stop = stop.waitHandle();
+    const t = try std.Thread.spawn(.{}, Node.runLoop, .{d});
+    stop.signal();
+    t.join();
+}
