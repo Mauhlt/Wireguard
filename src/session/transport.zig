@@ -22,12 +22,13 @@
 
 const std = @import("std");
 const c = @import("constants.zig");
+const crypto = @import("../crypto.zig");
 
-pub const SymKey = [32]u8;
+pub const SymKey = crypto.SymKey;
 
 pub const message_type: u8 = 4;
 pub const header_len: usize = 16;
-pub const tag_len: usize = 16;
+pub const tag_len: usize = crypto.tag_len;
 /// Header + Poly1305 tag.
 pub const overhead: usize = header_len + tag_len;
 /// Size of a keepalive (empty plaintext) message.
@@ -76,24 +77,6 @@ pub fn messageLen(len: usize, mtu: usize) usize {
     return header_len + paddedLen(len, mtu) + tag_len;
 }
 
-fn nonce(counter: u64) [12]u8 {
-    var n: [12]u8 = @splat(0);
-    std.mem.writeInt(u64, n[4..12], counter, .little);
-    return n;
-}
-
-// AEAD adapter. TODO(session): switch to crypto.aead once the noise agent's
-// src/crypto.zig lands; semantics are identical (RFC 8439, empty AD here).
-const Aead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
-
-fn aeadSeal(key: *const SymKey, counter: u64, buf: []u8, tag: *[tag_len]u8) void {
-    Aead.encrypt(buf, tag, buf, &.{}, nonce(counter), key.*);
-}
-
-fn aeadOpen(key: *const SymKey, counter: u64, out: []u8, ct: []const u8, tag: [tag_len]u8) error{AuthenticationFailed}!void {
-    Aead.decrypt(out, ct, tag, &.{}, nonce(counter), key.*) catch return error.AuthenticationFailed;
-}
-
 pub const SealError = error{BufferTooSmall};
 
 /// Build a complete transport message in `out` and return its length.
@@ -115,7 +98,9 @@ pub fn seal(
     @memmove(body[0..plaintext.len], plaintext);
     @memset(body[plaintext.len..], 0);
     (Header{ .receiver_index = receiver_index, .counter = counter }).write(out[0..header_len]);
-    aeadSeal(key, counter, body, out[header_len + padded ..][0..tag_len]);
+    // ChaCha20-Poly1305, nonce 0^32 ‖ LE64(counter), empty AD; the tag
+    // directly follows the padded body. In place: body is both input and output.
+    crypto.aeadEncrypt(out[header_len..][0 .. padded + tag_len], key, counter, body, &.{});
     return total;
 }
 
@@ -130,8 +115,7 @@ pub fn open(key: *const SymKey, packet: []const u8, out: []u8) OpenError![]u8 {
     const h = try Header.parse(packet);
     const ct = packet[header_len .. packet.len - tag_len];
     if (out.len < ct.len) return error.BufferTooSmall;
-    const tag = packet[packet.len - tag_len ..][0..tag_len].*;
-    try aeadOpen(key, h.counter, out[0..ct.len], ct, tag);
+    try crypto.aeadDecrypt(out[0..ct.len], key, h.counter, packet[header_len..], &.{});
     return out[0..ct.len];
 }
 
@@ -221,7 +205,7 @@ test "known answer: RFC 8439 AEAD with WireGuard nonce layout" {
     var expect_ct: [16]u8 = undefined;
     var expect_tag: [16]u8 = undefined;
     const nn = [12]u8{ 0, 0, 0, 0, 0x0d, 0x0c, 0x0b, 0x0a, 0, 0, 0, 0 };
-    Aead.encrypt(&expect_ct, &expect_tag, pt, "", nn, test_key);
+    std.crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(&expect_ct, &expect_tag, pt, "", nn, test_key);
     try testing.expectEqualSlices(u8, &expect_ct, out[16..32]);
     try testing.expectEqualSlices(u8, &expect_tag, out[32..48]);
     try testing.expectEqual(@as(usize, 48), n);
