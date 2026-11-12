@@ -11,4 +11,4 @@ pub const response_sender: u32 = 0;
 pub const response: [92]u8 = @splat(0);
 pub const keepalive: [32]u8 = @splat(0);
 pub const echo_payload: []const u8 = "";
-pub const echo_reply: [64]u8 = @splat(0);
+pub const echo_reply: []const u8 = "";

@@ -212,7 +212,7 @@ test "official WireGuard for Windows transcript (recorded by live.zig --record)"
     // The official keepalive after the handshake, and its echo reply.
     const k = try spec.openTransport(&out, r2.keys, &official.keepalive);
     try testing.expectEqual(@as(usize, 0), k.plain.len);
-    const e = try spec.openTransport(&out, r2.keys, &official.echo_reply);
+    const e = try spec.openTransport(&out, r2.keys, official.echo_reply);
     try testing.expectEqualStrings(official.echo_payload, ip.parseUdp4(e.plain).?.payload);
 
     // Same transcript through noise + session.
@@ -220,7 +220,7 @@ test "official WireGuard for Windows transcript (recorded by live.zig --record)"
     const start = try noise.consumeInitiationStatic(&local, try noise.Initiation.parse(&official.initiation));
     try testing.expectEqual(official.official_public, start.remote_static);
     const seed_keys = r2.keys;
-    const pt = try session.transport.open(&seed_keys.recv, &official.echo_reply, &out);
+    const pt = try session.transport.open(&seed_keys.recv, official.echo_reply, &out);
     try testing.expectEqualStrings(official.echo_payload, ip.parseUdp4(pt).?.payload);
 }
 
