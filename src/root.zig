@@ -7,4 +7,5 @@ pub const tun = @import("tun/root.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("fuzz.zig");
 }

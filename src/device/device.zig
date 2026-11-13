@@ -630,7 +630,11 @@ pub const Device = struct {
             d.stats.dropped_invalid += 1;
             return;
         };
-        if (addrs.total_len > r.plaintext.len or addrs.total_len == 0) {
+        // The claimed length must cover the IP header and fit in what was
+        // decrypted (kernel receive.c: "dishonest_packet_size"; wireguard-go
+        // does the same). An IPv6 length is payload + 40, so always >= 40.
+        const min_len: usize = if (addrs.src == .v4) 20 else 40;
+        if (addrs.total_len > r.plaintext.len or addrs.total_len < min_len) {
             d.stats.dropped_invalid += 1;
             return;
         }
