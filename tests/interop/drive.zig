@@ -110,3 +110,94 @@ pub fn fail(comptime fmt: []const u8, args: anytype) error{InteropFailed} {
 pub fn step(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("== " ++ fmt ++ "\n", args);
 }
+
+// ---- live tests: UDP echo / probe through a tunnel, PASS/FAIL report -----
+
+const os = wg.device.os;
+
+pub fn monoMs(io: Io) i64 {
+    return @intCast(@divFloor(Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
+}
+
+pub fn nowS(io: Io) i64 {
+    return @intCast(@divFloor(Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
+}
+
+/// UDP echo server on 0.0.0.0:<port> until `stop` is signalled (blocks on
+/// the socket and the stop handle; no polling).
+pub fn echoServe(port: u16, stop: ?os.WaitHandle) !void {
+    var u = try os.Udp.open(.v4, port);
+    defer u.close();
+    var buf: [65535]u8 = undefined;
+    while (true) {
+        if (stop) |s| {
+            const r = try os.wait(&.{ s, u.waitHandle() }, null);
+            if (r == 0) return;
+        } else _ = try os.wait(&.{u.waitHandle()}, null);
+        u.beginDrain();
+        while (try u.recv(&buf)) |dg| u.send(dg.from, buf[0..dg.len]) catch {};
+    }
+}
+
+/// Sends `len` tagged bytes to dst:port and waits for the identical echo,
+/// resending every second (a handshake may be under way) until
+/// `timeout_ms`. Returns the round-trip time in ms, or null.
+pub fn udpProbe(io: Io, dst: [4]u8, port: u16, len: usize, timeout_ms: u32) !?i64 {
+    var u = try os.Udp.open(.v4, 0);
+    defer u.close();
+    var payload: [65507]u8 = undefined;
+    if (len > payload.len) return error.TooLong;
+    var tag: [8]u8 = undefined;
+    io.random(&tag);
+    for (payload[0..len], 0..) |*b, i| b.* = if (i < 8) tag[i] else @truncate(i);
+    var buf: [65535]u8 = undefined;
+    const t0 = monoMs(io);
+    const t_end = t0 + timeout_ms;
+    while (monoMs(io) < t_end) {
+        u.send(.{ .ip4 = .{ .bytes = dst, .port = port } }, payload[0..len]) catch {};
+        const t_resend = @min(t_end, monoMs(io) + 1000);
+        while (true) {
+            const left = t_resend - monoMs(io);
+            if (left <= 0) break;
+            _ = try os.wait(&.{u.waitHandle()}, @as(u64, @intCast(left)) * std.time.ns_per_ms) orelse break;
+            u.beginDrain();
+            while (try u.recv(&buf)) |dg| {
+                if (dg.len == len and std.mem.eql(u8, buf[0..len], payload[0..len])) return monoMs(io) - t0;
+            }
+        }
+    }
+    return null;
+}
+
+pub const Check = struct { name: []const u8, ok: bool, detail: []const u8 };
+
+/// Named PASS/FAIL checks, printed as they happen and written as a results
+/// file at the end.
+pub const Report = struct {
+    checks: std.ArrayList(Check) = .empty,
+    gpa: std.mem.Allocator,
+
+    pub fn add(r: *Report, name: []const u8, ok: bool, comptime fmt: []const u8, args: anytype) void {
+        const detail = std.fmt.allocPrint(r.gpa, fmt, args) catch "";
+        r.checks.append(r.gpa, .{ .name = name, .ok = ok, .detail = detail }) catch {};
+        std.debug.print("  [{s}] {s}{s}{s}\n", .{ if (ok) "PASS" else "FAIL", name, if (detail.len != 0) ": " else "", detail });
+    }
+
+    pub fn passed(r: *const Report) bool {
+        if (r.checks.items.len == 0) return false;
+        for (r.checks.items) |c| if (!c.ok) return false;
+        return true;
+    }
+
+    pub fn write(r: *const Report, w: *Io.Writer, title: []const u8, notes: []const u8) !void {
+        var fails: usize = 0;
+        for (r.checks.items) |c| fails += @intFromBool(!c.ok);
+        try w.print("{s}: {s} ({d} checks, {d} failed)\n\n", .{ title, if (r.passed()) "PASS" else "FAIL", r.checks.items.len, fails });
+        for (r.checks.items) |c| try w.print("{s}  {s}{s}{s}\n", .{ if (c.ok) "PASS" else "FAIL", c.name, if (c.detail.len != 0) " -- " else "", c.detail });
+        if (notes.len != 0) try w.print("\n{s}\n", .{notes});
+    }
+};
+
+pub fn okText(ok: bool) []const u8 {
+    return if (ok) "OK" else "FAILED";
+}

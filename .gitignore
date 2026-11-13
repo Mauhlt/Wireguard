@@ -1,3 +1,6 @@
 .zig-cache/
 zig-out/
 zig-pkg/
+# Wintun is never committed: zig build -Dwintun=<folder> copies the signed DLL into zig-out
+wintun.dll
+*.dll

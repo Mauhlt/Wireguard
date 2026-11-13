@@ -23,7 +23,14 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    const tests = b.addTest(.{ .root_module = mod });
+    // `-Dtest-filter=<substring>` builds only the matching tests, e.g. one fuzz
+    // target: `zig build test --fuzz=1M -Doptimize=ReleaseSafe -Dtest-filter="fuzz: replay"`
+    // (one process per target gives per-target coverage; see src/fuzz.zig).
+    const test_filter = b.option([]const u8, "test-filter", "Only build and run tests whose name contains this");
+    const tests = b.addTest(.{
+        .root_module = mod,
+        .filters = if (test_filter) |f| b.dupeStrings(&.{f}) else &.{},
+    });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
     test_step.dependOn(&exe.step);
@@ -100,6 +107,73 @@ pub fn build(b: *std.Build) void {
     run_loopback_cross.addArtifactArg(refpeer);
     interop.dependOn(&run_loopback_cross.step);
 
+    // Live tests against Linux / WSL (tests/interop/README.md, "Live test:
+    // Windows (Wintun) <-> WSL"). The Linux side is always built for Linux:
+    // natively on Linux, cross-compiled (pure Zig, no libc) elsewhere, so the
+    // Windows driver can run it inside WSL without a Zig install there.
+    const linux_target = if (target.result.os.tag == .linux)
+        target
+    else
+        b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux });
+    const linux_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = linux_target,
+        .optimize = optimize,
+    });
+    const zwg_linux = b.addExecutable(.{
+        .name = "zwg",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = linux_target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "WireGuard", .module = linux_mod }},
+        }),
+    });
+    const live_linux = b.addExecutable(.{
+        .name = "zwg-live-linux",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/interop/live_linux.zig"),
+            .target = linux_target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "WireGuard", .module = linux_mod }},
+        }),
+    });
+    const to_linux_dir: std.Build.Step.InstallArtifact.Options = .{ .dest_dir = .{ .override = .{ .custom = "linux" } } };
+    const live_linux_step = b.step("interop-live-linux", "Build zig-out/linux/{zwg,zwg-live-linux} (run `zwg-live-linux netns-test` as root)");
+    live_linux_step.dependOn(&b.addInstallArtifact(zwg_linux, to_linux_dir).step);
+    live_linux_step.dependOn(&b.addInstallArtifact(live_linux, to_linux_dir).step);
+    interop.dependOn(&live_linux.step); // keep it compiling
+
+    // Wintun: the official signed DLL, never committed. `-Dwintun=<folder>`
+    // (or ZWG_WINTUN_DIR) points at the unzipped release from wintun.net;
+    // `zig build` then copies wintun\bin\<arch>\wintun.dll next to zwg.exe.
+    if (target.result.os.tag == .windows) {
+        const wintun_dir = b.option([]const u8, "wintun", "Folder with the unzipped official Wintun release (copies wintun.dll next to zwg.exe)") orelse
+            b.graph.environ_map.get("ZWG_WINTUN_DIR");
+        if (wintun_dir) |dir| {
+            const arch: []const u8 = switch (target.result.cpu.arch) {
+                .x86_64 => "amd64",
+                .aarch64 => "arm64",
+                .x86 => "x86",
+                else => "arm",
+            };
+            const candidates = [_][]const u8{
+                b.pathJoin(&.{ dir, "wintun", "bin", arch, "wintun.dll" }),
+                b.pathJoin(&.{ dir, "bin", arch, "wintun.dll" }),
+                b.pathJoin(&.{ dir, "wintun.dll" }),
+            };
+            const found = for (candidates) |p| {
+                std.Io.Dir.cwd().access(b.graph.io, p, .{}) catch continue;
+                break p;
+            } else null;
+            if (found) |p| {
+                b.getInstallStep().dependOn(&b.addInstallBinFile(.{ .cwd_relative = p }, "wintun.dll").step);
+            } else {
+                b.getInstallStep().dependOn(&b.addFail(b.fmt("-Dwintun={s}: no wintun\\bin\\{s}\\wintun.dll there (unzip the release from https://www.wintun.net/)", .{ dir, arch })).step);
+            }
+        }
+    }
+
     // Live interop with WireGuard for Windows: built here, run by hand from an
     // elevated prompt (tests/interop/README.md).
     if (target.result.os.tag == .windows) {
@@ -116,5 +190,22 @@ pub fn build(b: *std.Build) void {
         live_step.dependOn(&b.addInstallArtifact(live, .{}).step);
         live_step.dependOn(b.getInstallStep());
         interop.dependOn(&live.step); // keep it compiling
+
+        // Live test Windows (real Wintun adapter) <-> WSL2: kernel WireGuard and
+        // zwg for Linux inside WSL. Built here, run once elevated.
+        const live_wsl = b.addExecutable(.{
+            .name = "zwg-live-wsl",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/interop/live_wsl.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "WireGuard", .module = mod }},
+            }),
+        });
+        const live_wsl_step = b.step("interop-live-wsl", "Build zwg-live-wsl.exe + zwg.exe (+ wintun.dll with -Dwintun) + the Linux side (run it elevated; see tests/interop/README.md)");
+        live_wsl_step.dependOn(&b.addInstallArtifact(live_wsl, .{}).step);
+        live_wsl_step.dependOn(b.getInstallStep());
+        live_wsl_step.dependOn(live_linux_step);
+        interop.dependOn(&live_wsl.step); // keep it compiling
     }
 }

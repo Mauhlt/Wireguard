@@ -1,0 +1,43 @@
+zwg live test, WSL/Linux internal (netns), started 1794528755 (unix), 132 s
+host: Linux 5.15.167.4-microsoft-standard-WSL2
+official peer: Linux kernel WireGuard (wireguard-tools v1.0.20210914 - https://git.zx2c4.com/wireguard-tools/)
+our peer: zwg (Linux /dev/net/tun backend)
+topology: netns zwg-live-k [zwgvk 10.99.0.1, zwgk0 10.88.0.1] <-veth-> netns zwg-live-z [zwgvz 10.99.0.2, zwgz0 10.88.0.2], MTU 1420
+
+RESULT: PASS (22 checks, 0 failed)
+
+PASS  kernel WireGuard interface up -- zwgk0 10.88.0.1/24, UDP 51820
+PASS  zwg Linux TUN interface up -- zwgz0 10.88.0.2/24, UDP 51821, MTU 1420
+PASS  handshake initiated by kernel WG, answered by zwg -- UDP echo kernel->zwg OK in 25 ms; kernel latest-handshake 1794528756
+PASS  UDP echo zwg->kernel -- 9 ms
+PASS  ping kernel->zwg (ICMP through the tunnel)
+PASS  ping zwg->kernel
+PASS  MTU-sized UDP kernel->zwg->kernel -- 1392-byte payload = 1420-byte IP packet
+PASS  MTU-sized UDP zwg->kernel->zwg -- 1392-byte payload
+PASS  MTU-sized ping kernel->zwg (DF) -- -s 1392 -M do
+PASS  MTU-sized ping zwg->kernel (DF) -- -s 1392 -M do
+PASS  re-handshake initiated by kernel while zwg holds a live session -- echo OK; latest-handshake 1794528756 -> 1794528759
+PASS  zwg follows the kernel's new port (endpoint roaming in zwg) -- echo kernel->zwg after the move OK
+PASS  zwg->kernel after the move
+PASS  zwg exits cleanly on SIGTERM with a status -- endpoint: 10.99.0.1:51830; latest handshake: Now; transfer: 13.01 KiB received, 12.90 KiB sent
+PASS  handshake initiated by zwg, answered by kernel WG -- echo zwg->kernel OK in 22 ms; latest-handshake 1794528759 -> 1794528760
+PASS  kernel->zwg on the zwg-initiated session
+PASS  kernel follows zwg's new address (zwg packets authenticate the roam) -- kernel endpoint for zwg = 10.99.0.3:51821
+PASS  kernel->zwg at the new address
+PASS  zwg rekeys after REKEY_AFTER_TIME (kernel as responder) -- new handshake 121 s after the previous one (expected ~120 s); traffic during rekey uninterrupted
+PASS  traffic on the rekeyed session
+PASS  zwg final status (wg show style) -- endpoint: 10.99.0.1:51830; latest handshake: 5 seconds ago; transfer: 4.05 KiB received, 4.20 KiB sent
+PASS  teardown: namespaces, interfaces, keys removed
+
+kernel `wg show` before teardown (keys are throwaway):
+interface: zwgk0
+  public key: JMHbVNrAHSS5yVekyVDLulBaiId1hH6SXPCAuj2mln4=
+  private key: (hidden)
+  listening port: 51830
+
+peer: ePLwW/IvMc7Eut/IlsNs37O3wyZmvX4KmoS4RVJ1ATQ=
+  endpoint: 10.99.0.3:51821
+  allowed ips: 10.88.0.2/32
+  latest handshake: 5 seconds ago
+  transfer: 4.66 KiB received, 4.57 KiB sent
+
