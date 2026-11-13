@@ -95,6 +95,13 @@ pub fn initNetworking() common.OpenError!void {
     wsa_started.store(true, .release);
 }
 
+/// The address the device's sockets listen on: every interface, as a real
+/// endpoint must. Unit tests listen on loopback only, so running them never
+/// opens the machine to the network (and never raises a Windows Firewall
+/// prompt for each freshly built test executable).
+const any4: [4]u8 = if (@import("builtin").is_test) .{ 127, 0, 0, 1 } else @splat(0);
+const any6: [16]u8 = if (@import("builtin").is_test) .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } else @splat(0);
+
 pub const Udp = struct {
     sock: SOCKET,
     event: HANDLE,
@@ -123,11 +130,11 @@ pub const Udp = struct {
 
         const rc = switch (family) {
             .v4 => blk: {
-                const sa: sockaddr_in = .{ .family = AF_INET, .port = std.mem.nativeToBig(u16, port), .addr = @splat(0) };
+                const sa: sockaddr_in = .{ .family = AF_INET, .port = std.mem.nativeToBig(u16, port), .addr = any4 };
                 break :blk bind(s, &sa, @sizeOf(sockaddr_in));
             },
             .v6 => blk: {
-                const sa: sockaddr_in6 = .{ .family = AF_INET6, .port = std.mem.nativeToBig(u16, port), .addr = @splat(0) };
+                const sa: sockaddr_in6 = .{ .family = AF_INET6, .port = std.mem.nativeToBig(u16, port), .addr = any6 };
                 break :blk bind(s, &sa, @sizeOf(sockaddr_in6));
             },
         };
