@@ -112,7 +112,7 @@ fn serviceMain(argc: u32, argv: ?[*]?win.LPWSTR) callconv(.winapi) void {
     locked(state.Machine.starting, .{});
 
     const paths = store.Paths.init(g.name) catch null;
-    if (paths) |*p| log.open(p.log) catch {};
+    if (paths) |*p| log.open(p.log()) catch {};
     defer log.close();
     log.print("tunnel {s}: service starting (pid {d})", .{ g.name, win.GetCurrentProcessId() });
 

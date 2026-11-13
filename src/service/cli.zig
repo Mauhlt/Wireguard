@@ -264,7 +264,7 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
     _ = tun.windows.probe() catch return .wintun_missing;
 
     store.prepare(&paths) catch |err| return if (err == error.UntrustedDirectory) .untrusted_dir else storeFail("create the store directories", err);
-    log.open(paths.log) catch {};
+    log.open(paths.log()) catch {};
     defer log.close();
     log.print("installtunnel {s}: for user {s}, start {s}", .{ name, user_sid, if (auto) "automatic" else "on demand" });
 
@@ -368,11 +368,11 @@ pub fn elevatedUninstall(name: []const u8) Result {
         s.delete() catch return .service_failed;
         break :blk true;
     };
-    const had_files = store.exists(paths.dir);
+    const had_files = store.exists(paths.dir());
     removeFiles(&paths);
     var old_buf: [300]u8 = undefined;
-    store.delete(paths.log) catch {};
-    store.delete(std.fmt.bufPrint(&old_buf, "{s}.old", .{paths.log}) catch paths.log) catch {};
+    store.delete(paths.log()) catch {};
+    store.delete(std.fmt.bufPrint(&old_buf, "{s}.old", .{paths.log()}) catch paths.log()) catch {};
     store.removeDirs(&paths);
     if (!had_service and !had_files) return .not_installed;
     return result;
@@ -388,7 +388,7 @@ fn storeFail(step: []const u8, err: anyerror) Result {
 }
 
 fn removeFiles(paths: *const store.Paths) void {
-    store.wipe(paths.conf) catch {};
+    store.wipe(paths.conf()) catch {};
     var buf: [400]u8 = undefined;
     if (paths.inDir(&buf, store.exe_file)) |p| store.delete(p) catch {} else |_| {}
     if (paths.inDir(&buf, store.wintun_file)) |p| store.delete(p) catch {} else |_| {}

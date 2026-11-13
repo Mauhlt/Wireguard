@@ -54,35 +54,63 @@ pub const Error = error{
 /// Absolute paths (UTF-8) for one tunnel. All derive from the
 /// known-folder ProgramData path and a validated tunnel name.
 pub const Paths = struct {
+    /// Each path lives in its own buffer and is reached through a method,
+    /// so a Paths can be copied (returned by value, wrapped in an optional)
+    /// without its paths pointing into the copy it was built in.
     buf: [6][260]u8 = undefined,
-    root: []const u8 = "",
-    tunnels: []const u8 = "",
-    dir: []const u8 = "",
-    conf: []const u8 = "",
-    logs: []const u8 = "",
-    log: []const u8 = "",
+    len: [6]usize = @splat(0),
 
     pub fn init(name: []const u8) Error!Paths {
         std.debug.assert(names.isValid(name));
         var pd_buf: [260]u8 = undefined;
         const pd = try programData(&pd_buf);
         var p: Paths = .{};
-        p.root = try p.put(0, "{s}\\zwg", .{pd});
-        p.tunnels = try p.put(1, "{s}\\zwg\\tunnels", .{pd});
-        p.dir = try p.put(2, "{s}\\zwg\\tunnels\\{s}", .{ pd, name });
-        p.conf = try p.put(3, "{s}\\zwg\\tunnels\\{s}\\" ++ conf_file, .{ pd, name });
-        p.logs = try p.put(4, "{s}\\zwg\\logs", .{pd});
-        p.log = try p.put(5, "{s}\\zwg\\logs\\{s}.log", .{ pd, name });
+        try p.put(0, "{s}\\zwg", .{pd});
+        try p.put(1, "{s}\\zwg\\tunnels", .{pd});
+        try p.put(2, "{s}\\zwg\\tunnels\\{s}", .{ pd, name });
+        try p.put(3, "{s}\\zwg\\tunnels\\{s}\\" ++ conf_file, .{ pd, name });
+        try p.put(4, "{s}\\zwg\\logs", .{pd});
+        try p.put(5, "{s}\\zwg\\logs\\{s}.log", .{ pd, name });
         return p;
+    }
+
+    /// %ProgramData%\zwg
+    pub fn root(p: *const Paths) []const u8 {
+        return p.get(0);
+    }
+    /// %ProgramData%\zwg\tunnels
+    pub fn tunnels(p: *const Paths) []const u8 {
+        return p.get(1);
+    }
+    /// %ProgramData%\zwg\tunnels\<name>
+    pub fn dir(p: *const Paths) []const u8 {
+        return p.get(2);
+    }
+    /// The encrypted configuration in dir().
+    pub fn conf(p: *const Paths) []const u8 {
+        return p.get(3);
+    }
+    /// %ProgramData%\zwg\logs
+    pub fn logs(p: *const Paths) []const u8 {
+        return p.get(4);
+    }
+    /// %ProgramData%\zwg\logs\<name>.log
+    pub fn log(p: *const Paths) []const u8 {
+        return p.get(5);
     }
 
     /// `<dir>\<file>` into `out`.
     pub fn inDir(p: *const Paths, out: []u8, file: []const u8) Error![]const u8 {
-        return std.fmt.bufPrint(out, "{s}\\{s}", .{ p.dir, file }) catch error.NameTooLong;
+        return std.fmt.bufPrint(out, "{s}\\{s}", .{ p.dir(), file }) catch error.NameTooLong;
     }
 
-    fn put(p: *Paths, i: usize, comptime fmt: []const u8, args: anytype) Error![]const u8 {
-        return std.fmt.bufPrint(&p.buf[i], fmt, args) catch error.NameTooLong;
+    fn get(p: *const Paths, i: usize) []const u8 {
+        return p.buf[i][0..p.len[i]];
+    }
+
+    fn put(p: *Paths, i: usize, comptime fmt: []const u8, args: anytype) Error!void {
+        const s = std.fmt.bufPrint(&p.buf[i], fmt, args) catch return error.NameTooLong;
+        p.len[i] = s.len;
     }
 };
 
@@ -105,10 +133,10 @@ fn programData(buf: []u8) Error![]const u8 {
 /// the protected DACL, or verify and re-secure them if they exist.
 /// Needs an elevated process (owner = Administrators).
 pub fn prepare(p: *const Paths) Error!void {
-    try secureDir(p.root, true);
-    try secureDir(p.tunnels, false);
-    try secureDir(p.logs, false);
-    try secureDir(p.dir, false);
+    try secureDir(p.root(), true);
+    try secureDir(p.tunnels(), false);
+    try secureDir(p.logs(), false);
+    try secureDir(p.dir(), false);
 }
 
 fn secureDir(path: []const u8, is_root: bool) Error!void {
@@ -163,7 +191,7 @@ fn checkOwner(w: [:0]const u16) Error!void {
 /// Remove the tunnel's directory (its files must be gone) and, if empty,
 /// tunnels\, logs\ and the root. Best effort.
 pub fn removeDirs(p: *const Paths) void {
-    for ([_][]const u8{ p.dir, p.tunnels, p.logs, p.root }) |d| {
+    for ([_][]const u8{ p.dir(), p.tunnels(), p.logs(), p.root() }) |d| {
         var wbuf: [300]u16 = undefined;
         const w = win.W(&wbuf, d) catch continue;
         _ = win.RemoveDirectoryW(w.ptr);
@@ -315,12 +343,12 @@ fn mapOpen(e: u32) Error {
 pub fn storeConfig(gpa: std.mem.Allocator, p: *const Paths, text: []const u8) Error!void {
     const blob = try protect(gpa, text);
     defer gpa.free(blob);
-    try writeNew(p.conf, blob, null);
+    try writeNew(p.conf(), blob, null);
 }
 
 /// Read and decrypt the stored configuration. Caller wipes and frees.
 pub fn loadConfig(gpa: std.mem.Allocator, p: *const Paths) Error![]u8 {
-    const blob = try readAll(gpa, p.conf, 4 << 20);
+    const blob = try readAll(gpa, p.conf(), 4 << 20);
     defer gpa.free(blob);
     return unprotect(gpa, blob);
 }
@@ -354,10 +382,10 @@ test "a blob made for another purpose (other entropy) does not decrypt as ours" 
 
 test "paths come from the known folder, not the environment" {
     const p = try Paths.init("laptop");
-    try testing.expect(std.ascii.endsWithIgnoreCase(p.root, "\\zwg"));
-    try testing.expect(std.mem.endsWith(u8, p.conf, "\\zwg\\tunnels\\laptop\\tunnel.conf.dpapi"));
-    try testing.expect(std.mem.endsWith(u8, p.log, "\\zwg\\logs\\laptop.log"));
-    try testing.expect(std.fs.path.isAbsoluteWindows(p.root));
+    try testing.expect(std.ascii.endsWithIgnoreCase(p.root(), "\\zwg"));
+    try testing.expect(std.mem.endsWith(u8, p.conf(), "\\zwg\\tunnels\\laptop\\tunnel.conf.dpapi"));
+    try testing.expect(std.mem.endsWith(u8, p.log(), "\\zwg\\logs\\laptop.log"));
+    try testing.expect(std.fs.path.isAbsoluteWindows(p.root()));
 }
 
 test "write a file with an explicit DACL, read it back, wipe it" {
@@ -408,4 +436,25 @@ test "the running executable can be copied (the installer copies itself)" {
     const data = try readAll(testing.allocator, buf[0..n], max_binary_bytes);
     defer testing.allocator.free(data);
     try testing.expect(std.mem.startsWith(u8, data, "MZ"));
+}
+
+test "paths stay valid after the Paths value is copied (returned, wrapped in an optional)" {
+    const S = struct {
+        fn make() ?Paths {
+            return Paths.init("laptop") catch null;
+        }
+        // Reuses the stack the init call ran on.
+        fn scribble() u8 {
+            var junk: [8192]u8 = undefined;
+            @memset(&junk, 0xAA);
+            std.mem.doNotOptimizeAway(&junk);
+            return junk[100];
+        }
+    };
+    const opt = S.make();
+    _ = S.scribble();
+    const p = opt orelse return error.TestUnexpectedResult;
+    try testing.expect(std.ascii.endsWithIgnoreCase(p.root(), "\\zwg"));
+    try testing.expect(std.mem.endsWith(u8, p.dir(), "\\zwg\\tunnels\\laptop"));
+    try testing.expect(std.mem.endsWith(u8, p.log(), "\\zwg\\logs\\laptop.log"));
 }
