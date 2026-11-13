@@ -147,6 +147,50 @@ pub extern "kernel32" fn DisconnectNamedPipe(h: HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn WaitNamedPipeW(name: LPCWSTR, ms: u32) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetOverlappedResult(h: HANDLE, ov: *OVERLAPPED, n: *u32, wait: BOOL) callconv(.winapi) BOOL;
 pub extern "kernel32" fn CancelIoEx(h: HANDLE, ov: ?*OVERLAPPED) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CreatePipe(read: *HANDLE, write: *HANDLE, sa: ?*SECURITY_ATTRIBUTES, size: u32) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetSystemDirectoryW(buf: [*]u16, len: u32) callconv(.winapi) u32;
+
+// Child processes under another token (the end-to-end driver runs zwg.exe
+// as an ordinary user).
+pub const STARTF_USESTDHANDLES: u32 = 0x100;
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400;
+pub const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+pub const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
+
+pub const STARTUPINFOW = extern struct {
+    cb: u32 = @sizeOf(STARTUPINFOW),
+    reserved: ?LPWSTR = null,
+    desktop: ?LPWSTR = null,
+    title: ?LPWSTR = null,
+    x: u32 = 0,
+    y: u32 = 0,
+    x_size: u32 = 0,
+    y_size: u32 = 0,
+    x_count_chars: u32 = 0,
+    y_count_chars: u32 = 0,
+    fill_attribute: u32 = 0,
+    flags: u32 = 0,
+    show_window: u16 = 0,
+    cb_reserved2: u16 = 0,
+    reserved2: ?*u8 = null,
+    std_input: ?HANDLE = null,
+    std_output: ?HANDLE = null,
+    std_error: ?HANDLE = null,
+};
+pub const STARTUPINFOEXW = extern struct {
+    startup_info: STARTUPINFOW = .{ .cb = @sizeOf(STARTUPINFOEXW) },
+    attribute_list: ?*anyopaque = null,
+};
+pub const PROCESS_INFORMATION = extern struct {
+    process: ?HANDLE = null,
+    thread: ?HANDLE = null,
+    process_id: u32 = 0,
+    thread_id: u32 = 0,
+};
+pub extern "kernel32" fn InitializeProcThreadAttributeList(list: ?*anyopaque, count: u32, flags: u32, size: *usize) callconv(.winapi) BOOL;
+pub extern "kernel32" fn UpdateProcThreadAttribute(list: *anyopaque, flags: u32, attribute: usize, value: *const anyopaque, size: usize, prev: ?*anyopaque, ret_size: ?*usize) callconv(.winapi) BOOL;
+pub extern "kernel32" fn DeleteProcThreadAttributeList(list: *anyopaque) callconv(.winapi) void;
 
 // ---- advapi32: tokens, SIDs, security descriptors ---------------------------
 
@@ -157,6 +201,9 @@ pub const TokenIntegrityLevel: c_int = 25;
 pub const SE_GROUP_INTEGRITY: u32 = 0x20;
 pub const DISABLE_MAX_PRIVILEGE: u32 = 1;
 pub const LUA_TOKEN: u32 = 4;
+pub const TokenType: c_int = 8;
+pub const TokenPrimary: c_int = 1;
+pub const SecurityImpersonation: c_int = 2;
 
 pub const SID_AND_ATTRIBUTES = extern struct { sid: ?PSID, attributes: u32 };
 pub const TOKEN_USER = extern struct { user: SID_AND_ATTRIBUTES };
@@ -184,6 +231,8 @@ pub extern "advapi32" fn SetTokenInformation(token: HANDLE, class: c_int, info: 
 pub extern "advapi32" fn CreateRestrictedToken(existing: HANDLE, flags: u32, disable_count: u32, disable: ?[*]const SID_AND_ATTRIBUTES, delete_priv_count: u32, delete_privs: ?*const anyopaque, restrict_count: u32, restrict: ?[*]const SID_AND_ATTRIBUTES, new_token: *HANDLE) callconv(.winapi) BOOL;
 pub extern "advapi32" fn ImpersonateLoggedOnUser(token: HANDLE) callconv(.winapi) BOOL;
 pub extern "advapi32" fn RevertToSelf() callconv(.winapi) BOOL;
+pub extern "advapi32" fn DuplicateTokenEx(existing: HANDLE, access: u32, sa: ?*SECURITY_ATTRIBUTES, level: c_int, kind: c_int, new_token: *HANDLE) callconv(.winapi) BOOL;
+pub extern "advapi32" fn CreateProcessAsUserW(token: HANDLE, app: ?LPCWSTR, cmdline: ?LPWSTR, process_sa: ?*SECURITY_ATTRIBUTES, thread_sa: ?*SECURITY_ATTRIBUTES, inherit: BOOL, flags: u32, env: ?*anyopaque, cwd: ?LPCWSTR, si: *STARTUPINFOEXW, pi: *PROCESS_INFORMATION) callconv(.winapi) BOOL;
 pub extern "advapi32" fn ConvertSidToStringSidW(sid: PSID, out: *?LPWSTR) callconv(.winapi) BOOL;
 pub extern "advapi32" fn ConvertStringSidToSidW(s: LPCWSTR, out: *?PSID) callconv(.winapi) BOOL;
 pub extern "advapi32" fn IsValidSid(sid: PSID) callconv(.winapi) BOOL;
@@ -489,4 +538,96 @@ pub fn restrictedToken(deny_user: bool) error{Unexpected}!HANDLE {
     if (SetTokenInformation(out, TokenIntegrityLevel, &label, @sizeOf(TOKEN_MANDATORY_LABEL) + GetLengthSid(medium.?)) == 0)
         return error.Unexpected;
     return out;
+}
+
+pub const ChildResult = struct {
+    exit_code: u32,
+    /// What the child wrote to stdout and stderr (interleaved), truncated
+    /// to the caller's buffer.
+    output: []u8,
+};
+
+/// Run `cmdline` (UTF-8, quoted as for CreateProcess) as a child whose
+/// primary token is `token` (`restrictedToken`: a restricted version of this
+/// process's own token needs no SeAssignPrimaryTokenPrivilege; an
+/// impersonation token is duplicated into a primary one), with stdout and
+/// stderr captured into `out`. Only the pipe's write end is inherited.
+/// Blocks on the pipe until the child closes it, then on the process handle
+/// for at most `timeout_ms`. For the tests and the end-to-end driver.
+pub fn runAsToken(token: HANDLE, cmdline: []const u8, out: []u8, timeout_ms: u32) error{ Unexpected, NameTooLong, InvalidUtf8, Timeout }!ChildResult {
+    var kind: c_int = 0;
+    var len: u32 = 0;
+    if (GetTokenInformation(token, TokenType, &kind, @sizeOf(c_int), &len) == 0) return error.Unexpected;
+    var primary = token;
+    if (kind != TokenPrimary) {
+        if (DuplicateTokenEx(token, TOKEN_ALL_ACCESS, null, SecurityImpersonation, TokenPrimary, &primary) == 0) return error.Unexpected;
+    }
+    defer if (primary != token) {
+        _ = CloseHandle(primary);
+    };
+
+    var sa: SECURITY_ATTRIBUTES = .{ .inherit = 1 };
+    var rd: HANDLE = undefined;
+    var wr: HANDLE = undefined;
+    if (CreatePipe(&rd, &wr, &sa, 0) == 0) return error.Unexpected;
+    defer _ = CloseHandle(rd);
+    var wr_open = true;
+    defer if (wr_open) {
+        _ = CloseHandle(wr);
+    };
+
+    var attr_size: usize = 0;
+    _ = InitializeProcThreadAttributeList(null, 1, 0, &attr_size);
+    var attr_buf: [256]u8 align(16) = undefined;
+    if (attr_size == 0 or attr_size > attr_buf.len) return error.Unexpected;
+    if (InitializeProcThreadAttributeList(&attr_buf, 1, 0, &attr_size) == 0) return error.Unexpected;
+    defer DeleteProcThreadAttributeList(&attr_buf);
+    const inherit_list = [1]HANDLE{wr};
+    if (UpdateProcThreadAttribute(&attr_buf, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherit_list, @sizeOf(@TypeOf(inherit_list)), null, null) == 0)
+        return error.Unexpected;
+
+    var si: STARTUPINFOEXW = .{ .attribute_list = &attr_buf };
+    si.startup_info.flags = STARTF_USESTDHANDLES;
+    si.startup_info.std_output = wr;
+    si.startup_info.std_error = wr;
+    var cmd_w: [2048]u16 = undefined;
+    const cmd = try W(&cmd_w, cmdline);
+    var pi: PROCESS_INFORMATION = .{};
+    if (CreateProcessAsUserW(primary, null, cmd.ptr, null, null, 1, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT, null, null, &si, &pi) == 0)
+        return error.Unexpected;
+    defer _ = CloseHandle(pi.process.?);
+    _ = CloseHandle(pi.thread.?);
+    // Our copy of the write end must go, or the reads below never see EOF.
+    _ = CloseHandle(wr);
+    wr_open = false;
+
+    var n: usize = 0;
+    var sink: [512]u8 = undefined;
+    while (true) {
+        const dst = if (n < out.len) out[n..] else sink[0..];
+        var got: u32 = 0;
+        // Blocks until the child writes or exits (ERROR_BROKEN_PIPE ends it).
+        if (ReadFile(rd, dst.ptr, @intCast(@min(dst.len, 1 << 20)), &got, null) == 0) break;
+        if (n < out.len) n += got;
+    }
+    if (WaitForSingleObject(pi.process.?, timeout_ms) != WAIT_OBJECT_0) return error.Timeout;
+    var code: u32 = 0;
+    if (GetExitCodeProcess(pi.process.?, &code) == 0) return error.Unexpected;
+    return .{ .exit_code = code, .output = out[0..n] };
+}
+
+test "runAsToken: a child under a restricted token, exit code and output" {
+    const t = try restrictedToken(false);
+    defer _ = CloseHandle(t);
+    var sysdir: [260]u16 = undefined;
+    const sn = GetSystemDirectoryW(&sysdir, sysdir.len);
+    if (sn == 0 or sn >= sysdir.len) return error.SkipZigTest;
+    var sys_utf8: [800]u8 = undefined;
+    const sys = sys_utf8[0..try std.unicode.utf16LeToUtf8(&sys_utf8, sysdir[0..sn])];
+    var cmd_buf: [1024]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&cmd_buf, "\"{s}\\cmd.exe\" /d /c echo zwg-child& exit 7", .{sys});
+    var out: [256]u8 = undefined;
+    const r = try runAsToken(t, cmd, &out, 30_000);
+    try std.testing.expectEqual(@as(u32, 7), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.output, "zwg-child") != null);
 }
