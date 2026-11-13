@@ -121,6 +121,7 @@ pub extern "kernel32" fn SleepEx(ms: u32, alertable: BOOL) callconv(.winapi) u32
 pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 pub extern "kernel32" fn LocalFree(mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 pub extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+pub extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 pub extern "kernel32" fn OpenProcess(access: u32, inherit: BOOL, pid: u32) callconv(.winapi) ?HANDLE;
 pub extern "kernel32" fn GetExitCodeProcess(h: HANDLE, code: *u32) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetModuleFileNameW(module: ?HANDLE, buf: [*]u16, len: u32) callconv(.winapi) u32;
@@ -457,3 +458,35 @@ pub const SecurityDescriptor = struct {
         return acl;
     }
 };
+
+/// A primary token derived from this process's token that looks like an
+/// ordinary unelevated user: Administrators deny-only, LUA, privileges
+/// stripped, medium integrity. With `deny_user`, the user's own SID is
+/// deny-only too (a stand-in for "some other user"). For the tests and the
+/// elevated end-to-end driver, which impersonate it to check DACLs.
+pub fn restrictedToken(deny_user: bool) error{Unexpected}!HANDLE {
+    var token: HANDLE = undefined;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &token) == 0) return error.Unexpected;
+    defer _ = CloseHandle(token);
+    var info: [256]u8 align(8) = undefined;
+    var len: u32 = 0;
+    if (GetTokenInformation(token, TokenUser, &info, info.len, &len) == 0) return error.Unexpected;
+    const tu: *const TOKEN_USER = @ptrCast(&info);
+
+    var ba: ?PSID = null;
+    if (ConvertStringSidToSidW(std.unicode.utf8ToUtf16LeStringLiteral("S-1-5-32-544"), &ba) == 0) return error.Unexpected;
+    defer _ = LocalFree(ba);
+    var medium: ?PSID = null;
+    if (ConvertStringSidToSidW(std.unicode.utf8ToUtf16LeStringLiteral("S-1-16-8192"), &medium) == 0) return error.Unexpected;
+    defer _ = LocalFree(medium);
+
+    const disable = [_]SID_AND_ATTRIBUTES{ .{ .sid = ba, .attributes = 0 }, .{ .sid = tu.user.sid, .attributes = 0 } };
+    var out: HANDLE = undefined;
+    if (CreateRestrictedToken(token, DISABLE_MAX_PRIVILEGE | LUA_TOKEN, if (deny_user) 2 else 1, &disable, 0, null, 0, null, &out) == 0)
+        return error.Unexpected;
+    errdefer _ = CloseHandle(out);
+    const label: TOKEN_MANDATORY_LABEL = .{ .label = .{ .sid = medium, .attributes = SE_GROUP_INTEGRITY } };
+    if (SetTokenInformation(out, TokenIntegrityLevel, &label, @sizeOf(TOKEN_MANDATORY_LABEL) + GetLengthSid(medium.?)) == 0)
+        return error.Unexpected;
+    return out;
+}

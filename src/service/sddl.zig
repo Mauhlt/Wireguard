@@ -6,7 +6,8 @@
 //!                    lets Users create and read files), inherited by
 //!                    everything below: tunnels\<name>\tunnel.conf.dpapi,
 //!                    the service's copy of zwg.exe / wintun.dll, logs.
-//!   control pipe     SYSTEM + Administrators full control; the installing
+//!   control pipe     (owner: the creating service, i.e. SYSTEM)
+//!                    SYSTEM + Administrators full control; the installing
 //!                    user read + write data only (not FILE_CREATE_PIPE_INSTANCE,
 //!                    WRITE_DAC, ...). Nobody else, no network clients
 //!                    (PIPE_REJECT_REMOTE_CLIENTS) and, with no mandatory
@@ -47,7 +48,7 @@ pub const Error = error{ InvalidSid, NoSpaceLeft };
 /// Control pipe DACL for `user_sid` (validated: it is spliced into SDDL).
 pub fn pipe(buf: []u8, user_sid: []const u8) Error![]const u8 {
     if (!names.isValidSidString(user_sid)) return error.InvalidSid;
-    return std.fmt.bufPrint(buf, "O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x{x};;;{s})", .{ pipe_user_access, user_sid });
+    return std.fmt.bufPrint(buf, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x{x};;;{s})", .{ pipe_user_access, user_sid });
 }
 
 /// Service object DACL for `user_sid`.
@@ -62,7 +63,7 @@ test "pipe and service SDDL strings" {
     const t = std.testing;
     var buf: [512]u8 = undefined;
     try t.expectEqualStrings(
-        "O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x120083;;;" ++ user ++ ")",
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x120083;;;" ++ user ++ ")",
         try pipe(&buf, user),
     );
     const s = try service(&buf, user);

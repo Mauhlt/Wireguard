@@ -14,6 +14,12 @@ pub const state = @import("state.zig");
 
 const is_windows = builtin.os.tag == .windows;
 pub const win32 = if (is_windows) @import("win32.zig") else struct {};
+pub const store = if (is_windows) @import("store.zig") else struct {};
+pub const log = if (is_windows) @import("log.zig") else struct {};
+pub const scm = if (is_windows) @import("scm.zig") else struct {};
+pub const pipe = if (is_windows) @import("pipe.zig") else struct {};
+pub const tunnel = if (is_windows) @import("tunnel.zig") else struct {};
+pub const cli = if (is_windows) @import("cli.zig") else struct {};
 
 test {
     @import("std").testing.refAllDecls(@This());

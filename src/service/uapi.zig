@@ -443,6 +443,7 @@ test "decode: random bytes never crash" {
 
 fn rep(comptime s: []const u8, comptime n: usize) []const u8 {
     comptime {
+        @setEvalBranchQuota(100_000);
         var out: []const u8 = "";
         for (0..n) |_| out = out ++ s;
         return out;
