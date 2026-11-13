@@ -153,19 +153,26 @@ pub fn main(init: std.process.Init) !void {
         } else |err| if (err != error.AccessDenied) return drive.fail("expected AccessDenied, got {s}", .{@errorName(err)});
     }
 
-    drive.step("as an ordinary user: zwg down {s}, zwg up {s}", .{ name, name });
+    // As the ordinary user would: zwg down / up as its own process whose
+    // primary token is the restricted one (not by impersonating it on one of
+    // our threads, which the SCM's state notification refuses).
+    drive.step("as an ordinary user (own process): zwg down {s}, zwg up {s}", .{ name, name });
     {
-        var ebuf: [512]u8 = undefined;
-        var ew = Io.File.stderr().writer(io, &ebuf);
-        defer ew.interface.flush() catch {};
-        const t = try asUser(false);
-        defer revert(t);
-        if ((try svc.cli.controlTunnel(name, .stop, &ew.interface, &ew.interface)) != @as(?u8, 0))
-            return drive.fail("down failed for the installing user", .{});
-        try expectState(win.SERVICE_STOPPED);
-        if ((try svc.cli.controlTunnel(name, .start, &ew.interface, &ew.interface)) != @as(?u8, 0))
-            return drive.fail("up failed for the installing user", .{});
-        try expectState(win.SERVICE_RUNNING);
+        const t = win.restrictedToken(false) catch return drive.fail("cannot build a restricted token", .{});
+        defer _ = win.CloseHandle(t);
+        const steps = [_]struct { verb: []const u8, want: u32 }{
+            .{ .verb = "down", .want = win.SERVICE_STOPPED },
+            .{ .verb = "up", .want = win.SERVICE_RUNNING },
+        };
+        for (steps) |c| {
+            var cmd_buf: [1024]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&cmd_buf, "\"{s}\" {s} {s}", .{ zwg_path, c.verb, name }) catch return drive.fail("command line too long", .{});
+            var out: [2048]u8 = undefined;
+            const r = win.runAsToken(t, cmd, &out, 60_000) catch |err| return drive.fail("zwg {s} as the ordinary user: {s}", .{ c.verb, @errorName(err) });
+            std.debug.print("{s}", .{r.output});
+            if (r.exit_code != 0) return drive.fail("{s} failed for the installing user (exit {d})", .{ c.verb, r.exit_code });
+            try expectState(c.want);
+        }
     }
     try waitForHandshake(gpa, io, peer_keys.public);
 

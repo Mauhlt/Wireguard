@@ -482,11 +482,9 @@ pub fn controlTunnel(name: []const u8, action: Action, out: *std.Io.Writer, errw
                 },
                 else => return err,
             };
-            const st = s.waitFor(win.SERVICE_STOPPED, stop_timeout_ms) catch |err| {
-                try errw.print("zwg: {s}: waiting for the service to stop: {s}\n", .{ name, @errorName(err) });
-                return 1;
-            };
-            _ = st;
+            var watch_code: u32 = 0;
+            _ = s.waitForCode(win.SERVICE_STOPPED, stop_timeout_ms, &watch_code) catch |err|
+                return try waitFailed(&s, name, .stop, err, watch_code, out, errw);
             try out.print("{s} stopped\n", .{name});
         },
         .start => {
@@ -494,10 +492,9 @@ pub fn controlTunnel(name: []const u8, action: Action, out: *std.Io.Writer, errw
                 try errw.print("zwg: {s}: cannot start the service: {s}\n", .{ name, @errorName(err) });
                 return 1;
             };
-            const st = s.waitFor(win.SERVICE_RUNNING, start_timeout_ms) catch |err| {
-                try errw.print("zwg: {s}: waiting for the service to start: {s}\n", .{ name, @errorName(err) });
-                return 1;
-            };
+            var watch_code: u32 = 0;
+            const st = s.waitForCode(win.SERVICE_RUNNING, start_timeout_ms, &watch_code) catch |err|
+                return try waitFailed(&s, name, .start, err, watch_code, out, errw);
             if (st.status.current_state != win.SERVICE_RUNNING) {
                 const code = st.status.service_specific_exit_code;
                 const msg = if (code >= 1 and code <= @intFromEnum(state.Exit.bad_arguments)) @as(state.Exit, @enumFromInt(code)).message() else "stopped";
@@ -508,6 +505,73 @@ pub fn controlTunnel(name: []const u8, action: Action, out: *std.Io.Writer, errw
         },
     }
     return 0;
+}
+
+/// The wait after a stop / start failed. If it could not watch at all
+/// (error.CannotWatch), one status query decides: on its way (or there)
+/// counts as done, with a note on stderr. Anything else fails, with the raw
+/// Windows error when there is one.
+fn waitFailed(s: *const scm.Service, name: []const u8, action: Action, err: scm.Error, code: u32, out: *std.Io.Writer, errw: *std.Io.Writer) !u8 {
+    if (err == error.CannotWatch) {
+        const now: ?u32 = if (s.status()) |st| st.status.current_state else |_| null;
+        try writeUnwatched(errw, name, action, code, now);
+        if (now) |state_| if (requestTaken(action, state_)) {
+            try out.print("{s} {s}\n", .{ name, scm.stateName(state_) });
+            return 0;
+        };
+        return 1;
+    }
+    try writeWaitFailed(errw, name, action, err, code);
+    return 1;
+}
+
+/// After a stop / start whose outcome cannot be watched: is the service on
+/// its way (or already there)?
+fn requestTaken(action: Action, current_state: u32) bool {
+    return switch (action) {
+        .stop => current_state == win.SERVICE_STOP_PENDING or current_state == win.SERVICE_STOPPED,
+        .start => current_state == win.SERVICE_START_PENDING or current_state == win.SERVICE_RUNNING,
+    };
+}
+
+fn writeUnwatched(errw: *std.Io.Writer, name: []const u8, action: Action, code: u32, current_state: ?u32) !void {
+    try errw.print("zwg: {s}: {s} requested; cannot watch the service state: Windows error {d}", .{ name, @tagName(action), code });
+    if (current_state) |st| {
+        if (!requestTaken(action, st)) try errw.print("; the service is {s}", .{scm.stateName(st)});
+    } else try errw.writeAll("; cannot query it either");
+    try errw.writeAll("\n");
+}
+
+fn writeWaitFailed(errw: *std.Io.Writer, name: []const u8, action: Action, err: scm.Error, code: u32) !void {
+    try errw.print("zwg: {s}: waiting for the service to {s}: {s}", .{ name, @tagName(action), @errorName(err) });
+    if (code != 0) try errw.print(" (Windows error {d})", .{code});
+    try errw.writeAll("\n");
+}
+
+test "down / up when the state change cannot be watched" {
+    try std.testing.expect(requestTaken(.stop, win.SERVICE_STOP_PENDING));
+    try std.testing.expect(requestTaken(.stop, win.SERVICE_STOPPED));
+    try std.testing.expect(!requestTaken(.stop, win.SERVICE_RUNNING));
+    try std.testing.expect(requestTaken(.start, win.SERVICE_START_PENDING));
+    try std.testing.expect(requestTaken(.start, win.SERVICE_RUNNING));
+    try std.testing.expect(!requestTaken(.start, win.SERVICE_STOPPED));
+
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeUnwatched(&w, "home", .stop, 5, win.SERVICE_STOP_PENDING);
+    try std.testing.expectEqualStrings("zwg: home: stop requested; cannot watch the service state: Windows error 5\n", w.buffered());
+    w = .fixed(&buf);
+    try writeUnwatched(&w, "home", .start, 5, win.SERVICE_STOPPED);
+    try std.testing.expectEqualStrings("zwg: home: start requested; cannot watch the service state: Windows error 5; the service is stopped\n", w.buffered());
+    w = .fixed(&buf);
+    try writeUnwatched(&w, "home", .stop, 5, null);
+    try std.testing.expectEqualStrings("zwg: home: stop requested; cannot watch the service state: Windows error 5; cannot query it either\n", w.buffered());
+    w = .fixed(&buf);
+    try writeWaitFailed(&w, "home", .stop, error.Unexpected, 1234);
+    try std.testing.expectEqualStrings("zwg: home: waiting for the service to stop: Unexpected (Windows error 1234)\n", w.buffered());
+    w = .fixed(&buf);
+    try writeWaitFailed(&w, "home", .start, error.Timeout, 0);
+    try std.testing.expectEqualStrings("zwg: home: waiting for the service to start: Timeout\n", w.buffered());
 }
 
 test "result messages" {

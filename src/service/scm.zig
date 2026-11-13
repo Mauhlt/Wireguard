@@ -4,6 +4,18 @@
 //! an APC to this thread, which sleeps alertably until it arrives or the
 //! deadline passes).
 //!
+//! NotifyServiceStatusChangeW can refuse with ERROR_ACCESS_DENIED from the
+//! call itself on a thread that impersonates a token which may not open this
+//! process's own threads (their DACL is the process token's default DACL),
+//! however the service handle was opened and even when that token may query
+//! the service. Seen: an elevated process impersonating its user with
+//! Administrators deny-only (the end-to-end driver), and an unelevated one
+//! impersonating its user with the user SID deny-only (the "waitFor while
+//! impersonating" test below); an unelevated process impersonating its user
+//! with Administrators deny-only, whose user SID still opens its threads,
+//! is not refused. waitFor reports it as error.CannotWatch and never polls
+//! instead: the caller decides from one final status query.
+//!
 //! Service configuration, as WireGuard for Windows' tunnel services:
 //!   name           zwgTunnel$<name>, display "zwg tunnel: <name>"
 //!   type           SERVICE_WIN32_OWN_PROCESS, LocalSystem
@@ -32,6 +44,9 @@ pub const Error = error{
     MarkedForDelete,
     NotRunning,
     Timeout,
+    /// The state change cannot be watched (the notification was refused);
+    /// the service itself may be fine: query its status once.
+    CannotWatch,
     NameTooLong,
     OutOfMemory,
     Unexpected,
@@ -103,6 +118,13 @@ pub const Service = struct {
     /// stops (when waiting for RUNNING), or `timeout_ms` passes. Returns
     /// the last status seen. No polling: one SCM notification per change.
     pub fn waitFor(s: *const Service, target: u32, timeout_ms: u32) Error!win.SERVICE_STATUS_PROCESS {
+        return s.waitForCode(target, timeout_ms, null);
+    }
+
+    /// waitFor, and on a failed notification the raw Windows error in
+    /// `code` (0 otherwise), for the message.
+    pub fn waitForCode(s: *const Service, target: u32, timeout_ms: u32, code: ?*u32) Error!win.SERVICE_STATUS_PROCESS {
+        if (code) |c| c.* = 0;
         const deadline = win.GetTickCount64() + timeout_ms;
         var st = try s.status();
         while (st.status.current_state != target) {
@@ -117,7 +139,8 @@ pub const Service = struct {
             const rc = win.NotifyServiceStatusChangeW(s.h, mask, &n.notify);
             if (rc != 0) {
                 std.heap.page_allocator.destroy(n);
-                return if (rc == win.ERROR_SERVICE_MARKED_FOR_DELETE) error.MarkedForDelete else mapErr(rc);
+                if (code) |c| c.* = rc;
+                return notifyErr(rc);
             }
             while (!n.fired) {
                 const now = win.GetTickCount64();
@@ -125,7 +148,10 @@ pub const Service = struct {
                 _ = win.SleepEx(@intCast(@min(deadline - now, win.INFINITE - 1)), 1);
             }
             defer std.heap.page_allocator.destroy(n);
-            if (n.notify.notification_status != 0) return mapErr(n.notify.notification_status);
+            if (n.notify.notification_status != 0) {
+                if (code) |c| c.* = n.notify.notification_status;
+                return notifyErr(n.notify.notification_status);
+            }
             st = n.notify.status;
         }
         return st;
@@ -293,6 +319,16 @@ pub fn stateName(state: u32) []const u8 {
     };
 }
 
+/// A NotifyServiceStatusChangeW failure, as its return code or as the
+/// notification's status. ACCESS_DENIED there is not about the service (the
+/// handle was opened and checked already) but about the watching itself.
+fn notifyErr(e: u32) Error {
+    return switch (e) {
+        win.ERROR_ACCESS_DENIED => error.CannotWatch,
+        else => mapErr(e),
+    };
+}
+
 fn mapErr(e: u32) Error {
     return switch (e) {
         win.ERROR_ACCESS_DENIED => error.AccessDenied,
@@ -335,4 +371,43 @@ test "waitFor returns at once when the state is already reached" {
     const t0 = win.GetTickCount64();
     try std.testing.expectError(error.Timeout, s.waitFor(win.SERVICE_STOPPED, 200));
     try std.testing.expect(win.GetTickCount64() - t0 >= 150);
+}
+
+test "notification failures: access denied means cannot watch, the rest as usual" {
+    try std.testing.expectEqual(error.CannotWatch, notifyErr(win.ERROR_ACCESS_DENIED));
+    try std.testing.expectEqual(error.MarkedForDelete, notifyErr(win.ERROR_SERVICE_MARKED_FOR_DELETE));
+    try std.testing.expectEqual(error.NotInstalled, notifyErr(win.ERROR_SERVICE_DOES_NOT_EXIST));
+    try std.testing.expectEqual(error.Unexpected, notifyErr(win.ERROR_INVALID_HANDLE));
+    // Everywhere else ACCESS_DENIED stays AccessDenied.
+    try std.testing.expectEqual(error.AccessDenied, mapErr(win.ERROR_ACCESS_DENIED));
+}
+
+test "waitFor while impersonating another token: CannotWatch with the raw code, no polling" {
+    // The user's SID deny-only: a token other than the process token that
+    // may still query the Event Log service (Authenticated Users can).
+    const t = win.restrictedToken(true) catch return error.SkipZigTest;
+    defer _ = win.CloseHandle(t);
+    if (win.ImpersonateLoggedOnUser(t) == 0) return error.SkipZigTest;
+    defer _ = win.RevertToSelf();
+    var m = try Manager.open(win.SC_MANAGER_CONNECT);
+    defer m.close();
+    var wb: [16]u16 = undefined;
+    const h = win.OpenServiceW(m.h, (try win.W(&wb, "EventLog")).ptr, win.SERVICE_QUERY_STATUS) orelse return error.SkipZigTest;
+    var s: Service = .{ .h = h };
+    defer s.close();
+    // Already there: no notification is needed, so none can fail.
+    _ = try s.waitFor(win.SERVICE_RUNNING, 1000);
+    var code: u32 = 0;
+    const t0 = win.GetTickCount64();
+    if (s.waitForCode(win.SERVICE_STOPPED, 2000, &code)) |_| {
+        return error.TestUnexpectedResult; // the Event Log does not stop
+    } else |err| switch (err) {
+        error.CannotWatch => {
+            try std.testing.expectEqual(win.ERROR_ACCESS_DENIED, code);
+            try std.testing.expect(win.GetTickCount64() - t0 < 1000); // at once, not after the deadline
+        },
+        // A Windows that allows it: an ordinary wait until the deadline.
+        error.Timeout => try std.testing.expectEqual(@as(u32, 0), code),
+        else => return err,
+    }
 }
