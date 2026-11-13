@@ -5,8 +5,9 @@
 //! routes use the classic ioctls (SIOCSIFADDR, SIOCSIFMTU, SIOCADDRT on an
 //! AF_INET / AF_INET6 datagram socket), which need CAP_NET_ADMIN.
 //!
-//! Status: compile-checked only (cross-compiled from Windows in
-//! `zig build test`); not yet run on a Linux host.
+//! Status: run on Linux (WSL2 5.15) against kernel WireGuard by
+//! tests/interop/live_linux.zig (`netns-test`): handshakes both ways, ping,
+//! MTU-sized packets, roaming, rekey; also cross-compiled in `zig build test`.
 const std = @import("std");
 const linux = std.os.linux;
 const root = @import("root.zig");

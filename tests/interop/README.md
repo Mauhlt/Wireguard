@@ -91,6 +91,85 @@ Windows would short-circuit the traffic over loopback, never touching either
 tunnel. UdpTun keeps zwg's side of the traffic out of the Windows stack, so
 every packet really crosses both WireGuard implementations.
 
+## Live test: Windows (Wintun) <-> WSL
+
+Two real hosts: zwg on Windows with a **real Wintun adapter** talks to WSL2,
+first to the official **Linux kernel WireGuard**, then to **zwg built for
+Linux** on a real `/dev/net/tun`. Unlike the single-host test above, the two
+tunnel addresses live on different hosts (Windows and the WSL VM), so every
+packet really crosses both implementations and both OS network stacks.
+
+| File | What it is |
+|---|---|
+| `live_wsl.zig` | `zwg-live-wsl.exe`: the elevated Windows driver. |
+| `live_linux.zig` | `zwg-live-linux` (cross-compiled for x86_64 Linux): the WSL side. `serve` is the driver's control channel; `netns-test` is a self-contained kernel-WG <-> zwg test in two network namespaces; `cleanup` removes leftovers. |
+
+Prerequisites: WSL2 with kernel WireGuard (`CONFIG_WIREGUARD=y` in the
+Microsoft kernel), `wireguard-tools` (`sudo apt-get install wireguard-tools`),
+`iproute2` and `ping` in the distro. No Zig inside WSL is needed: the Linux
+binaries are cross-compiled.
+
+1. As your normal user (downloads the signed DLL nowhere; it only copies the
+   one you verified):
+   ```
+   zig build interop-live-wsl -Dwintun=%LOCALAPPDATA%\zwg-deps\wintun
+   ```
+   (`-Dwintun` / `ZWG_WINTUN_DIR` = the unzipped official release; zig-out\bin
+   then holds zwg.exe + wintun.dll + zwg-live-wsl.exe, zig-out\linux the Linux side.)
+2. In **Terminal (Admin)**, in the repo:
+   ```
+   zig-out\bin\zwg-live-wsl.exe
+   ```
+   (`--quick` skips the two slow checks, ~3 min; results go to
+   `zig-out\zwg-live-wsl-results.txt`, or `--out <file>`.)
+
+Topology: Windows `zwgtest` 10.88.0.1/24 (zwg, UDP port picked at start) ;
+WSL root namespace: kernel `zwgk0` 10.88.0.2 (UDP 51820), later zwg `zwgz0`
+10.88.0.3 (UDP 51821). Endpoints are the WSL VM's eth0 address and the
+Windows host address as WSL sees it (its default gateway).
+
+Checks, for each WSL peer: handshake initiated by Windows, handshake
+initiated by the WSL peer, UDP echo and ping both ways, MTU-sized (1420-byte,
+DF) UDP and ping both ways, endpoint roaming (the WSL peer changes its UDP
+port; zwg on Windows must follow from authenticated packets), final `wg show`
+style status on both sides. Kernel only: forced re-handshake (`wg set peer
+remove/re-add`), and without `--quick` a dead-session re-handshake driven by
+zwg's timers (~15 s) and zwg's time-based rekey after REKEY_AFTER_TIME (~120 s).
+
+Changed, and removed again on success and on failure: three inbound firewall
+rules `zwg-live-wsl-{wg,echo,icmp}`, the Wintun adapter `zwgtest` (`zwg
+down`), `%TEMP%\zwgtest.conf` (overwritten, deleted) and `zwgtest.log`; inside
+WSL the `zwgk0` / `zwgz0` interfaces, the echo server and `/run/zwg-live`
+(root-only key files, overwritten before deletion). If a run is interrupted,
+running it again cleans up first; `wsl -u root -e zig-out/linux/zwg-live-linux
+cleanup` does the WSL half by hand.
+
+WSL-only variant, no Windows elevation (needs root inside WSL):
+```
+zig build interop-live-linux
+wsl -u root -e zig-out/linux/zwg-live-linux netns-test --zwg zig-out/linux/zwg [--quick] --out <file>
+```
+Namespaces `zwg-live-k` (kernel WireGuard) and `zwg-live-z` (zwg) joined by a
+veth pair; the same checks plus roaming of zwg's source address. Recorded
+results: `results/wsl-netns-*.txt`.
+
+## Fuzzing
+
+`src/fuzz.zig` (and `src/noise/tests.zig`) hold `std.testing.fuzz` targets:
+noise message parsers / consumers (with valid MAC1 half the time), `.conf`
+parser (round trip), keys / addresses / CIDRs / endpoints (two key decoders
+and std.base64 must agree), the allowed-IPs trie against a brute-force model,
+transport seal/open, the replay window against an exact model, the TUN packet
+paths (packetflow, packet ring, IP header parse) and a real Device fed
+valid, mutated and junk datagrams (cryptokey-routing invariants on the TUN
+output). `zig build test` runs each once on its corpus. Real coverage-guided
+fuzzing needs Linux/macOS (`--fuzz` is not implemented on Windows in this
+Zig) and ReleaseSafe (Debug fuzz builds fail with "pcs_len was zero"):
+```
+zig build test --fuzz=1M -Doptimize=ReleaseSafe -Dtest-filter="fuzz: replay"
+```
+One process per target (`-Dtest-filter`) gives per-target coverage numbers.
+
 ## Wintun (Windows TUN)
 
 The one non-Zig runtime component: a layer-3 adapter on Windows needs a signed

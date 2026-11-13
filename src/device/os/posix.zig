@@ -2,8 +2,8 @@
 //! UDP sockets whose fd is the readiness handle, and poll(2) over
 //! {sockets, TUN fd, wakers} with the next timer deadline as the timeout.
 //!
-//! Status: compiles for Linux; exercised only on Windows so far (the owner's
-//! machine). `zwg down` on POSIX is not wired up yet (SIGINT/SIGTERM stop a
+//! Status: unit tests pass on Linux (WSL2) and the live netns test runs zwg on
+//! it against kernel WireGuard (tests/interop/live_linux.zig). `zwg down` on POSIX is not wired up yet (SIGINT/SIGTERM stop a
 //! foreground `zwg up`).
 
 const std = @import("std");

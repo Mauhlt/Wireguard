@@ -431,6 +431,20 @@ const keepalive_shape: [32]u8 = blk: {
     break :blk b;
 };
 
+/// A corpus entry for `fuzzOne`: Smith decodes a `slice` draw as a
+/// little-endian u32 length followed by the bytes (raw message bytes would be
+/// read as a length and truncated).
+fn sliceInput(comptime bytes: []const u8) []const u8 {
+    const S = struct {
+        const data = blk: {
+            var len: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len, @intCast(bytes.len), .little);
+            break :blk len ++ bytes[0..bytes.len].*;
+        };
+    };
+    return &S.data;
+}
+
 const FuzzCtx = struct {
     local: noise.Local,
     peer: noise.Local,
@@ -439,7 +453,21 @@ const FuzzCtx = struct {
 fn fuzzOne(ctx: FuzzCtx, smith: *testing.Smith) anyerror!void {
     var buf: [256]u8 = undefined;
     const len = smith.slice(&buf);
+    // Anyone who knows the responder's public key can make mac1 valid, so
+    // half the time do that to get past the cheap check into the DH / AEAD
+    // paths and the under-load mac2 / cookie-reply path.
+    if (smith.boolWeighted(1, 1)) fixMac1(&ctx.local.public, buf[0..len]);
     try exercise(ctx, buf[0..len]);
+}
+
+fn fixMac1(public: *const crypto.PublicKey, msg: []u8) void {
+    const off: usize = switch (msg.len) {
+        noise.Initiation.size => 116,
+        noise.Response.size => 60,
+        else => return,
+    };
+    const key = crypto.hash(&.{ noise.label_mac1, public });
+    msg[off..][0..16].* = crypto.mac(&key, &.{msg[0..off]});
 }
 
 /// Feed arbitrary bytes through dispatch, parsing, MAC checks and the
@@ -483,11 +511,11 @@ test "fuzz message parsers and consumers" {
         .peer = noise.Local.init(try crypto.keyFromBase64(s_i_priv)),
     };
     try testing.fuzz(ctx, fuzzOne, .{ .corpus = &.{
-        &golden_psk.initiation,
-        &golden_psk.response,
-        &golden_cookie.reply,
-        &golden_cookie.initiation2,
-        &keepalive_shape,
+        sliceInput(&golden_psk.initiation),
+        sliceInput(&golden_psk.response),
+        sliceInput(&golden_cookie.reply),
+        sliceInput(&golden_cookie.initiation2),
+        sliceInput(&keepalive_shape),
     } });
 }
 

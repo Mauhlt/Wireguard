@@ -8,4 +8,5 @@ pub const service = @import("service/root.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("fuzz.zig");
 }
