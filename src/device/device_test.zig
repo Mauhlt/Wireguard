@@ -243,3 +243,46 @@ test "run returns when the external stop handle (zwg down) is signaled" {
     stop.signal();
     t.join();
 }
+
+test "control hook runs on the loop thread when its handle is signaled" {
+    const gpa = testing.allocator;
+    var clock: dev.Clock = .{ .io = testing.io };
+    var fake: tun.FakeTun = try .init(gpa, .{});
+    defer fake.deinit();
+    var priv: crypto.PrivateKey = @splat(9);
+    crypto.clampPrivateKey(&priv);
+    const d = try Device.create(gpa, &clock, fake.tun(), .{
+        .private_key = priv,
+        .peers = &.{.{ .public_key = @splat(7), .allowed_ips = &.{try ip.Cidr.parse("10.9.0.2/32")} }},
+    });
+    defer d.destroy();
+
+    const Ctx = struct {
+        request: tun.queue.Waker,
+        done: tun.queue.Waker,
+        calls: u32 = 0,
+        peers: usize = 0,
+        fn ready(ctx: *anyopaque, dv: *Device) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.request.clear();
+            c.calls += 1;
+            c.peers = dv.peers.items.len;
+            c.done.signal();
+        }
+    };
+    var ctx: Ctx = .{ .request = try .init(), .done = try .init() };
+    defer ctx.request.deinit();
+    defer ctx.done.deinit();
+    d.control = .{ .handle = ctx.request.handle, .ctx = &ctx, .ready = Ctx.ready };
+
+    const t = try std.Thread.spawn(.{}, Device.run, .{d});
+    for (1..4) |i| {
+        ctx.request.signal();
+        try testing.expectEqual(@as(?usize, 0), try os.wait(&.{ctx.done.handle}, 2 * std.time.ns_per_s));
+        ctx.done.clear();
+        try testing.expectEqual(@as(u32, @intCast(i)), ctx.calls);
+    }
+    try testing.expectEqual(@as(usize, 1), ctx.peers);
+    d.stop();
+    t.join();
+}

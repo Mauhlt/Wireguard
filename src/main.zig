@@ -5,6 +5,8 @@
 //!   zwg show <file.conf>     the parsed configuration, `wg show` style, no secrets
 //!   zwg up <file.conf>       run the tunnel in the foreground (Ctrl+C or `zwg down` stops it)
 //!   zwg down <name|file.conf>  stop a running `zwg up` for that interface
+//!   zwg installtunnel / uninstalltunnel / show [<name>] / down / up <name>
+//!                            installed tunnels on Windows (src/service/cli.zig)
 //!
 //! The interface name is the file name without ".conf" (as wg-quick and
 //! WireGuard for Windows name tunnels).
@@ -14,6 +16,10 @@ const wg = @import("WireGuard");
 const dev = wg.device;
 const keys = dev.keys;
 const config = dev.config;
+const is_windows = @import("builtin").os.tag == .windows;
+
+// In the tunnel service, std.log output goes to the tunnel's log file.
+pub const std_options: std.Options = .{ .logFn = if (is_windows) wg.service.log.logFn else std.log.defaultLog };
 
 const usage =
     \\Usage: zwg <command> [arguments]
@@ -26,7 +32,7 @@ const usage =
     \\                         test mode: the TUN is a 127.0.0.1 UDP socket (tests/interop)
     \\  down <name|file.conf>  stop a tunnel started with `zwg up`
     \\
-;
+++ (if (is_windows) "\nInstalled tunnels (Windows service; nothing else runs elevated):\n" ++ wg.service.cli.usage else "");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -59,6 +65,9 @@ fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.I
         try errw.writeAll(usage);
         return 1;
     }
+    // installtunnel, uninstalltunnel, show/down/up <installed name>, and the
+    // service's internal verbs (src/service/cli.zig).
+    if (is_windows) if (try wg.service.cli.dispatch(gpa, io, args, out, errw)) |code| return code;
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "genkey") and args.len == 1) {
         var k = keys.generatePrivate(io);

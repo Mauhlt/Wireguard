@@ -1,8 +1,9 @@
 # Interop and known-answer harness
 
 ```
-zig build interop        # golden/KAT tests + two-process loopback (no admin)
-zig build interop-live   # builds zig-out\bin\zwg-interop-live.exe (run it elevated, once)
+zig build interop         # golden/KAT tests + two-process loopback (no admin)
+zig build interop-live    # builds zig-out\bin\zwg-interop-live.exe (run it elevated, once)
+zig build interop-service # builds zig-out\bin\zwg-service-live.exe (run it elevated, once)
 ```
 
 | File | What it is |
@@ -13,6 +14,7 @@ zig build interop-live   # builds zig-out\bin\zwg-interop-live.exe (run it eleva
 | `loopback.zig` | Two peers as two real processes on 127.0.0.1, their TUNs replaced by `UdpTun` sockets the runner feeds and reads; UDP datagrams both ways. |
 | `refpeer.zig` | Minimal one-peer endpoint on the reference model with the same CLI as zwg. `zig build interop` runs the loopback zwg+zwg, refpeer+refpeer and zwg+refpeer (cross-implementation, real processes). |
 | `live.zig` | Live interop driver against the installed WireGuard for Windows. |
+| `service_live.zig` | End-to-end check of the tunnel service (`zwg installtunnel`), run once elevated; see "Elevation design". |
 | `drive.zig`, `ip.zig` | Shared helpers: keys, `.conf` files, processes, IPv4/UDP packets. |
 
 ## CLI contract: `zwg up --tun udp:<port>`
@@ -109,20 +111,122 @@ open the session afterwards.
 
 Options considered:
 
-1. **`zwg up` from an elevated prompt.** Works today: `Wintun.open` checks
-   `TokenElevation` first and returns `error.AccessDenied` (zwg prints
-   `tun.windows.elevation_hint`). Fine for development and the interop test.
+1. **`zwg up` from an elevated prompt.** `Wintun.open` checks `TokenElevation`
+   first and returns `error.AccessDenied` (zwg prints
+   `tun.windows.elevation_hint`). Kept for development and the interop tests.
 2. **Self-elevating `zwg up`** (ShellExecuteEx "runas" of itself). A UAC prompt on
-   every `up`, and an elevated process with the user's whole environment.
-3. **Tunnel service (proposed).** `zwg installtunnel <conf>` (one UAC prompt via
-   "runas") registers a per-tunnel Windows service that runs `zwg` as LocalSystem
-   with only the data plane, exactly like `wireguard.exe /installtunnelservice`.
-   Unelevated `zwg show/down` talk to it over a named pipe whose DACL admits
-   SYSTEM, Administrators and the installing user, using the cross-platform
-   `wg` UAPI text protocol. The service needs no network access beyond its UDP
-   socket and holds the private key only in memory (the .conf is stored with a
-   SYSTEM-only DACL).
+   every `up`, and an elevated process with the user's whole environment. Rejected.
+3. **Tunnel service — built (owner decision 2026-11-12), `src/service/`.**
+   Nothing the user launches runs elevated; the model is WireGuard for Windows'
+   `/installtunnelservice`.
 
-Recommendation: ship (1) now, build (3) for real use. It keeps the Portal rule —
-nothing the user launches runs elevated by default — and matches how the official
-client is deployed, so the owner's mental model carries over.
+### The tunnel service (`zwg installtunnel`)
+
+```
+zwg installtunnel <file.conf> [--auto]   one UAC prompt: install + start
+zwg show                                 installed tunnels and their state      (unelevated)
+zwg show <name>                          live status over the control pipe      (unelevated)
+zwg down <name> / zwg up <name>          stop / start the service               (unelevated, installing user)
+zwg uninstalltunnel <name>               one UAC prompt: stop + remove everything
+```
+
+**Elevation, once per install/uninstall.** The unelevated `zwg` validates the
+.conf, then re-launches itself with ShellExecuteEx "runas" and a narrow internal
+verb (`/installtunnel-elevated <abs path> <user SID> <auto>` or
+`/uninstalltunnel-elevated <name>`), hidden, and waits on the child's process
+handle for its exit code (mapped to a message, including the service's own
+failure reason). From an already elevated prompt the same code runs in-process.
+The elevated child re-reads and re-validates everything it is handed.
+
+**Storage** (`store.zig`):
+
+```
+%ProgramData%\zwg\                       O:BA, D:PAI (SYSTEM, Administrators: full; inherited)
+  tunnels\<name>\tunnel.conf.dpapi       the .conf, DPAPI machine scope + fixed entropy
+  tunnels\<name>\zwg.exe, wintun.dll     what the service runs (copied at install)
+  logs\<name>.log (+ .old)               bounded to 1 MiB each, never keys
+```
+
+The ACL is the access control: no non-admin process can open the files. DPAPI
+(`CRYPTPROTECT_LOCAL_MACHINE`) is defence in depth: a copy of the file (backup,
+image without the machine's LSA secrets) is ciphertext; machine scope because
+the installer (elevated user) writes and the service (SYSTEM) reads. The
+service binary is copied into the protected tree so LocalSystem never runs an
+executable a user could replace (zig-out\bin is user-writable). %ProgramData%
+comes from `SHGetKnownFolderPath`, never the environment. Users may create
+folders in %ProgramData%, so a pre-existing `zwg` folder is used only if it is a
+real directory (no junction/symlink) owned by Administrators or SYSTEM; its DACL
+is reset either way.
+
+**Service** (`scm.zig`): `zwgTunnel$<name>`, SERVICE_WIN32_OWN_PROCESS,
+LocalSystem, demand start (or automatic with `--auto`), depends on Nsi and
+TcpIp, binary `"<store>\tunnels\<name>\zwg.exe" /tunnelservice <name> <user SID>`,
+service SID type unrestricted (its own SID for firewall rules; a restricted SID
+would need write-restricted ACEs on everything Wintun/NSI touch), failure
+actions: restart after 2 s, again after 5 s, then stay stopped (counter reset
+after a day, also on non-crash failure exits such as DNS not ready at boot).
+Its DACL is Windows' default plus the installing user with query
+status/config, start, stop, interrogate (not change config, delete, WRITE_DAC):
+that is what `zwg down/up <name>` use, unelevated.
+
+**Service process** (`tunnel.zig`, `state.zig`): ServiceMain registers a
+control handler and reports START_PENDING (wait hint 30 s, checkpoint per
+step), decrypts and parses the conf, resolves endpoints, creates the Wintun
+adapter, sets addresses and routes, creates the device, opens the control
+pipe, reports RUNNING (accepting STOP and SHUTDOWN), runs the device loop.
+STOP/SHUTDOWN set the device's `external_stop` event; then STOP_PENDING,
+teardown (closing the adapter removes it with its addresses and routes),
+STOPPED with a service-specific exit code naming the reason. A stop that
+arrives while starting is remembered (the SCM never sees RUNNING after it
+asked to stop). std.log output goes to the tunnel's log.
+
+**Control pipe** (`pipe.zig`, `sddl.zig`): `\\.\pipe\ProtectedPrefix\Administrators\zwg\<name>`
+(only Administrators/SYSTEM can create pipes under that prefix, so nobody can
+squat the name and impersonate the service to `zwg show`; plus
+FILE_FLAG_FIRST_PIPE_INSTANCE and PIPE_REJECT_REMOTE_CLIENTS) with an explicit
+DACL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x120083;;;<user SID>)`: the installing user
+gets read/write data only (not FILE_CREATE_PIPE_INSTANCE, WRITE_DAC, ...),
+nobody else gets anything, and without a mandatory label nothing below medium
+integrity can write. The server runs on its own thread with overlapped I/O,
+5 s per client, one client at a time; the device state is snapshotted on the
+device's loop thread through `Device.control`, so clients never touch the data
+path. Clients connect with identification-level impersonation only.
+
+**Protocol** (`uapi.zig`): the cross-platform `wg` UAPI text protocol
+(wireguard.com/xplatform), read-only subset. `get=1` answers `listen_port`,
+then per peer `public_key`, `endpoint`, `last_handshake_time_sec/nsec`,
+`tx_bytes`, `rx_bytes`, `persistent_keepalive_interval`, `allowed_ip`,
+`protocol_version=1`, then `errno=0`. Decision: **no private or preshared key
+is ever sent**, to anyone (unlike wg, which returns `private_key` to its
+admin-only callers): the callers include the unelevated user, and an admin can
+read the stored configuration. The interface public key is sent as the
+extension key `zwg_public_key=` (wg's parser ignores unknown keys). `set=1` is
+refused with `errno=-1` (configuration changes = reinstall, elevated); anything
+else gets `errno=-22`. The client-side decoder is bounded (1 MiB, 256-byte
+lines, peer and allowed-IP limits) and treats the response as hostile.
+
+**Uninstall**: stop, wait for the service process to exit, delete the service,
+overwrite and delete the stored conf, delete the binaries and the log, remove
+the directories that are now empty. The adapter goes away when the service
+closes it on stop (uninstall waits for the service process to exit first).
+
+### End-to-end check (run once, elevated)
+
+Prerequisite: `wintun.dll` next to `zig-out\bin\zwg.exe` (see Wintun above) or
+in System32. Then, as your normal user `zig build interop-service`, and in
+**Terminal (Admin)** in the repo:
+
+```
+zig-out\bin\zwg-service-live.exe --zwg zig-out\bin\zwg.exe
+```
+
+It installs `zwgTunnel$zwgsvctest` (10.79.0.1/24, peer 10.79.0.2 = a plain
+`zwg up --tun udp:<port>` process on 127.0.0.1), checks the store's DACL and
+encryption, then — impersonating an ordinary-user version of your token
+(Administrators deny-only, medium integrity) — reads the handshake over the
+pipe, sends UDP both ways through the real Wintun adapter, checks another
+user is refused, runs `down` and `up`, then `zwg uninstalltunnel` and checks
+the service, `%ProgramData%\zwg\tunnels\zwgsvctest`, the log and the adapter
+are gone. On any failure it uninstalls anyway, kills the peer and shreds both
+temporary .conf files in %TEMP%. Source: `service_live.zig` (separate from
+`live.zig` so the two can be folded into one live run later).
