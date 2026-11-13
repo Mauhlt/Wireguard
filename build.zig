@@ -207,5 +207,21 @@ pub fn build(b: *std.Build) void {
         live_wsl_step.dependOn(b.getInstallStep());
         live_wsl_step.dependOn(live_linux_step);
         interop.dependOn(&live_wsl.step); // keep it compiling
+
+        // The tunnel service (zwg installtunnel) end to end: built here,
+        // run once by hand from an elevated prompt (tests/interop/README.md).
+        const service_live = b.addExecutable(.{
+            .name = "zwg-service-live",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/interop/service_live.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "WireGuard", .module = mod }},
+            }),
+        });
+        const service_step = b.step("interop-service", "Build zwg-service-live.exe (run it elevated; see tests/interop/README.md)");
+        service_step.dependOn(&b.addInstallArtifact(service_live, .{}).step);
+        service_step.dependOn(b.getInstallStep());
+        interop.dependOn(&service_live.step); // keep it compiling
     }
 }

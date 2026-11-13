@@ -136,6 +136,9 @@ pub const Device = struct {
     stop_requested: std.atomic.Value(bool) = .init(false),
     /// Extra handle that stops the loop when ready (`zwg down`).
     external_stop: ?os.WaitHandle = null,
+    /// Extra wait source serviced on the loop thread (the tunnel service's
+    /// control pipe asks for status snapshots through it).
+    control: ?Control = null,
 
     stats: Stats = .{},
     rx_buf: []u8,
@@ -143,6 +146,15 @@ pub const Device = struct {
     pkt_buf: []u8,
     /// Staged packets are popped into this (never aliases the others).
     flush_buf: []u8,
+
+    /// `ready` runs on the loop thread whenever `handle` is signalled (it
+    /// must reset the handle unless it is auto-reset), so it may read the
+    /// device's state without locking. It must not block.
+    pub const Control = struct {
+        handle: os.WaitHandle,
+        ctx: *anyopaque,
+        ready: *const fn (ctx: *anyopaque, d: *Device) void,
+    };
 
     pub const InitError = error{ OutOfMemory, SystemResources, DuplicatePeer, InvalidPeer } || os.OpenError;
 
@@ -300,12 +312,17 @@ pub const Device = struct {
             if (d.stop_requested.load(.acquire)) return;
             now = d.clock.now();
             const deadline = d.fireTimers(now);
-            var handles: [5]os.WaitHandle = undefined;
+            var handles: [6]os.WaitHandle = undefined;
             var n: usize = 0;
             handles[n] = d.waker.handle;
             n += 1;
             if (d.external_stop) |h| {
                 handles[n] = h;
+                n += 1;
+            }
+            const control_index = n;
+            if (d.control) |c| {
+                handles[n] = c.handle;
                 n += 1;
             }
             if (d.udp4) |*u| {
@@ -324,6 +341,7 @@ pub const Device = struct {
             if (ready) |r| {
                 if (r == 0) d.waker.clear();
                 if (d.external_stop != null and r == 1) return;
+                if (d.control) |c| if (r == control_index) c.ready(c.ctx, d);
             }
             more = false;
             now = d.clock.now();
