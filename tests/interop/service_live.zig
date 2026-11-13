@@ -284,7 +284,7 @@ fn checkStore(gpa: std.mem.Allocator) !void {
     const p = try svc.store.Paths.init(name);
     var wbuf: [300]u16 = undefined;
     {
-        const w = try win.W(&wbuf, p.root);
+        const w = try win.W(&wbuf, p.root());
         var dacl: ?*win.ACL = null;
         var owner: ?win.PSID = null;
         var sd: ?win.PSECURITY_DESCRIPTOR = null;
@@ -298,19 +298,19 @@ fn checkStore(gpa: std.mem.Allocator) !void {
         if (dacl.?.ace_count != 2) return drive.fail("store DACL has {d} ACEs, expected 2 (SYSTEM, Administrators)", .{dacl.?.ace_count});
         if (win.IsWellKnownSid(owner.?, win.WinBuiltinAdministratorsSid) == 0) return drive.fail("store owner is not Administrators", .{});
     }
-    const blob = try svc.store.readAll(gpa, p.conf, 1 << 20);
+    const blob = try svc.store.readAll(gpa, p.conf(), 1 << 20);
     defer gpa.free(blob);
     if (std.mem.indexOf(u8, blob, "PrivateKey") != null or std.mem.indexOf(u8, blob, "[Interface]") != null)
         return drive.fail("the stored configuration is plaintext", .{});
     {
         const t = try asUser(false);
         defer revert(t);
-        if (svc.store.readAll(gpa, p.conf, 1 << 20)) |b| {
+        if (svc.store.readAll(gpa, p.conf(), 1 << 20)) |b| {
             gpa.free(b);
             return drive.fail("an ordinary-user token could read the stored configuration", .{});
         } else |err| if (err != error.AccessDenied) return drive.fail("expected AccessDenied reading the store, got {s}", .{@errorName(err)});
     }
-    std.debug.print("  {s}: protected, {d} bytes of DPAPI ciphertext, ordinary user denied\n", .{ p.conf, blob.len });
+    std.debug.print("  {s}: protected, {d} bytes of DPAPI ciphertext, ordinary user denied\n", .{ p.conf(), blob.len });
 }
 
 fn checkGone(arena: std.mem.Allocator, io: Io) !void {
@@ -323,8 +323,8 @@ fn checkGone(arena: std.mem.Allocator, io: Io) !void {
         return drive.fail("the service still exists", .{});
     } else |_| {}
     const p = try svc.store.Paths.init(name);
-    if (svc.store.exists(p.dir)) return drive.fail("{s} still exists", .{p.dir});
-    if (svc.store.exists(p.log)) return drive.fail("{s} still exists", .{p.log});
+    if (svc.store.exists(p.dir())) return drive.fail("{s} still exists", .{p.dir()});
+    if (svc.store.exists(p.log())) return drive.fail("{s} still exists", .{p.log()});
     const r = try drive.run(arena, io, &.{ "netsh", "interface", "show", "interface" });
     if (std.mem.indexOf(u8, r.stdout, name) != null) return drive.fail("the adapter {s} still exists", .{name});
 }
