@@ -339,30 +339,7 @@ fn queryNamed(gpa: std.mem.Allocator, pipe_name: []const u8, timeout_ms: u32) Qu
     const name_w = win.W(&wb, pipe_name) catch return error.Unexpected;
     const deadline = win.GetTickCount64() + timeout_ms;
 
-    const h = blk: for (0..3) |_| {
-        const h = win.CreateFileW(
-            name_w.ptr,
-            win.FILE_READ_DATA | win.FILE_WRITE_DATA | win.SYNCHRONIZE,
-            0,
-            null,
-            win.OPEN_EXISTING,
-            win.FILE_FLAG_OVERLAPPED | win.SECURITY_SQOS_PRESENT | win.SECURITY_IDENTIFICATION,
-            null,
-        );
-        if (h != win.INVALID_HANDLE_VALUE) break :blk h;
-        switch (win.GetLastError()) {
-            win.ERROR_FILE_NOT_FOUND, win.ERROR_PATH_NOT_FOUND => return error.NotRunning,
-            win.ERROR_ACCESS_DENIED => return error.AccessDenied,
-            // Another client is being served: the kernel wakes us when the
-            // instance is free (no polling), bounded by the deadline.
-            win.ERROR_PIPE_BUSY => {
-                const now = win.GetTickCount64();
-                if (now >= deadline) return error.Busy;
-                _ = win.WaitNamedPipeW(name_w.ptr, @intCast(deadline - now));
-            },
-            else => return error.Unexpected,
-        }
-    } else return error.Busy;
+    const h = try open(name_w, win.FILE_FLAG_OVERLAPPED | win.SECURITY_SQOS_PRESENT | win.SECURITY_IDENTIFICATION, deadline);
     defer _ = win.CloseHandle(h);
     const event = win.CreateEventW(null, 1, 0, null) orelse return error.Unexpected;
     defer _ = win.CloseHandle(event);
@@ -385,6 +362,30 @@ fn queryNamed(gpa: std.mem.Allocator, pipe_name: []const u8, timeout_ms: u32) Qu
         if (complete(buf.items)) break;
     }
     return buf.toOwnedSlice(gpa);
+}
+
+/// Open the server's pipe instance, waiting (in WaitNamedPipe, until
+/// `deadline`, tick ms) while it is busy. The server has one instance, so
+/// it is busy not only while another client is served but also in the
+/// short gap after a client leaves, before the server has disconnected and
+/// re-armed it: ERROR_PIPE_BUSY is a normal answer, not a failure.
+fn open(name_w: [:0]const u16, flags: u32, deadline: u64) QueryError!win.HANDLE {
+    while (true) {
+        const h = win.CreateFileW(name_w.ptr, win.FILE_READ_DATA | win.FILE_WRITE_DATA | win.SYNCHRONIZE, 0, null, win.OPEN_EXISTING, flags, null);
+        if (h != win.INVALID_HANDLE_VALUE) return h;
+        switch (win.GetLastError()) {
+            win.ERROR_FILE_NOT_FOUND, win.ERROR_PATH_NOT_FOUND => return error.NotRunning,
+            win.ERROR_ACCESS_DENIED => return error.AccessDenied,
+            // The kernel wakes us when the instance is listening again (no
+            // polling); another client may win it, so retry until the deadline.
+            win.ERROR_PIPE_BUSY => {
+                const now = win.GetTickCount64();
+                if (now >= deadline) return error.Busy;
+                _ = win.WaitNamedPipeW(name_w.ptr, @intCast(deadline - now));
+            },
+            else => return error.Unexpected,
+        }
+    }
 }
 
 /// A response is complete when it ends with an "errno=..." line and a blank line.
@@ -433,16 +434,11 @@ fn rep(comptime s: []const u8, comptime n: usize) []const u8 {
 fn exchange(gpa: std.mem.Allocator, pipe_name: []const u8, request: []const u8) ![]u8 {
     var wb: [128]u16 = undefined;
     const name_w = try win.W(&wb, pipe_name);
-    const h = for (0..3) |_| {
-        const h = win.CreateFileW(name_w.ptr, win.FILE_READ_DATA | win.FILE_WRITE_DATA | win.SYNCHRONIZE, 0, null, win.OPEN_EXISTING, win.FILE_FLAG_OVERLAPPED, null);
-        if (h != win.INVALID_HANDLE_VALUE) break h;
-        if (win.GetLastError() != win.ERROR_PIPE_BUSY) return error.OpenFailed;
-        _ = win.WaitNamedPipeW(name_w.ptr, 3000);
-    } else return error.OpenFailed;
+    const deadline = win.GetTickCount64() + 3000;
+    const h = try open(name_w, win.FILE_FLAG_OVERLAPPED, deadline);
     defer _ = win.CloseHandle(h);
     const ev = win.CreateEventW(null, 1, 0, null).?;
     defer _ = win.CloseHandle(ev);
-    const deadline = win.GetTickCount64() + 3000;
     var req_buf: [8192]u8 = undefined;
     @memcpy(req_buf[0..request.len], request);
     var off: usize = 0;
@@ -556,11 +552,12 @@ test "control pipe end to end: device state over get=1, set refused, garbage ref
     }
 
     // A client that connects and says nothing is dropped at the deadline,
-    // and the next client is served.
+    // and the next client is served. (It opens like a real client: right
+    // after the previous client left, the single instance may not be
+    // listening yet, and a bare CreateFileW then gets ERROR_PIPE_BUSY.)
     {
         var wb: [128]u16 = undefined;
-        const silent = win.CreateFileW((try win.W(&wb, pipe_name)).ptr, win.FILE_READ_DATA | win.FILE_WRITE_DATA | win.SYNCHRONIZE, 0, null, win.OPEN_EXISTING, 0, null);
-        try testing.expect(silent != win.INVALID_HANDLE_VALUE);
+        const silent = try open(try win.W(&wb, pipe_name), 0, win.GetTickCount64() + client_deadline_ms);
         defer _ = win.CloseHandle(silent);
         const r = try queryNamed(gpa, pipe_name, 3 * client_deadline_ms); // waits in WaitNamedPipe, then served
         gpa.free(r);
