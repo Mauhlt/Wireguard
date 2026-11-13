@@ -153,25 +153,27 @@ pub fn main(init: std.process.Init) !void {
         } else |err| if (err != error.AccessDenied) return drive.fail("expected AccessDenied, got {s}", .{@errorName(err)});
     }
 
-    // As the ordinary user would: zwg down / up as its own process whose
-    // primary token is the restricted one (not by impersonating it on one of
-    // our threads, which the SCM's state notification refuses).
-    drive.step("as an ordinary user (own process): zwg down {s}, zwg up {s}", .{ name, name });
+    // zwg down / up while impersonating the ordinary user. The SCM refuses
+    // to deliver state notifications to an impersonating thread, so this
+    // also exercises zwg's "cannot watch" path: it must still succeed from
+    // one final status query. The driver then waits for the state itself.
+    drive.step("as an ordinary user: zwg down {s}, zwg up {s}", .{ name, name });
     {
-        const t = win.restrictedToken(false) catch return drive.fail("cannot build a restricted token", .{});
-        defer _ = win.CloseHandle(t);
-        const steps = [_]struct { verb: []const u8, want: u32 }{
-            .{ .verb = "down", .want = win.SERVICE_STOPPED },
-            .{ .verb = "up", .want = win.SERVICE_RUNNING },
+        var ebuf: [512]u8 = undefined;
+        var ew = Io.File.stderr().writer(io, &ebuf);
+        defer ew.interface.flush() catch {};
+        const steps = [_]struct { verb: []const u8, action: svc.cli.Action, want: u32 }{
+            .{ .verb = "down", .action = .stop, .want = win.SERVICE_STOPPED },
+            .{ .verb = "up", .action = .start, .want = win.SERVICE_RUNNING },
         };
         for (steps) |c| {
-            var cmd_buf: [1024]u8 = undefined;
-            const cmd = std.fmt.bufPrint(&cmd_buf, "\"{s}\" {s} {s}", .{ zwg_path, c.verb, name }) catch return drive.fail("command line too long", .{});
-            var out: [2048]u8 = undefined;
-            const r = win.runAsToken(t, cmd, &out, 60_000) catch |err| return drive.fail("zwg {s} as the ordinary user: {s}", .{ c.verb, @errorName(err) });
-            std.debug.print("{s}", .{r.output});
-            if (r.exit_code != 0) return drive.fail("{s} failed for the installing user (exit {d})", .{ c.verb, r.exit_code });
-            try expectState(c.want);
+            {
+                const t = try asUser(false);
+                defer revert(t);
+                if ((try svc.cli.controlTunnel(name, c.action, &ew.interface, &ew.interface)) != @as(?u8, 0))
+                    return drive.fail("{s} failed for the installing user", .{c.verb});
+            }
+            try waitState(c.want);
         }
     }
     try waitForHandshake(gpa, io, peer_keys.public);
@@ -212,6 +214,16 @@ fn revert(t: win.HANDLE) void {
     _ = win.CloseHandle(t);
 }
 
+/// Waits (SCM notification, bounded) until the service reaches `want`.
+fn waitState(want: u32) !void {
+    var m = try svc.scm.Manager.open(win.SC_MANAGER_CONNECT);
+    defer m.close();
+    var s = try svc.scm.Service.open(&m, name, win.SERVICE_QUERY_STATUS);
+    defer s.close();
+    const st = s.waitFor(want, 30_000) catch |err| return drive.fail("waiting for {s}: {s}", .{ svc.scm.stateName(want), @errorName(err) });
+    if (st.status.current_state != want)
+        return drive.fail("service state {s}, expected {s}", .{ svc.scm.stateName(st.status.current_state), svc.scm.stateName(want) });
+}
 fn expectState(want: u32) !void {
     var m = try svc.scm.Manager.open(win.SC_MANAGER_CONNECT);
     defer m.close();
