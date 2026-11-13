@@ -208,7 +208,7 @@ lines, peer and allowed-IP limits) and treats the response as hostile.
 **Uninstall**: stop, wait for the service process to exit, delete the service,
 overwrite and delete the stored conf, delete the binaries and the log, remove
 the directories that are now empty. The adapter goes away when the service
-closes it (and Wintun removes adapters of a process that dies).
+closes it on stop (uninstall waits for the service process to exit first).
 
 ### End-to-end check (run once, elevated)
 

@@ -77,7 +77,7 @@ pub const Peer = struct {
 /// Upper bound of `encodeGet`'s output for `peers` peers with
 /// `allowed_ips` allowed IPs in total (to size a fixed buffer once).
 pub fn maxGetLen(peers: usize, allowed_ips: usize) usize {
-    return 128 + peers * 384 + allowed_ips * 64;
+    return 128 + peers * 512 + allowed_ips * 64;
 }
 
 pub fn encodeGet(w: *std.Io.Writer, iface: Interface, peers: []const Peer) std.Io.Writer.Error!void {
