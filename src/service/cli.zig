@@ -248,7 +248,7 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
         c.deinit();
     }
 
-    const paths = store.Paths.init(name) catch return .store_failed;
+    const paths = store.Paths.init(name) catch |err| return storeFail("store paths", err);
     var m = scm.Manager.open(win.SC_MANAGER_CONNECT | win.SC_MANAGER_CREATE_SERVICE) catch return .not_elevated;
     defer m.close();
     if (scm.Service.open(&m, name, win.SERVICE_QUERY_STATUS)) |s_| {
@@ -263,7 +263,7 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
     // directory, where we copy the DLL from next to us, or System32).
     _ = tun.windows.probe() catch return .wintun_missing;
 
-    store.prepare(&paths) catch |err| return if (err == error.UntrustedDirectory) .untrusted_dir else .store_failed;
+    store.prepare(&paths) catch |err| return if (err == error.UntrustedDirectory) .untrusted_dir else storeFail("create the store directories", err);
     log.open(paths.log) catch {};
     defer log.close();
     log.print("installtunnel {s}: for user {s}, start {s}", .{ name, user_sid, if (auto) "automatic" else "on demand" });
@@ -284,7 +284,7 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
     const exe_path = paths.inDir(&exe_buf, store.exe_file) catch return .store_failed;
     store.copyInto(gpa, self_path, exe_path) catch |err| {
         log.print("copy zwg.exe: {s}", .{@errorName(err)});
-        return .store_failed;
+        return storeFail("copy zwg.exe", err);
     };
     var dll_src_buf: [1800]u8 = undefined;
     const dll_src = std.fmt.bufPrint(&dll_src_buf, "{s}\\" ++ store.wintun_file, .{std.fs.path.dirname(self_path) orelse "."}) catch return .store_failed;
@@ -292,12 +292,12 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
         var dll_buf: [400]u8 = undefined;
         store.copyInto(gpa, dll_src, paths.inDir(&dll_buf, store.wintun_file) catch return .store_failed) catch |err| {
             log.print("copy wintun.dll: {s}", .{@errorName(err)});
-            return .store_failed;
+            return storeFail("copy wintun.dll", err);
         };
     }
     store.storeConfig(gpa, &paths, text) catch |err| {
         log.print("store configuration: {s}", .{@errorName(err)});
-        return .store_failed;
+        return storeFail("store the encrypted configuration", err);
     };
 
     var s = scm.create(&m, .{ .tunnel = name, .exe_path = exe_path, .user_sid = user_sid, .auto_start = auto }) catch |err| {
@@ -379,6 +379,14 @@ pub fn elevatedUninstall(name: []const u8) Result {
 }
 
 /// Stored configuration (wiped), the binaries, the tunnel directory.
+/// Says which install step failed and why on stderr (the log under the store
+/// is rolled back with it), then reports the generic store failure.
+fn storeFail(step: []const u8, err: anyerror) Result {
+    const last = win.GetLastError();
+    std.debug.print("zwg: {s} failed: {s} (last Windows error {d})\n", .{ step, @errorName(err), last });
+    return .store_failed;
+}
+
 fn removeFiles(paths: *const store.Paths) void {
     store.wipe(paths.conf) catch {};
     var buf: [400]u8 = undefined;
