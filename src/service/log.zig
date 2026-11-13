@@ -13,6 +13,9 @@ var lock: win.SRWLOCK = .{};
 var handle: ?win.HANDLE = null;
 var written: u64 = 0;
 var path_w: [300]u16 = undefined;
+/// The installer and the service it starts append to the same file
+/// (FILE_APPEND_DATA writes are atomic appends); rotation renames it.
+const share = win.FILE_SHARE_READ | win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE;
 var old_w: [304]u16 = undefined;
 
 /// Start logging to `path` (UTF-8). Without a successful `open`, `print`
@@ -40,7 +43,7 @@ pub fn isOpen() bool {
 }
 
 fn reopen() store.Error!void {
-    const h = win.CreateFileW(@ptrCast(&path_w), win.FILE_APPEND_DATA | win.SYNCHRONIZE, win.FILE_SHARE_READ, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    const h = win.CreateFileW(@ptrCast(&path_w), win.FILE_APPEND_DATA | win.SYNCHRONIZE, share, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
     if (h == win.INVALID_HANDLE_VALUE) return if (win.GetLastError() == win.ERROR_ACCESS_DENIED) error.AccessDenied else error.Unexpected;
     var size: i64 = 0;
     _ = win.GetFileSizeEx(h, &size);
@@ -53,7 +56,7 @@ fn rotate() void {
     if (handle) |h| _ = win.CloseHandle(h);
     handle = null;
     _ = win.MoveFileExW(@ptrCast(&path_w), @ptrCast(&old_w), win.MOVEFILE_REPLACE_EXISTING);
-    const h = win.CreateFileW(@ptrCast(&path_w), win.FILE_APPEND_DATA | win.SYNCHRONIZE, win.FILE_SHARE_READ, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
+    const h = win.CreateFileW(@ptrCast(&path_w), win.FILE_APPEND_DATA | win.SYNCHRONIZE, share, null, win.OPEN_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, null);
     if (h == win.INVALID_HANDLE_VALUE) return;
     handle = h;
     written = 0;

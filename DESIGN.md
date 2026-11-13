@@ -20,9 +20,11 @@ src/noise/            handshake: messages 1/2, cookie reply, MAC1/MAC2, state ma
 src/session/          keypairs, transport data, counters + replay window, timers           (agent: session)
 src/device/           peers, allowed-IPs trie, config (.conf), UDP, packet routing, CLI    (agent: device)
 src/tun/              TUN per OS + interop/KAT harness                                     (agent: tun)
+src/service/          Windows tunnel service (zwg installtunnel), control pipe, wg UAPI    (agent: service)
 ```
 
-Dependencies point one way: device → session → noise → crypto; device → tun.
+Dependencies point one way: device → session → noise → crypto; device → tun;
+service → device, tun (design: tests/interop/README.md, "Elevation design").
 No module reaches into another's internals; only the public API below.
 
 ## Shared types (src/crypto.zig, owned by noise agent, frozen early)

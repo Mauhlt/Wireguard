@@ -399,3 +399,13 @@ test "write a file with an explicit DACL, read it back, wipe it" {
     try testing.expect(!exists(path));
     try wipe(path); // already gone: fine
 }
+
+test "the running executable can be copied (the installer copies itself)" {
+    var w: [600]u16 = undefined;
+    const self = try win.selfExePath(&w);
+    var buf: [1800]u8 = undefined;
+    const n = try std.unicode.utf16LeToUtf8(&buf, self);
+    const data = try readAll(testing.allocator, buf[0..n], max_binary_bytes);
+    defer testing.allocator.free(data);
+    try testing.expect(std.mem.startsWith(u8, data, "MZ"));
+}
