@@ -235,8 +235,11 @@ pub const Conn = struct {
     backoff: u8 = 0,
     rtt_seq: ?u32 = null,
     rtt_start: i64 = 0,
-    /// When the oldest unanswered retransmission started (user timeout).
+    /// When the oldest unanswered (re)transmission went out (user timeout).
     stalled_since: ?i64 = null,
+    /// stalled_since + Limits.user_timeout_ns: a deadline of its own, so the
+    /// connection gives up on time, not at the next (backed-off) RTO.
+    giveup_at: ?i64 = null,
     persist_backoff: u8 = 0,
 
     // congestion control
@@ -1080,6 +1083,7 @@ pub const Conn = struct {
         c.keepalive_at = null;
         c.delack_at = null;
         c.timewait_at = env.now +| nsI64(env.limits.time_wait_ns);
+        c.giveup_at = null;
     }
 
     pub fn fail(c: *Conn, e: ConnError) void {
@@ -1098,6 +1102,7 @@ pub const Conn = struct {
         c.timewait_at = null;
         c.tlp_at = null;
         c.tlp_now = false;
+        c.giveup_at = null;
         c.ack_now = false;
         c.send_syn = false;
         c.probe_now = false;
@@ -1106,9 +1111,34 @@ pub const Conn = struct {
 
     // ---- timers ----------------------------------------------------------------
 
+    /// Arms the retransmission timer if it is off; the first unanswered
+    /// transmission also starts the user-timeout clock.
+    fn armRto(c: *Conn, env: *const Env) void {
+        if (c.rto_at != null) return;
+        c.rto_at = env.now + c.rto;
+        c.markStalled(env);
+    }
+
+    fn markStalled(c: *Conn, env: *const Env) void {
+        if (c.stalled_since != null) return;
+        c.stalled_since = env.now;
+        c.giveup_at = env.now +| nsI64(env.limits.user_timeout_ns);
+    }
+
+    /// Limits.user_timeout_ns passed without an answer (or a half-open
+    /// connection ran out of SYN-ACK retries).
+    fn giveUp(c: *Conn, env: *const Env) Outcome {
+        env.stats.timeouts += 1;
+        if (c.state == .syn_received) {
+            c.state = .closed;
+            c.clearTimers();
+        } else c.fail(error.ConnectionTimedOut);
+        return .{ .notify = true };
+    }
+
     pub fn nextDeadline(c: *const Conn) ?i64 {
         var d: ?i64 = null;
-        for ([_]?i64{ c.rto_at, c.delack_at, c.persist_at, c.keepalive_at, c.timewait_at, c.tlp_at }) |t| {
+        for ([_]?i64{ c.rto_at, c.delack_at, c.persist_at, c.keepalive_at, c.timewait_at, c.tlp_at, c.giveup_at }) |t| {
             if (t) |v| d = if (d) |x| @min(x, v) else v;
         }
         return d;
@@ -1128,6 +1158,11 @@ pub const Conn = struct {
             c.ack_now = true;
             out.output = true;
         };
+        if (c.giveup_at) |t| if (now >= t) {
+            c.giveup_at = null;
+            // Stale if an ACK made progress since (stalled_since cleared).
+            if (c.stalled_since != null and c.rto_at != null) return c.giveUp(env);
+        };
         if (c.tlp_at) |t| if (now >= t) {
             c.tlp_at = null;
             if (!c.tlp_sent and !c.in_recovery and c.snd_una != c.snd_max) {
@@ -1139,18 +1174,10 @@ pub const Conn = struct {
         };
         if (c.rto_at) |t| if (now >= t) {
             c.rto_at = null;
-            if (c.stalled_since == null) c.stalled_since = now;
+            c.markStalled(env);
             const given_up = (now - c.stalled_since.? >= nsI64(env.limits.user_timeout_ns)) or
                 (c.state == .syn_received and c.backoff >= max_synack_retries);
-            if (given_up) {
-                env.stats.timeouts += 1;
-                if (c.state == .syn_received) {
-                    c.state = .closed;
-                    c.clearTimers();
-                } else c.fail(error.ConnectionTimedOut);
-                out.notify = true;
-                return out;
-            }
+            if (given_up) return c.giveUp(env);
             env.stats.rto_expirations += 1;
             // RFC 5681 (4): loss window; RFC 6298 5.5: back off.
             const fl = c.snd_max -% c.snd_una;
@@ -1352,7 +1379,7 @@ pub const Conn = struct {
             c.snd_nxt = end;
         }
         if (seqLt(c.snd_max, end)) c.snd_max = end;
-        if (c.rto_at == null) c.rto_at = env.now + c.rto;
+        c.armRto(env);
         if (!retransmit and c.tlp_at == null) c.armTlp(env);
         return c.emit(env, buf, ip_id, seq, flags, payload);
     }
@@ -1365,7 +1392,7 @@ pub const Conn = struct {
         }
         c.snd_nxt = c.iss +% 1;
         if (seqLt(c.snd_max, c.snd_nxt)) c.snd_max = c.snd_nxt;
-        if (c.rto_at == null) c.rto_at = env.now + c.rto;
+        c.armRto(env);
         var opts: wire.TcpOptions = .{ .mss = c.ourMss(env) };
         // Offer window scaling and SACK on our SYN; on a SYN-ACK only what
         // the peer offered.

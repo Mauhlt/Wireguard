@@ -205,6 +205,27 @@ test "user timeout: an unanswered connection fails" {
     try t.expectEqual(@as(u16, 0), r.stack.stats().connections);
 }
 
+test "user timeout: unACKed data fails at the deadline, not at the next backed-off RTO" {
+    const sec = std.time.ns_per_s;
+    var r: Rig = undefined;
+    try r.init(.{ .user_timeout_ns = 20 * sec });
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try r.established(l);
+    defer e.st.close();
+    const t0 = r.clock.now();
+    _ = try e.st.write("abc");
+    var n: usize = 0;
+    while (n < 50) : (n += 1) {
+        while (r.stack.output(&r.out)) |_| {}
+        r.fireNext() catch break;
+    }
+    try t.expectError(error.ConnectionTimedOut, e.st.read(&one));
+    // RTOs of 0.2, 0.4, ... 12.8 s would next fire at 25.4 s.
+    const elapsed = r.clock.now() - t0;
+    try t.expect(elapsed >= 20 * sec and elapsed < 20 * sec + 100 * std.time.ns_per_ms);
+}
+
 test "out-of-order segments: dup ACK, then both delivered in order" {
     var r: Rig = undefined;
     try r.init(.{});
