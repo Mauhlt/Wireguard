@@ -246,7 +246,9 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
     if (!win.isElevated()) return .not_elevated;
     const name = names.fromPath(conf_path);
     if (!names.isValid(name)) return .invalid_name;
-    if (!names.isValidSidString(user_sid)) return .bad_args;
+    // Only a user account may be granted the pipe and the service, never
+    // a group or well-known principal (Everyone, Users, ...).
+    if (!names.isAccountSidString(user_sid) or !win.isUserAccountSid(user_sid)) return .bad_args;
 
     // Read and validate again: this process trusts nothing it was handed.
     const text = std.Io.Dir.cwd().readFileAlloc(io, conf_path, gpa, .limited(config.max_config_bytes)) catch return .config_unreadable;

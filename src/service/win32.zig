@@ -260,6 +260,8 @@ pub extern "advapi32" fn CreateProcessAsUserW(token: HANDLE, app: ?LPCWSTR, cmdl
 pub extern "advapi32" fn ConvertSidToStringSidW(sid: PSID, out: *?LPWSTR) callconv(.winapi) BOOL;
 pub extern "advapi32" fn ConvertStringSidToSidW(s: LPCWSTR, out: *?PSID) callconv(.winapi) BOOL;
 pub extern "advapi32" fn IsValidSid(sid: PSID) callconv(.winapi) BOOL;
+pub extern "advapi32" fn LookupAccountSidW(system: ?LPCWSTR, sid: PSID, name: ?[*]u16, name_len: *u32, domain: ?[*]u16, domain_len: *u32, use: *c_int) callconv(.winapi) BOOL;
+pub const SidTypeUser: c_int = 1;
 pub extern "advapi32" fn EqualSid(a: PSID, b: PSID) callconv(.winapi) BOOL;
 pub extern "advapi32" fn GetLengthSid(sid: PSID) callconv(.winapi) u32;
 pub extern "advapi32" fn IsWellKnownSid(sid: PSID, kind: c_int) callconv(.winapi) BOOL;
@@ -483,6 +485,23 @@ pub fn currentUserSid(buf: []u8) error{ Unexpected, NameTooLong }![]u8 {
     return buf[0..span.len];
 }
 
+/// Does Windows know `sid` (a SID string) as a user account
+/// (LookupAccountSidW: SidTypeUser), not a group, alias or well-known SID?
+pub fn isUserAccountSid(sid: []const u8) bool {
+    var wbuf: [200]u16 = undefined;
+    const w = W(&wbuf, sid) catch return false;
+    var psid: ?PSID = null;
+    if (ConvertStringSidToSidW(w.ptr, &psid) == 0) return false;
+    defer _ = LocalFree(psid);
+    var name: [257]u16 = undefined;
+    var domain: [257]u16 = undefined;
+    var name_len: u32 = name.len;
+    var domain_len: u32 = domain.len;
+    var use: c_int = 0;
+    if (LookupAccountSidW(null, psid.?, &name, &name_len, &domain, &domain_len, &use) == 0) return false;
+    return use == SidTypeUser;
+}
+
 /// Path of the running executable (UTF-16, NUL-terminated, in `buf`).
 pub fn selfExePath(buf: []u16) error{Unexpected}![:0]u16 {
     const n = GetModuleFileNameW(null, buf.ptr, @intCast(buf.len));
@@ -666,6 +685,13 @@ pub fn runAsToken(token: HANDLE, cmdline: []const u8, out: []u8, timeout_ms: u32
     var code: u32 = 0;
     if (GetExitCodeProcess(pi.process.?, &code) == 0) return error.Unexpected;
     return .{ .exit_code = code, .output = out[0..n] };
+}
+
+test "user account SIDs: this user is one, SYSTEM / groups / aliases are not" {
+    var buf: [184]u8 = undefined;
+    try std.testing.expect(isUserAccountSid(try currentUserSid(&buf)));
+    for ([_][]const u8{ "S-1-5-18", "S-1-1-0", "S-1-5-11", "S-1-5-32-544", "S-1-5-32-545", "not a sid" }) |s|
+        try std.testing.expect(!isUserAccountSid(s));
 }
 
 test "the running image is recognised; a byte-identical copy is not it" {

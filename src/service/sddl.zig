@@ -47,13 +47,13 @@ pub const Error = error{ InvalidSid, NoSpaceLeft };
 
 /// Control pipe DACL for `user_sid` (validated: it is spliced into SDDL).
 pub fn pipe(buf: []u8, user_sid: []const u8) Error![]const u8 {
-    if (!names.isValidSidString(user_sid)) return error.InvalidSid;
+    if (!names.isAccountSidString(user_sid)) return error.InvalidSid;
     return std.fmt.bufPrint(buf, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x{x};;;{s})", .{ pipe_user_access, user_sid });
 }
 
 /// Service object DACL for `user_sid`.
 pub fn service(buf: []u8, user_sid: []const u8) Error![]const u8 {
-    if (!names.isValidSidString(user_sid)) return error.InvalidSid;
+    if (!names.isAccountSidString(user_sid)) return error.InvalidSid;
     return std.fmt.bufPrint(buf, "D:" ++ service_default_aces ++ "(A;;0x{x};;;{s})", .{ service_user_access, user_sid });
 }
 

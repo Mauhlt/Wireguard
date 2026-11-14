@@ -38,7 +38,7 @@ var g: Globals = undefined;
 /// Entry for `/tunnelservice`: hands the thread to the SCM dispatcher,
 /// which calls `serviceMain` on a new thread and returns when it stopped.
 pub fn serviceProcess(gpa: std.mem.Allocator, io: std.Io, name: []const u8, user_sid: []const u8, errw: *std.Io.Writer) !u8 {
-    if (!names.isValid(name) or !names.isValidSidString(user_sid)) {
+    if (!names.isValid(name) or !names.isAccountSidString(user_sid)) {
         try errw.writeAll("zwg: /tunnelservice: bad arguments\n");
         return 2;
     }

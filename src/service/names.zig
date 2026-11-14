@@ -92,6 +92,27 @@ pub fn isValidSidString(s: []const u8) bool {
     return parts >= 2 and parts <= 16;
 }
 
+/// A SID string naming a user *account* (the installing user the pipe and
+/// service DACLs grant access to), not a group, alias or well-known
+/// principal: syntactically valid (`isValidSidString`) and either a
+/// local / domain account, S-1-5-21-<3 domain sub-authorities>-<RID>, or
+/// an Entra ID (Azure AD) account, S-1-12-1-<4 sub-authorities>. So
+/// "S-1-1-0" (Everyone), "S-1-5-11" (Authenticated Users), "S-1-5-32-545"
+/// (Users) or "S-1-5-18" (SYSTEM) are refused even though they parse. The
+/// elevated installer additionally asks Windows that the SID is a user
+/// (LookupAccountSidW: SidTypeUser).
+pub fn isAccountSidString(s: []const u8) bool {
+    if (!isValidSidString(s)) return false;
+    const prefixes = [_]struct { prefix: []const u8, rest: usize }{
+        .{ .prefix = "S-1-5-21-", .rest = 4 },
+        .{ .prefix = "S-1-12-1-", .rest = 4 },
+    };
+    for (prefixes) |p| if (std.mem.startsWith(u8, s, p.prefix)) {
+        return std.mem.countScalar(u8, s[p.prefix.len..], '-') + 1 == p.rest;
+    };
+    return false;
+}
+
 test "tunnel names" {
     const t = std.testing;
     for ([_][]const u8{ "wg0", "laptop", "Home-VPN_2", "a", "x=y+z", "a.b", "con1", "CONx" }) |n| try t.expect(isValid(n));
@@ -131,4 +152,27 @@ test "SID strings" {
         "S-1-5-21-1)(A;;GA;;;WD)", "S-1-5-18;",     "S-1-5-x", "S-1-5-18 ", "S-1-5-12345678901",
         "S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16",
     }) |s| try t.expect(!isValidSidString(s));
+}
+
+test "account SIDs only: users, not groups or well-known principals" {
+    const t = std.testing;
+    for ([_][]const u8{
+        "S-1-5-21-1004336348-1177238915-682003330-1001",
+        "S-1-5-21-1-2-3-500",
+        "S-1-12-1-1234567890-1234567890-1234567890-1234567890",
+    }) |s| try t.expect(isAccountSidString(s));
+    for ([_][]const u8{
+        "S-1-1-0", // Everyone
+        "S-1-5-11", // Authenticated Users
+        "S-1-5-4", // Interactive
+        "S-1-5-18", // SYSTEM
+        "S-1-5-32-544", // Administrators
+        "S-1-5-32-545", // Users
+        "S-1-5-21-1-2-3", // a domain, no RID
+        "S-1-5-21-1-2-3-4-5",
+        "S-1-12-1-1-2-3",
+        "S-1-5-21-1-2-3-1001)(A;;GA;;;WD)",
+        "S-1-5-21-",
+        "",
+    }) |s| try t.expect(!isAccountSidString(s));
 }
