@@ -287,8 +287,7 @@ test "hostile: accept-backlog overflow: never more than accept_backlog queued" {
         accepted += 1;
         st.abort();
     } else |e| try t.expectEqual(error.WouldBlock, e);
-    std.debug.print("accept backlog 2: {d} connections were queued for accept
-", .{accepted});
+    std.debug.print("accept backlog 2: {d} connections were queued for accept\n", .{accepted});
     try t.expect(accepted >= 1 and accepted <= 2);
     try t.expect(h.stats().connections <= limits.syn_backlog + limits.accept_backlog);
 }
