@@ -294,6 +294,37 @@ pub const Stack = struct {
         return mine.eql(a);
     }
 
+    /// A source no unicast peer can have (RFC 1122 3.2.1.3, RFC 9293
+    /// 3.10.7.2: a SYN from it gets no SYN-ACK, nothing else gets a reply
+    /// either): unspecified, multicast, IPv4 limited broadcast, or one of
+    /// our own addresses. No prefix is configured (the device's
+    /// tunSetAddress is a no-op), so there is no subnet broadcast to know.
+    fn bogusSource(s: *const Stack, a: Addr) bool {
+        if (s.isOurs(a)) return true;
+        return switch (a) {
+            .v4 => |b| std.mem.allEqual(u8, &b, 0) or std.mem.allEqual(u8, &b, 0xff) or
+                b[0] & 0xf0 == 224, // 224.0.0.0/4
+            .v6 => |b| std.mem.allEqual(u8, &b, 0) or b[0] == 0xff, // ::, ff00::/8
+        };
+    }
+
+    test bogusSource {
+        var clock: root.Clock = .{ .io = std.testing.io };
+        const own6: Addr = .{ .v6 = .{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+        const s = try Stack.create(std.testing.allocator, &clock, .{ .address = .{ .v4 = .{ 10, 8, 0, 1 } }, .address6 = own6 });
+        defer s.destroy();
+        for ([_]Addr{
+            .{ .v4 = .{ 0, 0, 0, 0 } },                                           .{ .v4 = .{ 255, 255, 255, 255 } },
+            .{ .v4 = .{ 224, 0, 0, 5 } },                                         .{ .v4 = .{ 239, 255, 255, 250 } },
+            .{ .v4 = .{ 10, 8, 0, 1 } },                                          .{ .v6 = @splat(0) },
+            .{ .v6 = .{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }, own6,
+        }) |a| try std.testing.expect(s.bogusSource(a));
+        for ([_]Addr{
+            .{ .v4 = .{ 10, 8, 0, 2 } },  .{ .v4 = .{ 223, 255, 255, 255 } },
+            .{ .v4 = .{ 240, 0, 0, 1 } }, .{ .v6 = .{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 } },
+        }) |a| try std.testing.expect(!s.bogusSource(a));
+    }
+
     fn env(s: *Stack, now: i64) tcp.Env {
         return .{
             .now = now,
@@ -421,6 +452,10 @@ pub const Stack = struct {
         };
         if (!s.isOurs(ip.dst)) {
             s.st.dropped_not_for_us += 1;
+            return;
+        }
+        if (s.bogusSource(ip.src)) {
+            s.st.dropped_malformed += 1;
             return;
         }
         switch (ip.protocol) {
