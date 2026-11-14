@@ -143,7 +143,8 @@ fn run(o: pair.Options, bulk_n: usize, bytes: u64, label: []const u8) !Result {
         ms(r.p50),                    ms(r.p99),                      ms(r.max),                 r.samples,
         ds.retransmits,               ds.fast_retransmits,            ds.dropped_ring_full,
     });
-    try t.expect(r.samples >= 10);
+    // Small -Dnetstack-e2e-mib runs end before many keystrokes; 50 MiB gives thousands.
+    try t.expect(r.samples >= @min(@as(usize, 10), @as(usize, @intCast(mib / 8 + 1))));
     return r;
 }
 
