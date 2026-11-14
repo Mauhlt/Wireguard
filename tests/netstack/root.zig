@@ -3,4 +3,5 @@
 test {
     _ = @import("conformance.zig");
     _ = @import("hostile.zig");
+    _ = @import("fuzz.zig");
 }
