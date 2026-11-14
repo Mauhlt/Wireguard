@@ -306,14 +306,45 @@ each merged into at most 16 ranges; ranges are sequence numbers, buffers
 are never split, so there is no "SACK Panic"-style MSS underflow or
 fragmentation. When a block does not fit a full scoreboard the
 connection uses NewReno until the scoreboard empties, never more memory.
-Recovery starts on DupThresh duplicate ACKs or when more than 2 MSS are
-SACKed above snd_una (IsLost); cwnd = ssthresh = FlightSize / 2, and
-while cwnd - pipe >= 1 MSS the sender sends NextSeg: the first lost hole
-not yet retransmitted (HighRxt), else new data. A partial ACK also
-retransmits the segment at snd_una (a hole with too little SACKed above
-it would otherwise wait for the RTO). Reneging (allowed by RFC 2018):
-data is freed only by the cumulative ACK, and the scoreboard is
-discarded on every RTO.
+With SACK, RACK (below) decides what is lost; without SACK information,
+recovery starts on DupThresh duplicate ACKs (NewReno). In recovery cwnd =
+ssthresh = FlightSize / 2, and while cwnd - pipe >= 1 MSS the sender
+sends NextSeg: the first segment RACK marked lost, else new data; pipe
+counts bytes neither SACKed nor lost. Reneging (allowed by RFC 2018):
+data is freed only by the cumulative ACK, and the scoreboard and RACK's
+delivered marks are discarded on every RTO.
+
+RACK-TLP (RFC 8985, src/netstack/rack.zig): every data transmission is
+recorded in a bounded per-connection ring (at most 256 records of start,
+end, last transmit time, flags; no per-segment allocation; past the cap
+new data is folded into the last record with the newer time, which only
+delays detection). Each ACK marks the records it cumulatively ACKs or
+SACKs as delivered; the most recently sent delivered one sets RACK.xmit_ts,
+end_seq and rtt (a retransmission ACKed faster than min RTT is ambiguous
+and ignored). A record sent before it is lost once now >= its transmit
+time + RACK.rtt + reo_wnd; the earliest pending candidate is the RACK
+reorder timer, a deadline in the connection's single next-deadline
+function. Retransmissions get new timestamps, so a lost retransmission is
+detected by later deliveries instead of the RTO. reo_wnd = min_RTT / 4 *
+reo_wnd_mult, capped at SRTT, and 0 while recovering before any
+reordering has been seen. The RTO marks everything outstanding lost. TLP
+(the probe of RACK-TLP) stays limited to interactive streams; bulk
+streams have enough data in flight for RACK to detect tail losses.
+
+D-SACK (RFC 2883): the receiver reports a duplicate segment (entirely
+below rcv_nxt, the old part of an overlapping one, or one already held
+out of order) as the first SACK block of its next ACK, once. The sender
+recognises a D-SACK (first block below the segment's cumulative ACK, or
+inside the second block) and validates it: non-empty, at most 64 KiB,
+within one send buffer below snd_una up to snd_max; anything else is
+counted in Stats.sack_blocks_ignored. A D-SACK raises reo_wnd_mult by
+one, at most once per round trip (snd_una must pass the previous round's
+snd_max, so a flood while idle counts once), up to 16; after 16
+recoveries without one it returns to 1. Spurious retransmission undo
+(RFC 3708 style): when every retransmission of the last recovery comes
+back D-SACKed, the window cut is undone (cwnd and ssthresh back to their
+values before it, never higher), at most once per episode and once per
+second; an RTO disables undo for its episode.
 
 Tail loss probe (RFC 8985 TLP), interactive streams only: when the last
 segment of a burst is outstanding and nothing else is queued, a probe

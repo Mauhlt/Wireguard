@@ -266,6 +266,11 @@ test "e2e: 50 MiB both ways, 1% loss + reordering + duplication, SHA-256 checked
     try transfer(t.allocator, .v4, 50 * 1024 * 1024, 5_000, 5_000, 1_000);
 }
 
+test "e2e: 50 MiB both ways, 5% loss + reordering + duplication, SHA-256 checked" {
+    // 2.5% per impairment point: ~5% end to end, both directions.
+    try transfer(t.allocator, .v4, 50 * 1024 * 1024, 25_000, 5_000, 1_000);
+}
+
 test "e2e: 50 MiB both ways, clean path" {
     try transfer(t.allocator, .v4, 50 * 1024 * 1024, 0, 0, 0);
 }
