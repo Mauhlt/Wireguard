@@ -326,16 +326,11 @@ fn pairSeeds(tag: u8, initiator_index: u32, responder_index: u32) [2]Seed {
     };
 }
 
-fn isZero(bytes: []const u8) bool {
-    for (bytes) |b| if (b != 0) return false;
-    return true;
-}
-
 test "keypair round trip, counters, replay, wrong index" {
     var seeds = pairSeeds(1, 10, 20);
     var a = Keypair.init(&seeds[0], 0);
     var b = Keypair.init(&seeds[1], 0);
-    try testing.expect(isZero(std.mem.asBytes(&seeds[0])));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&seeds[0]), 0));
 
     var pkt: [128]u8 = undefined;
     var buf: [128]u8 = undefined;
@@ -570,9 +565,9 @@ test "rotation: install reports retired indices and wipes them" {
 test "wipe zeroes key material" {
     var s = pairSeeds(9, 1, 2)[0];
     var kp = Keypair.init(&s, 0);
-    try testing.expect(!isZero(&kp.send_key));
+    try testing.expect(!std.mem.allEqual(u8, &kp.send_key, 0));
     kp.wipe();
-    try testing.expect(isZero(std.mem.asBytes(&kp)));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&kp), 0));
 }
 
 test "receive-side last-minute rekey hint (initiator only)" {

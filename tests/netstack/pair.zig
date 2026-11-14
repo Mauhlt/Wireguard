@@ -38,9 +38,7 @@ pub const Pair = struct {
     v6: bool = false,
 
     fn keyPair() struct { priv: crypto.PrivateKey, public: crypto.PublicKey } {
-        var priv: crypto.PrivateKey = undefined;
-        std.testing.io.random(&priv);
-        crypto.clampPrivateKey(&priv);
+        const priv = crypto.generatePrivateKey(std.testing.io);
         return .{ .priv = priv, .public = crypto.publicKey(priv) };
     }
 

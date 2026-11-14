@@ -438,15 +438,6 @@ const tun = @import("../tun/root.zig");
 const dev = @import("../device/device.zig");
 const Cidr = @import("../device/ip.zig").Cidr;
 
-fn rep(comptime s: []const u8, comptime n: usize) []const u8 {
-    comptime {
-        @setEvalBranchQuota(100_000);
-        var out: []const u8 = "";
-        for (0..n) |_| out = out ++ s;
-        return out;
-    }
-}
-
 /// Raw exchange for protocol tests: send `request`, read to EOF or "\n\n".
 fn exchange(gpa: std.mem.Allocator, pipe_name: []const u8, request: []const u8) ![]u8 {
     var wb: [128]u16 = undefined;
@@ -540,13 +531,13 @@ test "control pipe end to end: device state over get=1, set refused, garbage ref
     gpa.free(raw2);
 
     // set=1 is refused; garbage gets EINVAL; neither kills the server.
-    const set = try exchange(gpa, pipe_name, "set=1\nprivate_key=" ++ comptime rep("00", 32) ++ "\n\n");
+    const set = try exchange(gpa, pipe_name, "set=1\nprivate_key=" ++ &@as([64]u8, @splat('0')) ++ "\n\n");
     defer gpa.free(set);
     try testing.expectEqualStrings("errno=-1\n\n", set);
     const junk = try exchange(gpa, pipe_name, "hello\n\n");
     defer gpa.free(junk);
     try testing.expectEqualStrings("errno=-22\n\n", junk);
-    const huge = try exchange(gpa, pipe_name, "get=1" ++ comptime rep("1", 5000));
+    const huge = try exchange(gpa, pipe_name, "get=1" ++ &@as([5000]u8, @splat('1')));
     defer gpa.free(huge);
     try testing.expectEqualStrings("errno=-22\n\n", huge);
 

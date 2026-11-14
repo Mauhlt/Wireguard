@@ -92,12 +92,8 @@ const Pair = struct {
         errdefer gpa.destroy(p);
         p.clock = .{ .io = t.io };
         p.family = family;
-        var ks: wg.crypto.PrivateKey = undefined;
-        var kc: wg.crypto.PrivateKey = undefined;
-        t.io.random(&ks);
-        t.io.random(&kc);
-        wg.crypto.clampPrivateKey(&ks);
-        wg.crypto.clampPrivateKey(&kc);
+        var ks = wg.crypto.generatePrivateKey(t.io);
+        var kc = wg.crypto.generatePrivateKey(t.io);
         defer wg.crypto.wipe(&ks);
         defer wg.crypto.wipe(&kc);
         const server_cidrs = [_]dev.ip.Cidr{ try dev.ip.Cidr.parse("10.8.0.1/32"), try dev.ip.Cidr.parse("fd0a:8::1/128") };
@@ -497,12 +493,8 @@ test "e2e IPv6: lost keystrokes are repaired by the tail loss probe (1% loss on 
 test "e2e: Node (device + stack + threads) with the std.Io Reader / Writer adapters" {
     const gpa = t.allocator;
     var clock: dev.device.Clock = .{ .io = t.io };
-    var ks: wg.crypto.PrivateKey = undefined;
-    var kc: wg.crypto.PrivateKey = undefined;
-    t.io.random(&ks);
-    t.io.random(&kc);
-    wg.crypto.clampPrivateKey(&ks);
-    wg.crypto.clampPrivateKey(&kc);
+    var ks = wg.crypto.generatePrivateKey(t.io);
+    var kc = wg.crypto.generatePrivateKey(t.io);
     defer wg.crypto.wipe(&ks);
     defer wg.crypto.wipe(&kc);
     const server_cidr = [_]dev.ip.Cidr{try dev.ip.Cidr.parse("10.8.0.1/32")};

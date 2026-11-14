@@ -7,6 +7,7 @@
 //! private and preshared keys go through here.
 
 const std = @import("std");
+const crypto = @import("../crypto.zig");
 
 pub const key_len = 32;
 pub const Key = [key_len]u8;
@@ -94,28 +95,20 @@ pub fn decode(text: []const u8) DecodeError!Key {
 
 /// Clamps 32 random bytes into an X25519 private key (RFC 7748), as
 /// `wg genkey` does.
-pub fn clamp(k: *Key) void {
-    k[0] &= 248;
-    k[31] = (k[31] & 127) | 64;
-}
+pub const clamp = crypto.clampPrivateKey;
 
-pub fn generatePrivate(io: std.Io) Key {
-    var k: Key = undefined;
-    io.random(&k);
-    clamp(&k);
-    return k;
-}
+/// A fresh clamped private key, as `wg genkey` makes.
+pub const generatePrivate = crypto.generatePrivateKey;
 
 /// Public key for a private key (X25519 base-point multiplication; clamping
 /// is applied by the scalar multiplication as wg does).
 pub fn publicFromPrivate(priv: *const Key) Key {
-    return std.crypto.dh.X25519.recoverPublicKey(priv.*);
+    return crypto.publicKey(priv.*);
 }
 
+/// Constant time.
 pub fn isZero(k: *const Key) bool {
-    var acc: u8 = 0;
-    for (k) |b| acc |= b;
-    return acc == 0;
+    return crypto.isZero(key_len, k);
 }
 
 test "base64 round trip and std agreement" {

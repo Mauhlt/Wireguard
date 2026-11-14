@@ -58,12 +58,8 @@ test "two devices: handshake, both directions, source check, roaming, rekey" {
     const gpa = testing.allocator;
     var clock: dev.Clock = .{ .io = testing.io };
 
-    var priv_a: crypto.PrivateKey = undefined;
-    var priv_b: crypto.PrivateKey = undefined;
-    testing.io.random(&priv_a);
-    testing.io.random(&priv_b);
-    crypto.clampPrivateKey(&priv_a);
-    crypto.clampPrivateKey(&priv_b);
+    const priv_a = crypto.generatePrivateKey(testing.io);
+    const priv_b = crypto.generatePrivateKey(testing.io);
     const pub_a = crypto.publicKey(priv_a);
     const pub_b = crypto.publicKey(priv_b);
 
@@ -411,9 +407,7 @@ const FakeDns = struct {
 };
 
 fn keyPair() struct { priv: crypto.PrivateKey, public: crypto.PublicKey } {
-    var priv: crypto.PrivateKey = undefined;
-    testing.io.random(&priv);
-    crypto.clampPrivateKey(&priv);
+    const priv = crypto.generatePrivateKey(testing.io);
     return .{ .priv = priv, .public = crypto.publicKey(priv) };
 }
 

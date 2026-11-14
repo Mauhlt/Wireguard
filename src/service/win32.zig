@@ -514,17 +514,9 @@ pub fn isRunningImage(h: HANDLE) bool {
     return NtAreMappedFilesTheSame(image, view) == 0;
 }
 
-/// True when the process token is elevated.
-pub fn isElevated() bool {
-    var token: HANDLE = undefined;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == 0) return false;
-    defer _ = CloseHandle(token);
-    var elevation: u32 = 0;
-    var len: u32 = 0;
-    const TokenElevation: c_int = 20;
-    if (GetTokenInformation(token, TokenElevation, &elevation, @sizeOf(u32), &len) == 0) return false;
-    return elevation != 0;
-}
+/// True when the process token is elevated (one implementation, shared
+/// with the Wintun backend).
+pub const isElevated = @import("../tun/windows.zig").isElevated;
 
 pub const SecurityDescriptor = struct {
     sd: PSECURITY_DESCRIPTOR,
