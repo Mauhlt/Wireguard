@@ -20,7 +20,7 @@ src/noise/            handshake: messages 1/2, cookie reply, MAC1/MAC2, state ma
 src/session/          keypairs, transport data, counters + replay window, timers           (agent: session)
 src/device/           peers, allowed-IPs trie, config (.conf), UDP, packet routing, CLI    (agent: device)
 src/tun/              TUN per OS + interop/KAT harness                                     (agent: tun)
-src/netstack/         userspace TCP/IPv4 stack as a Tun (in-process tunnels)          (agent: netstack)
+src/netstack/         userspace TCP/IP stack (IPv4 + IPv6) as a Tun (in-process)         (agent: netstack)
 src/service/          Windows tunnel service (zwg installtunnel), control pipe, wg UAPI    (agent: service)
 ```
 
@@ -168,7 +168,8 @@ reparse point, verifies and secures that same handle and keeps it open
 Goal (owner, 2026-11-14): Portal runs zwg in-process (no Wintun adapter,
 no driver, no admin, no service). The hub owns UDP 51820 and accepts TCP
 on 10.8.0.1:8420/8421 inside the tunnel; devices dial 10.8.0.1:8420. A
-minimal TCP/IPv4 stack is the device's Tun. Pure Zig, std only, no C.
+minimal TCP/IP stack (IPv4 and IPv6, see "IPv6" below) is the device's
+Tun. Pure Zig, std only, no C.
 
 Threads and wiring (the device is unchanged):
 
@@ -182,19 +183,21 @@ host threads: Stream / Listener calls under the stack mutex; blocking calls
 ```
 
 No polling, no ticks: retransmit, delayed ACK, persist (zero window),
-keepalive and TIME-WAIT are deadlines on the device clock (`.boot`).
+keepalive, TIME-WAIT, orphaned FIN-WAIT-2 and the user timeout are
+deadlines on the device clock (`.boot`).
 A full ring drops the packet (like a NIC); TCP recovers.
 
 Public API (`const ns = @import("WireGuard").netstack;`):
 
 ```zig
-ns.Addr = device.ip.Addr                  // .v4 only for now (IPv6 kept in the types)
+ns.Addr = device.ip.Addr                  // .v4 or .v6
 ns.Endpoint { addr: Addr, port: u16 }
 ns.Limits { max_connections=64, max_listeners=8, send_buffer=256K, recv_buffer=256K,
             syn_backlog=16, accept_backlog=16, max_ooo_segments=32, ring_packets=512,
-            time_wait_ns=2s, user_timeout_ns=60s, bulk_unsent_lowat=64K }
+            time_wait_ns=2s, fin_wait2_ns=30s, user_timeout_ns=60s, bulk_unsent_lowat=64K }
 ns.Priority = enum { interactive, bulk }
-ns.Options { address: Addr, mtu=1420, limits, keepalive_idle_ns: ?u64=null, icmp_echo=true }
+ns.Options { address: Addr, address6: ?Addr=null, mtu=1420, limits, keepalive_idle_ns: ?u64=null, icmp_echo=true }
+          // address: IPv4 (or IPv6 for a v6-only stack); address6: IPv6 next to an IPv4 address
 
 // Everything in one call (what Portal embeds):
 ns.Node.start(gpa, *device.Clock, device.Options, ns.Options) !*Node   // .stack, .device
@@ -205,8 +208,8 @@ ns.Stack.create(gpa, *device.Clock, Options) !*Stack;  stack.tun() -> tun.Tun (g
 stack.start() / stack.stop() / stack.destroy()
 stack.input(packet) / stack.output(buf) ?[]u8 / stack.runTimers() ?i64   // manual drive (tests)
 
-stack.listen(port) !Listener              // bound to Options.address only
-stack.dial(Endpoint) !Stream              // returns at once (SYN sent); .interactive
+stack.listen(port) !Listener              // on every configured address (address and address6)
+stack.dial(Endpoint) !Stream              // returns at once (SYN sent); .interactive; our address by the destination's family
 stack.dialWith(Endpoint, Priority) !Stream
 stack.dialWait(Endpoint, timeout_ns: ?u64) !Stream
 stack.readyHandle() WaitHandle; stack.clearReady()   // event-loop hosts
@@ -251,15 +254,21 @@ ConnectionReset, ConnectionTimedOut (Limits.user_timeout_ns), BrokenPipe
 (write after shutdown). Handles are values (stack pointer + slot +
 generation), so a stale handle can never touch a reused slot.
 
-Shared code: `netstack.wire` is the one IPv4 / TCP / ICMP parser and
-serializer and the Internet checksum (`Checksum`, `pseudoHeader`), used by
-the stack, the tests and the fuzz targets; `wire.mssForMtu` is the one MSS
-derivation. `netstack.testing` holds the packet-crafting fake peer
-(`testing.Peer`) and `ImpairedTun` (seeded loss / reorder / duplication),
-for unit tests, tests/netstack and fuzzers alike.
+Shared code: `netstack.wire` is the one IPv4 / IPv6 / TCP / ICMP / ICMPv6
+parser and serializer and the Internet checksum (`Checksum`,
+`pseudoHeader` for either family), used by the stack, the tests and the
+fuzz targets: `parseIp` / `parseTcp` / `buildTcp` / `writeIpHeader` take
+either family; `wire.mssFor(addr, mtu)` is the one MSS derivation.
+`netstack.testing` holds the packet-crafting fake peer (`testing.Peer`,
+either family), `icmpPacket`, `withExtHeaders6` and `ImpairedTun`
+(seeded loss / reorder / duplication, either family), for unit tests,
+tests/netstack and fuzzers alike.
 
 TCP: RFC 9293 state machine (both handshakes, simultaneous open, FIN/RST,
-TIME-WAIT bounded by Limits.time_wait_ns), MSS from the MTU (1420 ->
+TIME-WAIT bounded by Limits.time_wait_ns, an orphaned FIN-WAIT-2 (closed
+by the application, the peer never sends its FIN) by Limits.fin_wait2_ns;
+the user timeout counts from the first unanswered transmission and is a
+deadline of its own), MSS from the MTU (1420 ->
 1380 over IPv4, 1360 over IPv6), window scale (RFC 7323; timestamps parsed
 and ignored), RTO per RFC 6298 with Karn's rule, SACK (below), NewReno
 (RFC 5681/6582) when the peer has no SACK, Limited Transmit (RFC 3042),
@@ -273,7 +282,11 @@ avoidance, no Nagle. Pure ACKs carry snd_max, not snd_nxt (as BSD): after
 an RTO rolls snd_nxt back, a peer that already has everything would drop
 an ACK at snd_nxt as unacceptable, and two such peers deadlock. ISNs:
 keyed SipHash-2-4 over the 4-tuple plus a 4 us clock (RFC 6528); per-
-listener SYN backlog cap; half-open connections get no buffers.
+listener SYN backlog cap; half-open connections get no buffers. While a
+listener's accept queue holds accept_backlog connections, the ACK that
+would complete another handshake is dropped (Linux style): it stays
+SYN-RECEIVED, bufferless, until a SYN-ACK retransmission finds room or
+the retries run out.
 
 Minimum RTO: 200 ms, not RFC 6298's 1 s. A deliberate deviation (Linux
 does the same): both ends are ours, one hop through the tunnel, and a
@@ -293,14 +306,51 @@ each merged into at most 16 ranges; ranges are sequence numbers, buffers
 are never split, so there is no "SACK Panic"-style MSS underflow or
 fragmentation. When a block does not fit a full scoreboard the
 connection uses NewReno until the scoreboard empties, never more memory.
-Recovery starts on DupThresh duplicate ACKs or when more than 2 MSS are
-SACKed above snd_una (IsLost); cwnd = ssthresh = FlightSize / 2, and
-while cwnd - pipe >= 1 MSS the sender sends NextSeg: the first lost hole
-not yet retransmitted (HighRxt), else new data. A partial ACK also
-retransmits the segment at snd_una (a hole with too little SACKed above
-it would otherwise wait for the RTO). Reneging (allowed by RFC 2018):
-data is freed only by the cumulative ACK, and the scoreboard is
-discarded on every RTO.
+With SACK, RACK (below) decides what is lost; without SACK information,
+recovery starts on DupThresh duplicate ACKs (NewReno). In recovery cwnd =
+ssthresh = FlightSize / 2, and while cwnd - pipe >= 1 MSS the sender
+sends NextSeg: the first segment RACK marked lost, else new data; pipe
+counts bytes neither SACKed nor lost. Reneging (allowed by RFC 2018):
+data is freed only by the cumulative ACK, and the scoreboard and RACK's
+delivered marks are discarded on every RTO.
+
+RACK-TLP (RFC 8985, src/netstack/rack.zig): every data transmission is
+recorded in a bounded per-connection ring (at most 256 records of start,
+end, last transmit time, flags; no per-segment allocation; past the cap
+new data is folded into the last record with the newer time, which only
+delays detection). Each ACK marks the records it cumulatively ACKs or
+SACKs as delivered; the most recently sent delivered one sets RACK.xmit_ts,
+end_seq and rtt (a retransmission ACKed faster than min RTT is ambiguous
+and ignored). A record sent before it is lost once now >= its transmit
+time + RACK.rtt + reo_wnd; the earliest pending candidate is the RACK
+reorder timer, a deadline in the connection's single next-deadline
+function. Retransmissions get new timestamps, so a lost retransmission is
+detected by later deliveries instead of the RTO. reo_wnd = min_RTT / 4 *
+reo_wnd_mult, capped at SRTT, and 0 while recovering before any
+reordering has been seen. The RTO marks everything outstanding lost. RACK-TLP
+congestion response (RFC 8985 7.4): a probe's fate is decided by the ACK
+that covers it; a D-SACK of the probe means the original had arrived (no
+reduction, Stats.tlp_unneeded); a cumulative ACK without one means the
+probe repaired a lost tail segment: ssthresh = cwnd = cwnd / 2, once per
+episode, skipped when a recovery during the episode already reduced it
+(Stats.tlp_loss_repairs). TLP
+(the probe of RACK-TLP) stays limited to interactive streams; bulk
+streams have enough data in flight for RACK to detect tail losses.
+
+D-SACK (RFC 2883): the receiver reports a duplicate segment (entirely
+below rcv_nxt, the old part of an overlapping one, or one already held
+out of order) as the first SACK block of its next ACK, once. The sender
+recognises a D-SACK (first block below the segment's cumulative ACK, or
+inside the second block) and validates it: non-empty, at most 64 KiB,
+within one send buffer below snd_una up to snd_max; anything else is
+counted in Stats.sack_blocks_ignored. A D-SACK raises reo_wnd_mult by
+one, at most once per round trip (snd_una must pass the previous round's
+snd_max, so a flood while idle counts once), up to 16; after 16
+recoveries without one it returns to 1. Spurious retransmission undo
+(RFC 3708 style): when every retransmission of the last recovery comes
+back D-SACKed, the window cut is undone (cwnd and ssthresh back to their
+values before it, never higher), at most once per episode and once per
+second; an RTO disables undo for its episode.
 
 Tail loss probe (RFC 8985 TLP), interactive streams only: when the last
 segment of a burst is outstanding and nothing else is queued, a probe
@@ -308,10 +358,18 @@ deadline is armed at max(2 * SRTT, 10 ms), below the RTO. On expiry the
 last segment is sent again (no cwnd change); its ACK, or the SACK of it,
 repairs a lost keystroke in ~2 RTTs instead of a 200 ms RTO. One probe
 per tail; an ACK of new data disarms or re-arms it.
-Validation: IHL, total length, header checksum, TCP data offset, options,
-TCP checksum; fragments dropped; packets not addressed to Options.address
-dropped. The device already drops inner packets whose source is not in
-the peer's AllowedIPs. Memory: buffers allocated per established
+
+Validation: IPv4 IHL, total length, header checksum; IPv6 version,
+payload length and the extension-header walk (below); TCP data offset,
+options, TCP checksum (pseudo-header of the packet's family); fragments
+dropped; packets not addressed to one of our addresses dropped; packets
+from a source that cannot be a peer dropped before TCP or ICMP see them
+(no SYN-ACK, RST or echo reply to it; RFC 1122 3.2.1.3, RFC 9293
+3.10.7.2), by one filter for both families: our own address, IPv4
+0.0.0.0, 255.255.255.255, 224.0.0.0/4; IPv6 ::, ::1, ff00::/8,
+::ffff:0:0/96.
+The device already drops inner packets whose source is not in the
+peer's AllowedIPs. Memory: buffers allocated per established
 connection, bounded by Limits (defaults: ~33 MiB worst case, rings ~1.4 MiB
 idle); wiped when freed.
 
@@ -325,6 +383,57 @@ two real Devices over 127.0.0.1 UDP, 50 MiB each way with and without
 loss / reordering / duplication (SHA-256 checked), interactive latency
 under a saturating bulk stream, Node with the Reader / Writer adapters.
 Adversarial and conformance suites live in tests/netstack (separate agent).
+The IPv6 coverage: the state-machine tests that matter for both families
+(handshake both ways, data, FIN / RST, RFC 5961 RST, retransmission, fast
+retransmit, user timeout, malformed / foreign drop, ICMP echo, the
+two-stack lossy transfers) are written once against an address pair and
+run over IPv4 and IPv6; IPv6-only tests cover MSS 1360, extension
+headers, ICMPv6, v4-mapped and unusable sources, the dual-stack listener
+and single-family stacks; the fuzz targets run IPv4-only and dual-stack;
+the e2e repeats the 50 MiB transfers and the latency runs over
+fd0a:8::1 / fd0a:8::2 on dual-stack nodes (outer UDP still 127.0.0.1).
+
+### IPv6
+
+Addressing (proposal): the tunnel gets a ULA /64, fd0a:8::/64, next to
+10.8.0.0/24, with the same host numbers: the hub is 10.8.0.1 and
+fd0a:8::1, device n is 10.8.0.n and fd0a:8::n (AllowedIPs 10.8.0.n/32,
+fd0a:8::n/128 on the hub; 10.8.0.1/32, fd0a:8::1/128 on a device).
+`Options.address` stays the IPv4 address and `address6` adds the IPv6
+one, so one listener accepts on both. Portal keeps IPv4 as the primary
+(devices dial 10.8.0.1); IPv6 inside the tunnel is available, not
+required, and nothing depends on the outer path's family (the outer
+transport is whatever UDP the device has). The prefix is fixed rather
+than random (RFC 4193 wants a random Global ID): the tunnel is never
+routed or merged with another site, and a fixed, readable prefix matches
+the fixed 10.8.0.0/24. A deployment that bridges tunnels should pick a
+random fdXX:XXXX:XXXX::/48 instead; nothing in the stack assumes fd0a:8.
+
+What the stack does:
+  * one address per family: `address` (either family) and `address6`
+    (IPv6 next to an IPv4 `address`); create rejects two of a family and
+    any v4-mapped address. No v4-mapped IPv6 anywhere: dial to
+    ::ffff:a.b.c.d is AddressFamilyUnsupported, an IPv4 connection is an
+    IPv4 connection. Dial picks our address by the destination's family
+    and refuses a family we have no address for, ::, ::1, multicast and
+    our own address.
+  * MSS = MTU - 60 (1420 -> 1360), so a full segment fills the MTU
+    exactly; the ring slots and the scratch buffer are MTU-sized for
+    either family. Minimum MTU 576 (IPv6 itself wants 1280; WireGuard's
+    1420 is far above both).
+  * extension headers: at most 4, at most 256 bytes. Hop-by-hop (first
+    only) and destination options are skipped when they hold only Pad1 /
+    PadN; anything else in them (router alert, jumbo payload, ...) drops
+    the packet. Fragment headers (atomic fragments included), routing,
+    AH, ESP, "no next header", mobility, HIP, shim6 and the experimental
+    values drop it. Replies carry no extension headers.
+  * ICMPv6: echo request -> echo reply (checksum over the IPv6
+    pseudo-header; `icmp_echo` turns it off). Everything else is
+    ignored: no NDP, no MLD, no router advertisements (a point-to-point
+    tunnel with configured addresses needs none) and no ICMPv6 errors are
+    sent (no Packet Too Big: we control the MTU on both ends). Incoming
+    ICMPv6 errors are ignored too, as ICMPv4 ones are (PMTUD not needed).
+  * the IPv6 header we send: traffic class 0, flow label 0, hop limit 64.
 ## Rules
 
 * Pure Zig, std only (Wintun is the one runtime-loaded OS component).

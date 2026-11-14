@@ -1,6 +1,6 @@
 //! Test helpers shared by the unit tests, tests/netstack and the fuzz
 //! targets: the one packet-crafting helper (a fake peer that builds and
-//! parses IPv4/TCP packets with wire.zig) and `ImpairedTun`, a Tun
+//! parses IPv4 or IPv6 TCP packets with wire.zig) and `ImpairedTun`, a Tun
 //! wrapper that drops / reorders / duplicates packets (seeded, so a run
 //! is reproducible). Not used by the stack itself.
 const std = @import("std");
@@ -27,8 +27,8 @@ pub const Peer = struct {
         payload: []const u8 = &.{},
     };
 
-    /// A complete, valid IPv4/TCP or IPv6/TCP packet peer -> stack in
-    /// `out` (the endpoints' family).
+    /// A complete, valid TCP packet peer -> stack in `out`, IPv4 or IPv6
+    /// by the endpoints' family (both endpoints must be of the same one).
     pub fn packet(p: *Peer, out: []u8, s: Seg) []u8 {
         p.ip_id +%= 1;
         return wire.buildTcp(out, p.peer.addr, p.stack.addr, p.ip_id, .{
@@ -40,19 +40,71 @@ pub const Peer = struct {
             .window = s.window,
             .options = s.options,
             .payload = s.payload,
-        }) catch @panic("testing.Peer.packet: buffer too small");
+        }) catch @panic("testing.Peer.packet: buffer too small or mixed address families");
     }
 
-    /// Parses a packet the stack sent and checks it is stack -> peer.
+    /// Parses a packet the stack sent (either family) and checks it is
+    /// stack -> peer.
     pub fn expect(p: *const Peer, pkt: []const u8) !wire.Tcp {
         const t = try wire.parseTcp(pkt);
-        try std.testing.expect(t.ip.src.eql(p.stack.addr));
-        try std.testing.expect(t.ip.dst.eql(p.peer.addr));
+        try std.testing.expectEqual(p.stack.addr, t.ip.src);
+        try std.testing.expectEqual(p.peer.addr, t.ip.dst);
         try std.testing.expectEqual(p.stack.port, t.tcp.src_port);
         try std.testing.expectEqual(p.peer.port, t.tcp.dst_port);
         return t.tcp;
     }
+
+    /// Like `expect`, but any source port (the SYN of a dial, from an
+    /// ephemeral port the test learns from it).
+    pub fn expectAnyPort(p: *const Peer, pkt: []const u8) !wire.Tcp {
+        const t = try wire.parseTcp(pkt);
+        try std.testing.expectEqual(p.stack.addr, t.ip.src);
+        try std.testing.expectEqual(p.peer.addr, t.ip.dst);
+        try std.testing.expectEqual(p.peer.port, t.tcp.dst_port);
+        return t.tcp;
+    }
 };
+
+/// An ICMPv4 or ICMPv6 message (by `src`'s family) of type `kind` from
+/// `src` to `dst` in `buf`: identifier 0x1234, sequence 1, then `data`;
+/// IP header and checksum valid (ICMPv6 over the pseudo-header).
+pub fn icmpPacket(buf: []u8, src: root.Addr, dst: root.Addr, kind: u8, data: []const u8) []u8 {
+    const v6 = src == .v6;
+    const hl = wire.ipHeaderLen(src);
+    const msg = buf[hl..][0 .. 8 + data.len];
+    msg[0..8].* = .{ kind, 0, 0, 0, 0x12, 0x34, 0, 1 };
+    @memcpy(msg[8..], data);
+    const sum = if (v6) wire.icmp6Checksum(src, dst, msg) else wire.checksum(msg);
+    std.mem.writeInt(u16, msg[2..4], sum, .big);
+    _ = wire.writeIpHeader(buf, src, dst, if (v6) wire.proto_icmp6 else wire.proto_icmp, 1, msg.len) catch
+        @panic("testing.icmpPacket: buffer too small or mixed address families");
+    return buf[0 .. hl + msg.len];
+}
+
+/// Rebuilds the IPv6 packet `pkt` (40-byte header, no extension headers)
+/// in `out` with one 8-byte extension header per entry of `kinds` (at
+/// least one) in front of its upper layer: hop-by-hop (0) and destination
+/// options (60) hold one PadN; any other kind is zero-filled (a fragment
+/// header is then an atomic fragment). `out` must hold the result.
+pub fn withExtHeaders6(out: []u8, pkt: []const u8, kinds: []const u8) []u8 {
+    const hl = wire.ip6_header_len;
+    const upper = pkt[hl..];
+    const ext = 8 * kinds.len;
+    @memcpy(out[0..hl], pkt[0..hl]);
+    std.mem.writeInt(u16, out[4..6], @intCast(ext + upper.len), .big);
+    out[6] = kinds[0];
+    for (kinds, 0..) |k, i| {
+        const h = out[hl + 8 * i ..][0..8];
+        @memset(h, 0);
+        h[0] = if (i + 1 < kinds.len) kinds[i + 1] else pkt[6];
+        if (k == 0 or k == 60) {
+            h[2] = 1; // PadN covering the remaining 6 bytes
+            h[3] = 4;
+        }
+    }
+    @memcpy(out[hl + ext ..][0..upper.len], upper);
+    return out[0 .. hl + ext + upper.len];
+}
 
 /// Prints a stream's TCP state (diagnostics for failing tests).
 pub fn dumpStream(name: []const u8, s: root.Stream) void {
@@ -81,7 +133,7 @@ pub const Impairment = struct {
 
     fn applies(i: Impairment, packet: []const u8) bool {
         const port = i.only_port orelse return true;
-        const p = wire.parseTcp4(packet) catch return false;
+        const p = wire.parseTcp(packet) catch return false;
         return p.tcp.src_port == port or p.tcp.dst_port == port;
     }
 };
