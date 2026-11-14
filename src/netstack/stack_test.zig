@@ -390,6 +390,36 @@ test "SYN backlog cap, half-open expiry" {
     try t.expectEqual(@as(u16, 0), r.stack.stats().connections);
 }
 
+test "accept backlog full: the final ACK is dropped, the SYN-ACK retry completes it later" {
+    var r: Rig = undefined;
+    try r.init(.{ .accept_backlog = 1 });
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    var isns: [2]u32 = undefined;
+    for (0..2) |i| {
+        r.peer.peer.port = @intCast(41000 + i);
+        r.send(.{ .seq = 1, .flags = .{ .syn = true } });
+        const sa = try r.recv();
+        try t.expect(sa.flags.syn and sa.flags.ack);
+        isns[i] = sa.seq;
+        r.send(.{ .seq = 2, .ack = sa.seq +% 1, .flags = .{ .ack = true }, .window = 2048 });
+    }
+    try t.expectEqual(@as(u64, 1), r.stack.stats().dropped_accept_backlog);
+    const a = try l.accept();
+    defer a.close();
+    try t.expectEqual(@as(u16, 41000), a.remote().port);
+    try t.expectError(error.WouldBlock, l.accept());
+    // The second is still SYN-RECEIVED: its SYN-ACK is retransmitted, and
+    // the peer's ACK now finds room.
+    try r.fireNext();
+    const sa = try r.recv();
+    try t.expect(sa.flags.syn and sa.flags.ack);
+    r.send(.{ .seq = 2, .ack = isns[1] +% 1, .flags = .{ .ack = true }, .window = 2048 });
+    const b = try l.accept();
+    defer b.close();
+    try t.expectEqual(@as(u16, 41001), b.remote().port);
+}
+
 test "malformed and foreign packets are dropped silently" {
     var r: Rig = undefined;
     try r.init(.{});

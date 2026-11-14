@@ -469,6 +469,10 @@ pub const Stack = struct {
         const now = s.clock.now();
         var e = s.env(now);
         if (s.findConn(local, remote)) |i| {
+            if (s.acceptQueueFull(i, seg)) {
+                s.st.dropped_accept_backlog += 1;
+                return;
+            }
             const out = s.slots[i].conn.input(&e, seg);
             s.afterOutcome(i, out);
             return;
@@ -600,6 +604,21 @@ pub const Stack = struct {
             n += 1;
         };
         return n;
+    }
+
+    /// Limits.accept_backlog: an ACK that would complete a passive
+    /// handshake while the listener's accept queue is full is dropped, so
+    /// the connection stays SYN-RECEIVED (no buffers) and the SYN-ACK
+    /// retransmission retries it.
+    fn acceptQueueFull(s: *Stack, i: usize, seg: wire.Tcp) bool {
+        const sl = &s.slots[i];
+        const li = sl.listener orelse return false;
+        if (sl.conn.state != .syn_received or !seg.flags.ack or seg.flags.rst or seg.flags.syn) return false;
+        var n: usize = 0;
+        for (s.slots) |*o| if (o.used and o.queued and o.listener == li) {
+            n += 1;
+        };
+        return n >= s.options.limits.accept_backlog;
     }
 
     fn allocSlot(s: *Stack) ?usize {
