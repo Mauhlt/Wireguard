@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(tun_check);
 
     // Userspace netstack: conformance, hostile input, fuzz, end to end over
-    // 127.0.0.1 and concurrency (tests/netstack/README.md).
+    // 127.0.0.1 and concurrency (tests/netstack/root.zig lists the suites).
     // `zig build fuzz-netstack --fuzz` fuzzes only the netstack targets.
     {
         const opts = b.addOptions();
