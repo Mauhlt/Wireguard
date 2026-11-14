@@ -238,15 +238,6 @@ fn waitState(want: u32) !void {
     if (st.status.current_state != want)
         return drive.fail("service state {s}, expected {s}", .{ svc.scm.stateName(st.status.current_state), svc.scm.stateName(want) });
 }
-fn expectState(want: u32) !void {
-    var m = try svc.scm.Manager.open(win.SC_MANAGER_CONNECT);
-    defer m.close();
-    var s = try svc.scm.Service.open(&m, name, win.SERVICE_QUERY_STATUS);
-    defer s.close();
-    const st = try s.status();
-    if (st.status.current_state != want)
-        return drive.fail("service state {s}, expected {s}", .{ svc.scm.stateName(st.status.current_state), svc.scm.stateName(want) });
-}
 
 /// Bounded wait (test tooling): ask the service at growing intervals,
 /// ~15 s in total, as an ordinary user.

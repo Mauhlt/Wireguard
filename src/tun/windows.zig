@@ -513,7 +513,6 @@ const k32 = struct {
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    const CREATE_ALWAYS: u32 = 2;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
     const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(~@as(usize, 0));

@@ -40,7 +40,6 @@ const tun_mod = @import("../tun/root.zig");
 
 const ip = @import("ip.zig");
 const os = @import("os.zig");
-const keys_mod = @import("keys.zig");
 const AllowedIps = @import("allowed_ips.zig").AllowedIps;
 const IndexTable = @import("index_table.zig").IndexTable;
 const ratelimit = @import("ratelimit.zig");

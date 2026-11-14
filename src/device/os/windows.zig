@@ -131,7 +131,6 @@ fn userOnlyDescriptor() common.StopError!*anyopaque {
 
 const INFINITE: u32 = 0xFFFF_FFFF;
 const WAIT_TIMEOUT: u32 = 258;
-const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 const EVENT_MODIFY_STATE: u32 = 0x0002;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const ERROR_ALREADY_EXISTS: u32 = 183;

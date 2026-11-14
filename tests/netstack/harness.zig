@@ -270,29 +270,14 @@ pub const Conn = struct {
         return c.stream.status().state;
     }
 
-    /// Like `pull`, but first waits (virtual time, at most `budget`) for
-    /// the stack to send something.
+    /// Waits (virtual time, at most `budget`) for the stack to send
+    /// something, then collects its data segments and ACKs them all;
+    /// returns the payload bytes seen (appended to `sink` if given).
     pub fn pullWait(c: *Conn, h: *H, sink: ?*std.ArrayList(u8), gpa: std.mem.Allocator, budget: u64) !usize {
         var n: usize = 0;
         var pkt: ?[]u8 = h.waitOut(budget);
         while (pkt) |raw| : (pkt = h.out()) {
             const t = try c.peer.expect(raw);
-            if (t.payload.len != 0 and t.seq == c.rcv_nxt) {
-                if (sink) |s| try s.appendSlice(gpa, t.payload);
-                c.rcv_nxt +%= @intCast(t.payload.len);
-                n += t.payload.len;
-            }
-            if (t.flags.fin and t.seq +% @as(u32, @intCast(t.payload.len)) == c.rcv_nxt) c.rcv_nxt +%= 1;
-        }
-        if (n != 0) c.ack(h);
-        return n;
-    }
-
-    /// Collects the stack's data segments (no time passing) and ACKs them
-    /// all; returns the payload bytes seen (appended to `sink` if given).
-    pub fn pull(c: *Conn, h: *H, sink: ?*std.ArrayList(u8), gpa: std.mem.Allocator) !usize {
-        var n: usize = 0;
-        while (try h.seg(&c.peer)) |t| {
             if (t.payload.len != 0 and t.seq == c.rcv_nxt) {
                 if (sink) |s| try s.appendSlice(gpa, t.payload);
                 c.rcv_nxt +%= @intCast(t.payload.len);

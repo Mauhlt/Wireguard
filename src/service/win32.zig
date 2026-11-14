@@ -21,7 +21,6 @@ pub const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(~@as(usize, 0));
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 pub const WAIT_OBJECT_0: u32 = 0;
 pub const WAIT_TIMEOUT: u32 = 258;
-pub const WAIT_IO_COMPLETION: u32 = 0xC0;
 pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 
 // ---- errors ----------------------------------------------------------------
@@ -33,8 +32,6 @@ pub const ERROR_ACCESS_DENIED: u32 = 5;
 pub const ERROR_INVALID_HANDLE: u32 = 6;
 pub const ERROR_BROKEN_PIPE: u32 = 109;
 pub const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
-pub const ERROR_SEM_TIMEOUT: u32 = 121;
-pub const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_PIPE_BUSY: u32 = 231;
 pub const ERROR_NO_DATA: u32 = 232;
@@ -50,7 +47,6 @@ pub const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 pub const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: u32 = 1061;
 pub const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
 pub const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: u32 = 1063;
-pub const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
 pub const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
 pub const ERROR_SERVICE_EXISTS: u32 = 1073;
 pub const ERROR_CANCELLED: u32 = 1223;
@@ -91,7 +87,6 @@ pub const FILE_TRAVERSE: u32 = 0x0020;
 pub const FILE_SHARE_READ: u32 = 1;
 pub const FILE_SHARE_WRITE: u32 = 2;
 pub const FILE_SHARE_DELETE: u32 = 4;
-pub const CREATE_NEW: u32 = 1;
 pub const CREATE_ALWAYS: u32 = 2;
 pub const OPEN_EXISTING: u32 = 3;
 pub const OPEN_ALWAYS: u32 = 4;
@@ -144,7 +139,6 @@ pub extern "kernel32" fn GetFileSizeEx(h: HANDLE, size: *i64) callconv(.winapi) 
 pub extern "kernel32" fn GetFileAttributesW(name: LPCWSTR) callconv(.winapi) u32;
 pub extern "kernel32" fn CreateDirectoryW(name: LPCWSTR, sa: ?*SECURITY_ATTRIBUTES) callconv(.winapi) BOOL;
 pub extern "kernel32" fn RemoveDirectoryW(name: LPCWSTR) callconv(.winapi) BOOL;
-pub extern "kernel32" fn DeleteFileW(name: LPCWSTR) callconv(.winapi) BOOL;
 pub extern "kernel32" fn MoveFileExW(from: LPCWSTR, to: LPCWSTR, flags: u32) callconv(.winapi) BOOL;
 
 pub extern "kernel32" fn CreateNamedPipeW(name: LPCWSTR, open_mode: u32, pipe_mode: u32, max_instances: u32, out_size: u32, in_size: u32, default_timeout: u32, sa: ?*SECURITY_ATTRIBUTES) callconv(.winapi) HANDLE;
@@ -168,7 +162,6 @@ pub extern "ntdll" fn NtAreMappedFilesTheSame(image_view: *const anyopaque, file
 pub const PAGE_READONLY: u32 = 0x02;
 pub const FILE_MAP_READ: u32 = 0x04;
 
-pub const FileBasicInfo: c_int = 0;
 pub const FileDispositionInfo: c_int = 4;
 pub const FileAttributeTagInfo: c_int = 9;
 pub const FILE_ATTRIBUTE_TAG_INFO = extern struct { attributes: u32, reparse_tag: u32 };
@@ -245,8 +238,6 @@ pub const ACL = extern struct { revision: u8, sbz1: u8, size: u16, ace_count: u1
 pub const ACE_HEADER = extern struct { kind: u8, flags: u8, size: u16 };
 pub const ACCESS_ALLOWED_ACE = extern struct { header: ACE_HEADER, mask: u32, sid_start: u32 };
 pub const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-pub const OBJECT_INHERIT_ACE: u8 = 1;
-pub const CONTAINER_INHERIT_ACE: u8 = 2;
 pub const SE_DACL_PROTECTED: u16 = 0x1000;
 
 pub extern "advapi32" fn OpenProcessToken(process: HANDLE, access: u32, token: *HANDLE) callconv(.winapi) BOOL;
@@ -259,7 +250,6 @@ pub extern "advapi32" fn DuplicateTokenEx(existing: HANDLE, access: u32, sa: ?*S
 pub extern "advapi32" fn CreateProcessAsUserW(token: HANDLE, app: ?LPCWSTR, cmdline: ?LPWSTR, process_sa: ?*SECURITY_ATTRIBUTES, thread_sa: ?*SECURITY_ATTRIBUTES, inherit: BOOL, flags: u32, env: ?*anyopaque, cwd: ?LPCWSTR, si: *STARTUPINFOEXW, pi: *PROCESS_INFORMATION) callconv(.winapi) BOOL;
 pub extern "advapi32" fn ConvertSidToStringSidW(sid: PSID, out: *?LPWSTR) callconv(.winapi) BOOL;
 pub extern "advapi32" fn ConvertStringSidToSidW(s: LPCWSTR, out: *?PSID) callconv(.winapi) BOOL;
-pub extern "advapi32" fn IsValidSid(sid: PSID) callconv(.winapi) BOOL;
 pub extern "advapi32" fn LookupAccountSidW(system: ?LPCWSTR, sid: PSID, name: ?[*]u16, name_len: *u32, domain: ?[*]u16, domain_len: *u32, use: *c_int) callconv(.winapi) BOOL;
 pub const SidTypeUser: c_int = 1;
 pub extern "advapi32" fn EqualSid(a: PSID, b: PSID) callconv(.winapi) BOOL;
@@ -271,7 +261,6 @@ pub extern "advapi32" fn GetSecurityDescriptorOwner(sd: PSECURITY_DESCRIPTOR, ow
 pub extern "advapi32" fn GetSecurityDescriptorControl(sd: PSECURITY_DESCRIPTOR, control: *u16, revision: *u32) callconv(.winapi) BOOL;
 pub extern "advapi32" fn GetAce(acl: *ACL, index: u32, ace: *?*anyopaque) callconv(.winapi) BOOL;
 pub extern "advapi32" fn GetNamedSecurityInfoW(name: LPCWSTR, kind: c_int, info: u32, owner: ?*?PSID, group: ?*?PSID, dacl: ?*?*ACL, sacl: ?*?*ACL, sd: *?PSECURITY_DESCRIPTOR) callconv(.winapi) u32;
-pub extern "advapi32" fn SetNamedSecurityInfoW(name: LPWSTR, kind: c_int, info: u32, owner: ?PSID, group: ?PSID, dacl: ?*ACL, sacl: ?*ACL) callconv(.winapi) u32;
 pub extern "advapi32" fn GetSecurityInfo(h: HANDLE, kind: c_int, info: u32, owner: ?*?PSID, group: ?*?PSID, dacl: ?*?*ACL, sacl: ?*?*ACL, sd: *?PSECURITY_DESCRIPTOR) callconv(.winapi) u32;
 pub extern "advapi32" fn SetSecurityInfo(h: HANDLE, kind: c_int, info: u32, owner: ?PSID, group: ?PSID, dacl: ?*ACL, sacl: ?*ACL) callconv(.winapi) u32;
 
@@ -281,12 +270,9 @@ pub const SC_MANAGER_CONNECT: u32 = 0x0001;
 pub const SC_MANAGER_CREATE_SERVICE: u32 = 0x0002;
 pub const SC_MANAGER_ENUMERATE_SERVICE: u32 = 0x0004;
 
-pub const SERVICE_QUERY_CONFIG: u32 = 0x0001;
-pub const SERVICE_CHANGE_CONFIG: u32 = 0x0002;
 pub const SERVICE_QUERY_STATUS: u32 = 0x0004;
 pub const SERVICE_START: u32 = 0x0010;
 pub const SERVICE_STOP: u32 = 0x0020;
-pub const SERVICE_INTERROGATE: u32 = 0x0080;
 pub const SERVICE_ALL_ACCESS: u32 = 0xF01FF;
 
 pub const SERVICE_WIN32_OWN_PROCESS: u32 = 0x10;
@@ -307,10 +293,6 @@ pub const SERVICE_PAUSE_PENDING: u32 = 6;
 pub const SERVICE_PAUSED: u32 = 7;
 
 pub const SERVICE_CONTROL_STOP: u32 = 1;
-pub const SERVICE_CONTROL_INTERROGATE: u32 = 4;
-pub const SERVICE_CONTROL_SHUTDOWN: u32 = 5;
-pub const SERVICE_ACCEPT_STOP: u32 = 1;
-pub const SERVICE_ACCEPT_SHUTDOWN: u32 = 4;
 
 pub const SERVICE_CONFIG_DESCRIPTION: u32 = 1;
 pub const SERVICE_CONFIG_FAILURE_ACTIONS: u32 = 2;
@@ -432,8 +414,6 @@ pub const SHELLEXECUTEINFOW = extern struct {
 };
 
 pub const GUID = extern struct { data1: u32, data2: u16, data3: u16, data4: [8]u8 };
-/// FOLDERID_ProgramData {62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}
-pub const FOLDERID_ProgramData: GUID = .{ .data1 = 0x62AB5D82, .data2 = 0xFDC1, .data3 = 0x4DC3, .data4 = .{ 0xA9, 0xDD, 0x07, 0x0D, 0x1D, 0x49, 0x5D, 0x97 } };
 /// FOLDERID_ProgramFiles {905E63B6-C1BF-494E-B29C-65B732D3D21A}
 pub const FOLDERID_ProgramFiles: GUID = .{ .data1 = 0x905E63B6, .data2 = 0xC1BF, .data3 = 0x494E, .data4 = .{ 0xB2, 0x9C, 0x65, 0xB7, 0x32, 0xD3, 0xD2, 0x1A } };
 

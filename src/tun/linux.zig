@@ -41,7 +41,6 @@ const SIOCGIFINDEX: u32 = 0x8933;
 const SIOCADDRT: u32 = 0x890B;
 const RTF_UP: u16 = 0x0001;
 const AF_INET: u16 = 2;
-const AF_INET6: u16 = 10;
 
 const SockaddrIn = extern struct { family: u16, port: u16 = 0, addr: [4]u8, zero: [8]u8 = @splat(0) };
 const Sockaddr = extern struct { family: u16, data: [14]u8 };
