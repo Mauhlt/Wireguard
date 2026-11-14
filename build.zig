@@ -56,6 +56,34 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(tun_check);
 
+    // Userspace netstack: conformance, hostile input, fuzz, end to end over
+    // 127.0.0.1 and concurrency (tests/netstack/README.md).
+    // `zig build fuzz-netstack --fuzz` fuzzes only the netstack targets.
+    {
+        const opts = b.addOptions();
+        opts.addOption(u32, "e2e_mib", b.option(u32, "netstack-e2e-mib", "MiB per direction in the netstack end-to-end transfers (default 50)") orelse 50);
+        const tsan = b.option(bool, "netstack-tsan", "Build tests/netstack with the thread sanitizer (not on Windows)") orelse false;
+        const ns_tests = struct {
+            fn make(bb: *std.Build, t: std.Build.ResolvedTarget, o: std.builtin.OptimizeMode, wg: *std.Build.Module, op: *std.Build.Step.Options, ts: bool, filters: []const []const u8) *std.Build.Step.Run {
+                const m = bb.createModule(.{
+                    .root_source_file = bb.path("tests/netstack/root.zig"),
+                    .target = t,
+                    .optimize = o,
+                    .sanitize_thread = if (ts) true else null,
+                    .imports = &.{.{ .name = "WireGuard", .module = wg }},
+                });
+                m.addOptions("netstack_test_options", op);
+                m.addAnonymousImport("netstack_stack_src", .{ .root_source_file = bb.path("src/netstack/stack.zig") });
+                return bb.addRunArtifact(bb.addTest(.{ .name = "netstack-tests", .root_module = m, .filters = filters }));
+            }
+        };
+        const filters: []const []const u8 = if (test_filter) |f| b.dupeStrings(&.{f}) else &.{};
+        b.step("test-netstack", "Netstack conformance / hostile / fuzz / e2e / concurrency suites (tests/netstack)")
+            .dependOn(&ns_tests.make(b, target, optimize, mod, opts, tsan, filters).step);
+        b.step("fuzz-netstack", "Netstack fuzz targets only (add --fuzz on Linux/macOS)")
+            .dependOn(&ns_tests.make(b, target, optimize, mod, opts, tsan, &.{"netstack fuzz"}).step);
+    }
+
     // Interop / known-answer harness (tests/interop, see its README.md).
     const interop = b.step("interop", "Known-answer + cross-implementation tests, FakeTun/UdpTun loopback");
     const golden = b.addTest(.{
