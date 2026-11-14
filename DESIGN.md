@@ -20,6 +20,7 @@ src/noise/            handshake: messages 1/2, cookie reply, MAC1/MAC2, state ma
 src/session/          keypairs, transport data, counters + replay window, timers           (agent: session)
 src/device/           peers, allowed-IPs trie, config (.conf), UDP, packet routing, CLI    (agent: device)
 src/tun/              TUN per OS + interop/KAT harness                                     (agent: tun)
+src/netstack/         userspace TCP/IPv4 stack as a Tun (in-process tunnels)          (agent: netstack)
 src/service/          Windows tunnel service (zwg installtunnel), control pipe, wg UAPI    (agent: service)
 ```
 
@@ -158,6 +159,93 @@ installer. The installer resolves each store directory once, never through a
 reparse point, verifies and secures that same handle and keeps it open
 (no FILE_SHARE_DELETE) while it writes the files relative to it.
 
+## Userspace netstack (src/netstack, `WireGuard.netstack`)
+
+Goal (owner, 2026-11-14): Portal runs zwg in-process (no Wintun adapter,
+no driver, no admin, no service). The hub owns UDP 51820 and accepts TCP
+on 10.8.0.1:8420/8421 inside the tunnel; devices dial 10.8.0.1:8420. A
+minimal TCP/IPv4 stack is the device's Tun. Pure Zig, std only, no C.
+
+Threads and wiring (the device is unchanged):
+
+```
+Device.run (device thread)  --Tun.write-->  [inbound tun.queue.Channel]  --> stack thread
+Device.run (device thread)  <--Tun.read---  [outbound tun.queue.Channel] <-- stack thread
+stack thread: waits on {inbound handle, kick Waker, device.os.DeadlineTimer}
+              with the earliest TCP deadline as timeout; runs input, timers, output
+host threads: Stream / Listener calls under the stack mutex; blocking calls
+              wait on a per-connection std.Io.Condition (with timeout)
+```
+
+No polling, no ticks: retransmit, delayed ACK, persist (zero window),
+keepalive and TIME-WAIT are deadlines on the device clock (`.boot`).
+A full ring drops the packet (like a NIC); TCP recovers.
+
+Public API (`const ns = @import("WireGuard").netstack;`):
+
+```zig
+ns.Addr = device.ip.Addr                  // .v4 only for now (IPv6 kept in the types)
+ns.Endpoint { addr: Addr, port: u16 }
+ns.Limits { max_connections=64, max_listeners=8, send_buffer=256K, recv_buffer=256K,
+            syn_backlog=16, accept_backlog=16, max_ooo_segments=32, ring_packets=512,
+            time_wait_ns=2s, user_timeout_ns=60s }
+ns.Options { address: Addr, mtu=1420, limits, keepalive_idle_ns: ?u64=null, icmp_echo=true }
+
+// Everything in one call (what Portal embeds):
+ns.Node.start(gpa, *device.Clock, device.Options, ns.Options) !*Node   // .stack, .device
+node.destroy()                                                          // stops both, wipes
+
+// Or by hand:
+ns.Stack.create(gpa, *device.Clock, Options) !*Stack;  stack.tun() -> tun.Tun (give to Device.create)
+stack.start() / stack.stop() / stack.destroy()
+stack.input(packet) / stack.output(buf) ?[]u8 / stack.runTimers() ?i64   // manual drive (tests)
+
+stack.listen(port) !Listener              // bound to Options.address only
+stack.dial(Endpoint) !Stream              // returns at once (SYN sent)
+stack.dialWait(Endpoint, timeout_ns: ?u64) !Stream
+stack.readyHandle() WaitHandle; stack.clearReady()   // event-loop hosts
+stack.stats() Stats
+
+listener.accept() !Stream (WouldBlock) | acceptWait(timeout_ns) !Stream | close() | port()
+stream.read(buf) !usize        // non-blocking; 0 = EOF; error.WouldBlock
+stream.readWait(buf, timeout_ns) !usize
+stream.write(data) !usize      // non-blocking; partial; WouldBlock when the send buffer is full
+stream.writeAll(data, timeout_ns) !void
+stream.waitConnected(timeout_ns) !void
+stream.shutdown()              // FIN after buffered data
+stream.close()                 // graceful, releases the handle (RST if unread data)
+stream.abort()                 // RST, releases the handle
+stream.status() Status { state, readable, writable, read_available, write_available }
+stream.local() / remote() Endpoint
+stream.reader(buf, timeout_ns) Stream.Reader   // .interface: std.Io.Reader, .err
+stream.writer(buf, timeout_ns) Stream.Writer   // .interface: std.Io.Writer, .err
+```
+
+Errors: WouldBlock, Timeout (the call's own timeout; stream still usable),
+Closed (handle closed / stale / stack gone), ConnectionRefused,
+ConnectionReset, ConnectionTimedOut (Limits.user_timeout_ns), BrokenPipe
+(write after shutdown). Handles are values (stack pointer + slot +
+generation), so a stale handle can never touch a reused slot.
+
+Shared code: `netstack.wire` is the one IPv4 / TCP / ICMP parser and
+serializer and the Internet checksum (`Checksum`, `pseudoHeader`), used by
+the stack, the tests and the fuzz targets; `wire.mssForMtu` is the one MSS
+derivation. `netstack.testing` holds the packet-crafting fake peer
+(`testing.Peer`) and `ImpairedTun` (seeded loss / reorder / duplication),
+for unit tests, tests/netstack and fuzzers alike.
+
+TCP: RFC 9293 state machine (both handshakes, FIN/RST, TIME-WAIT bounded
+by Limits.time_wait_ns), MSS from the MTU (1420 -> 1380), window scale
+(RFC 7323; SACK-permitted and timestamps parsed and ignored), RTO per
+RFC 6298 with Karn's rule, fast retransmit / NewReno (RFC 5681/6582), zero
+window probing, delayed ACK, no Nagle. ISNs: keyed SipHash over the
+4-tuple plus a clock (RFC 6528); per-listener SYN backlog cap.
+Validation: IHL, total length, header checksum, TCP data offset, options,
+TCP checksum; fragments dropped; packets not addressed to Options.address
+dropped. The device already drops inner packets whose source is not in
+the peer's AllowedIPs. Memory: buffers allocated per established
+connection, bounded by Limits (defaults: ~33 MiB worst case, rings ~1.4 MiB
+idle); wiped when freed.
 ## Rules
 
 * Pure Zig, std only (Wintun is the one runtime-loaded OS component).

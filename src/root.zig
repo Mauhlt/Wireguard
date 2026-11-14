@@ -5,6 +5,7 @@ pub const session = @import("session/root.zig");
 pub const device = @import("device/root.zig");
 pub const tun = @import("tun/root.zig");
 pub const service = @import("service/root.zig");
+pub const netstack = @import("netstack/root.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
