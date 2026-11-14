@@ -141,22 +141,18 @@ fn fuzzTextParsers(_: void, s: *Smith) anyerror!void {
     var buf: [96]u8 = undefined;
     const text = buf[0..s.slice(&buf)];
 
-    // Keys: two independent strict decoders must agree, accept only
-    // canonical text, and agree with std.base64 on what they accept.
+    // Keys: the one (constant-time) decoder accepts only canonical text
+    // and agrees with std.base64, the independent oracle, on what it
+    // accepts and what it decodes to.
     const a = dev.keys.decode(text);
-    const b = crypto.keyFromBase64(text);
     if (a) |ka| {
-        const kb = b catch return error.KeyDecodersDisagree;
-        try testing.expectEqualSlices(u8, &ka, &kb);
         try testing.expectEqualStrings(text, &dev.keys.encode(&ka));
-        try testing.expectEqualStrings(text, &crypto.keyToBase64(&kb));
         // std.base64 needs the destination sized by calcSizeForSlice.
         try testing.expectEqual(@as(usize, 32), try std.base64.standard.Decoder.calcSizeForSlice(text));
         var std_out: [32]u8 = undefined;
         try std.base64.standard.Decoder.decode(&std_out, text);
         try testing.expectEqualSlices(u8, &ka, &std_out);
     } else |_| {
-        if (b) |_| return error.KeyDecodersDisagree else |_| {}
         // std accepts it and it re-encodes to the same text => we must too.
         const std_len = std.base64.standard.Decoder.calcSizeForSlice(text) catch 0;
         if (text.len == 44 and std_len == 32) {

@@ -8,6 +8,7 @@ const common = @import("os/common.zig");
 const backend = if (builtin.os.tag == .windows) @import("os/windows.zig") else @import("os/posix.zig");
 
 pub const Family = common.Family;
+pub const Scope = common.Scope;
 pub const Datagram = common.Datagram;
 pub const OpenError = common.OpenError;
 pub const RecvError = common.RecvError;
@@ -19,6 +20,7 @@ pub const WaitHandle = backend.WaitHandle;
 pub const Udp = backend.Udp;
 pub const wait = backend.wait;
 pub const StopSignal = backend.StopSignal;
+pub const DeadlineTimer = backend.DeadlineTimer;
 pub const stopOnInterrupt = backend.stopOnInterrupt;
 
 const std = @import("std");
@@ -57,6 +59,28 @@ test "udp loopback with readiness wait (IPv4 and IPv6)" {
         try std.testing.expectEqual(@as(?usize, null), try wait(&.{b.waitHandle()}, 5 * std.time.ns_per_ms));
         try std.testing.expectError(error.AddressFamilyMismatch, a.send(if (fam == .v4) .{ .ip6 = .loopback(1) } else .{ .ip4 = .loopback(1) }, "x"));
     }
+}
+
+test "deadline timer: ready once armed time passes, not before, not after disarm" {
+    var t = try DeadlineTimer.init();
+    defer t.deinit();
+    const h = t.waitHandle() orelse return error.SkipZigTest; // no such clock on this OS
+    try std.testing.expectEqual(@as(?usize, null), try wait(&.{h}, 1 * std.time.ns_per_ms));
+    t.arm(20 * std.time.ns_per_ms);
+    // Not yet (the wait's own timeout ends first).
+    try std.testing.expectEqual(@as(?usize, null), try wait(&.{h}, 1 * std.time.ns_per_ms));
+    // Then it fires on its own, well inside a long wait.
+    try std.testing.expectEqual(@as(?usize, 0), try wait(&.{h}, 5 * std.time.ns_per_s));
+    t.clear();
+    try std.testing.expectEqual(@as(?usize, null), try wait(&.{h}, 1 * std.time.ns_per_ms));
+    // Re-arming replaces; disarming cancels.
+    t.arm(std.time.ns_per_s);
+    t.arm(10 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(?usize, 0), try wait(&.{h}, 5 * std.time.ns_per_s));
+    t.clear();
+    t.arm(10 * std.time.ns_per_ms);
+    t.disarm();
+    try std.testing.expectEqual(@as(?usize, null), try wait(&.{h}, 50 * std.time.ns_per_ms));
 }
 
 test "stop signal" {

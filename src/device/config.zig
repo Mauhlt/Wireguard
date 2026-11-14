@@ -98,6 +98,8 @@ pub const Warning = struct {
 
 pub const Config = struct {
     arena: std.heap.ArenaAllocator,
+    /// The arena's backing allocator: zeroes every block it gives back.
+    wiper: *Wiping,
     interface: Interface,
     peers: []Peer,
     warnings: []Warning,
@@ -105,8 +107,48 @@ pub const Config = struct {
     pub fn deinit(c: *Config) void {
         std.crypto.secureZero(u8, &c.interface.private_key);
         for (c.peers) |*p| if (p.preshared_key) |*k| std.crypto.secureZero(u8, k);
-        c.arena.deinit();
+        c.arena.deinit(); // every arena block (and stale copy in it) is zeroed on the way out
+        const gpa = c.wiper.child;
+        gpa.destroy(c.wiper);
         c.* = undefined;
+    }
+};
+
+/// An allocator that zeroes memory before giving it back to `child`, so
+/// nothing a parse put in its arena (keys, including copies left behind
+/// when a list grew) survives `Config.deinit` or a failed parse. Never
+/// moves a block (no remap), so no copy escapes unwiped.
+pub const Wiping = struct {
+    child: std.mem.Allocator,
+
+    pub fn allocator(w: *Wiping) std.mem.Allocator {
+        return .{ .ptr = w, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const w: *Wiping = @ptrCast(@alignCast(ctx));
+        return w.child.rawAlloc(len, alignment, ret);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const w: *Wiping = @ptrCast(@alignCast(ctx));
+        if (new_len < memory.len) std.crypto.secureZero(u8, memory[new_len..]);
+        return w.child.rawResize(memory, alignment, new_len, ret);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret;
+        return null; // the caller then allocates, copies and frees (wiped) itself
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const w: *Wiping = @ptrCast(@alignCast(ctx));
+        std.crypto.secureZero(u8, memory);
+        w.child.rawFree(memory, alignment, ret);
     }
 };
 
@@ -151,7 +193,11 @@ const ignored_interface_keys = [_][]const u8{ "table", "preup", "postup", "predo
 /// Parses a .conf. On error.InvalidConfig, `diag` says where and why.
 /// The returned Config owns all its memory (free with `deinit`).
 pub fn parse(gpa: std.mem.Allocator, text_in: []const u8, diag: *Diagnostic) ParseError!Config {
-    var arena = std.heap.ArenaAllocator.init(gpa);
+    const wiper = try gpa.create(Wiping);
+    wiper.* = .{ .child = gpa };
+    errdefer gpa.destroy(wiper);
+    // On error the arena goes back through `wiper`: every block zeroed.
+    var arena = std.heap.ArenaAllocator.init(wiper.allocator());
     errdefer arena.deinit();
     const a = arena.allocator();
 
@@ -174,6 +220,11 @@ pub fn parse(gpa: std.mem.Allocator, text_in: []const u8, diag: *Diagnostic) Par
     var section: Section = .none;
     var peer: Peer = .{ .public_key = undefined };
     var have_public = false;
+    // The keys on this stack frame, on any error.
+    errdefer {
+        std.crypto.secureZero(u8, &iface.private_key);
+        if (peer.preshared_key) |*k| std.crypto.secureZero(u8, k);
+    }
     var private_line: u32 = 0;
     var interface_line: u32 = 0;
 
@@ -275,8 +326,9 @@ pub fn parse(gpa: std.mem.Allocator, text_in: []const u8, diag: *Diagnostic) Par
                         return diag.set(line_no, "PublicKey is not a valid key (44 characters of base64)", .{});
                     have_public = true;
                 } else if (std.mem.eql(u8, key, "presharedkey")) {
-                    const k = keys.decode(value) catch
+                    var k = keys.decode(value) catch
                         return diag.set(line_no, "PresharedKey is not a valid key (44 characters of base64)", .{});
+                    defer std.crypto.secureZero(u8, &k);
                     // All zeros means "no preshared key" (wg prints it as "(none)").
                     peer.preshared_key = if (keys.isZero(&k)) null else k;
                 } else if (std.mem.eql(u8, key, "allowedips")) {
@@ -327,6 +379,7 @@ pub fn parse(gpa: std.mem.Allocator, text_in: []const u8, diag: *Diagnostic) Par
 
     return .{
         .arena = arena,
+        .wiper = wiper,
         .interface = iface,
         .peers = try peers.toOwnedSlice(a),
         .warnings = try warnings.toOwnedSlice(a),
@@ -465,6 +518,79 @@ fn expectInvalid(text: []const u8, line: u32, needle: []const u8) !void {
             std.debug.print("message: {s}\n", .{d.message()});
             return error.TestUnexpectedMessage;
         }
+    }
+}
+
+/// Wraps testing.allocator and remembers whether any block given back
+/// still contained one of `needles` (key bytes).
+const FreeSpy = struct {
+    needles: []const []const u8,
+    leaked: bool = false,
+
+    fn allocator(s: *FreeSpy) std.mem.Allocator {
+        return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(_: *anyopaque, len: usize, al: std.mem.Alignment, ret: usize) ?[*]u8 {
+        return testing.allocator.rawAlloc(len, al, ret);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ret: usize) bool {
+        const s: *FreeSpy = @ptrCast(@alignCast(ctx));
+        if (n < m.len) s.check(m[n..]);
+        return testing.allocator.rawResize(m, al, n, ret);
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ret: usize) void {
+        const s: *FreeSpy = @ptrCast(@alignCast(ctx));
+        s.check(m);
+        testing.allocator.rawFree(m, al, ret);
+    }
+    fn check(s: *FreeSpy, m: []const u8) void {
+        for (s.needles) |n| if (std.mem.indexOf(u8, m, n) != null) {
+            s.leaked = true;
+        };
+    }
+};
+
+test "key material is wiped from freed memory: after deinit and after a failed parse" {
+    const psk_b64 = "E2c8gYB5tYTUAg8ekhHYT5RhEnVyIu0ppD2D9+ZyMH0=";
+    const psk = try keys.decode(psk_b64);
+    const priv = try keys.decode(desktop_priv);
+    const head = "[Interface]\nPrivateKey = " ++ desktop_priv ++ "\n" ++
+        "[Peer]\nPublicKey = " ++ pubOf(laptop_priv) ++ "\nPresharedKey = " ++ psk_b64 ++ "\nAllowedIPs = 10.8.0.2/32\n" ++
+        "[Peer]\nPublicKey = " ++ pubOf(phone_priv) ++ "\nPresharedKey = " ++ psk_b64 ++ "\nAllowedIPs = 10.8.0.3/32\n";
+    const needles = [_][]const u8{ &psk, &priv };
+    {
+        var spy: FreeSpy = .{ .needles = &needles };
+        var d: Diagnostic = .{};
+        var c = try parse(spy.allocator(), head, &d);
+        try testing.expectEqualSlices(u8, &psk, &c.peers[1].preshared_key.?);
+        c.deinit();
+        try testing.expect(!spy.leaked);
+    }
+    {
+        // Fails after both peers (with their keys) were stored in the arena.
+        var spy: FreeSpy = .{ .needles = &needles };
+        var d: Diagnostic = .{};
+        try testing.expectError(error.InvalidConfig, parse(spy.allocator(), head ++ "[Peer]\nPublicKey = not-a-key\n", &d));
+        try testing.expect(!spy.leaked);
+    }
+    {
+        // Sanity: the spy does see keys in memory given back unwiped
+        // (rawFree, as ArenaAllocator.deinit frees its blocks; free()
+        // would scribble over it in safe builds first).
+        var spy: FreeSpy = .{ .needles = &needles };
+        const a = spy.allocator();
+        const buf = try a.dupe(u8, &psk);
+        a.rawFree(buf, .of(u8), @returnAddress());
+        try testing.expect(spy.leaked);
+        // And an arena straight on it (no Wiping) would leak the keys.
+        var spy2: FreeSpy = .{ .needles = &needles };
+        var arena = std.heap.ArenaAllocator.init(spy2.allocator());
+        _ = try arena.allocator().dupe(u8, &psk);
+        arena.deinit();
+        try testing.expect(spy2.leaked);
     }
 }
 

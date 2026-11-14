@@ -2,20 +2,31 @@
 //! run ONCE by the owner from an elevated prompt:
 //!
 //!   zig build interop-service
-//!   zig-out\bin\zwg-service-live.exe --zwg zig-out\bin\zwg.exe
+//!   zig-out\bin\zwg-service-live.exe --zwg zig-out\bin\zwg.exe [--peer zig-out\bin\zwg-testtun.exe]
+//!
+//! The service is installed from the release zwg.exe (no test mode); the
+//! peer runs as zwg-testtun.exe (the -Dtest-tun build: `--tun udp:<port>`),
+//! by default the one next to --zwg.
 //!
 //! What it does (and undoes, on success and on failure):
 //!  1. refuses unless elevated (changes nothing);
 //!  2. writes two throwaway .conf files to %TEMP% (zwgsvctest.conf: the
 //!     tunnel, 10.79.0.1/24, peer 10.79.0.2 at 127.0.0.1:<port>, keepalive
 //!     25 s; zwgsvcpeer.conf: the peer) and starts the peer as an ordinary
-//!     `zwg up --tun udp:<port>` process (no adapter, no privileges);
+//!     `zwg-testtun up --tun udp:<port>` process (no adapter, no privileges);
 //!  3. `zwg installtunnel zwgsvctest.conf`: service zwgTunnel$zwgsvctest,
-//!     %ProgramData%\zwg\tunnels\zwgsvctest\{zwg.exe,wintun.dll,tunnel.conf.dpapi},
-//!     %ProgramData%\zwg\logs\zwgsvctest.log, a Wintun adapter "zwgsvctest"
+//!     %ProgramFiles%\zwg\tunnels\zwgsvctest\{zwg.exe,wintun.dll,tunnel.conf.dpapi},
+//!     %ProgramFiles%\zwg\logs\zwgsvctest.log, a Wintun adapter "zwgsvctest"
 //!     with 10.79.0.1/24 and a route to 10.79.0.2/32;
-//!  4. checks the store: protected directory DACL (SYSTEM + Administrators),
-//!     the stored file is ciphertext, and an ordinary-user token cannot open it;
+//!  4. checks the store: under the Program Files known folder (not
+//!     %ProgramData%), every directory a plain directory (no junction or
+//!     symlink) owned by Administrators with the protected DACL (SYSTEM +
+//!     Administrators), the store opens through the installer's verifying
+//!     `Dirs.openExisting`, the stored file is ciphertext, and an
+//!     ordinary-user token can neither open it nor create anything in the
+//!     store; the service's zwg.exe is byte-identical to the installing
+//!     one and its wintun.dll (if copied) passes the Authenticode check
+//!     (signed by WireGuard LLC) the service applies before loading it;
 //!  5. AS AN ORDINARY USER (impersonating this user's token with
 //!     Administrators deny-only, medium integrity): reads the status over
 //!     the control pipe until the handshake with the peer shows;
@@ -52,15 +63,18 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
     var zwg: ?[]const u8 = null;
+    var peer_zwg: ?[]const u8 = null;
     var args = try init.minimal.args.iterateAllocator(arena);
     _ = args.skip();
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--zwg")) zwg = args.next();
+        if (std.mem.eql(u8, a, "--peer")) peer_zwg = args.next();
     }
     const zwg_path = zwg orelse {
-        std.debug.print("usage: zwg-service-live --zwg <path to zwg.exe>\n", .{});
+        std.debug.print("usage: zwg-service-live --zwg <path to zwg.exe> [--peer <path to zwg-testtun.exe>]\n", .{});
         std.process.exit(2);
     };
+    const peer_path_exe = peer_zwg orelse try std.fs.path.join(arena, &.{ std.fs.path.dirname(zwg_path) orelse ".", "zwg-testtun.exe" });
     if (!win.isElevated()) {
         std.debug.print(
             \\This driver installs and removes a temporary zwg tunnel service, so it
@@ -112,9 +126,9 @@ pub fn main(init: std.process.Init) !void {
     try drive.writeFile(io, peer_path, peer_conf);
     defer drive.shredFile(io, peer_path, peer_conf.len);
 
-    drive.step("start the peer: zwg up --tun udp:{d} (UDP {d})", .{ peer_tun_port, peer_port });
+    drive.step("start the peer: {s} up --tun udp:{d} (UDP {d})", .{ peer_path_exe, peer_tun_port, peer_port });
     const tun_arg = try std.fmt.allocPrint(arena, "udp:{d}", .{peer_tun_port});
-    var peer = try std.process.spawn(io, .{ .argv = &.{ zwg_path, "up", peer_path, "--tun", tun_arg } });
+    var peer = try std.process.spawn(io, .{ .argv = &.{ peer_path_exe, "up", peer_path, "--tun", tun_arg } });
     defer peer.kill(io);
     var peer_tun = try tun.UdpTun.open(0, 1500);
     defer peer_tun.close();
@@ -135,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
     }
     drive.shredFile(io, conf_path, conf.len); // the service has its own (encrypted) copy now
 
-    try checkStore(gpa);
+    try checkStore(gpa, zwg_path);
 
     drive.step("as an ordinary user: status over the control pipe until the handshake shows", .{});
     try waitForHandshake(gpa, io, peer_keys.public);
@@ -255,7 +269,7 @@ fn waitForHandshake(gpa: std.mem.Allocator, io: Io, peer_public: [32]u8) !void {
         drive.sleepMs(io, delay);
         delay = @min(delay * 2, 2000);
     }
-    return drive.fail("no handshake with the peer within 15 s (see %ProgramData%\\zwg\\logs\\{s}.log)", .{name});
+    return drive.fail("no handshake with the peer within 15 s (see %ProgramFiles%\\zwg\\logs\\{s}.log)", .{name});
 }
 
 /// 10.79.0.1:<p> -> 10.79.0.2:6000 leaves through the Wintun adapter, is
@@ -298,24 +312,22 @@ fn dataBothWays(io: Io, peer_tun: *tun.UdpTun) !void {
     return drive.fail("the reply pushed into the peer's TUN never reached the socket", .{});
 }
 
-fn checkStore(gpa: std.mem.Allocator) !void {
-    drive.step("the store: protected directory, encrypted file, closed to ordinary users", .{});
+fn checkStore(gpa: std.mem.Allocator, zwg_path: []const u8) !void {
+    drive.step("the store: under Program Files, plain protected directories, encrypted file, closed to ordinary users", .{});
     const p = try svc.store.Paths.init(name);
-    var wbuf: [300]u16 = undefined;
     {
-        const w = try win.W(&wbuf, p.root());
-        var dacl: ?*win.ACL = null;
-        var owner: ?win.PSID = null;
-        var sd: ?win.PSECURITY_DESCRIPTOR = null;
-        if (win.GetNamedSecurityInfoW(w.ptr, win.SE_FILE_OBJECT, win.OWNER_SECURITY_INFORMATION | win.DACL_SECURITY_INFORMATION, &owner, null, &dacl, null, &sd) != 0)
-            return drive.fail("cannot read the store's security", .{});
-        defer _ = win.LocalFree(sd);
-        var control: u16 = 0;
-        var rev: u32 = 0;
-        _ = win.GetSecurityDescriptorControl(sd.?, &control, &rev);
-        if (control & win.SE_DACL_PROTECTED == 0) return drive.fail("store DACL is not protected", .{});
-        if (dacl.?.ace_count != 2) return drive.fail("store DACL has {d} ACEs, expected 2 (SYSTEM, Administrators)", .{dacl.?.ace_count});
-        if (win.IsWellKnownSid(owner.?, win.WinBuiltinAdministratorsSid) == 0) return drive.fail("store owner is not Administrators", .{});
+        var pf_buf: [260]u8 = undefined;
+        const pf = try svc.store.programFiles(&pf_buf);
+        if (!std.mem.startsWith(u8, p.root(), pf) or std.ascii.findIgnoreCase(p.root(), "ProgramData") != null)
+            return drive.fail("the store {s} is not under the Program Files known folder {s}", .{ p.root(), pf });
+    }
+    for ([_][]const u8{ p.root(), p.tunnels(), p.logs(), p.dir() }) |d| try checkStoreDir(d);
+    {
+        // The installer's own verifier accepts what the installer made.
+        var dirs = svc.store.Dirs.openExisting(&p) catch |err| return drive.fail("Dirs.openExisting on the installed store: {s}", .{@errorName(err)});
+        defer dirs.close();
+        if (dirs.root == null or dirs.tunnels == null or dirs.logs == null or dirs.dir == null)
+            return drive.fail("Dirs.openExisting did not find every store directory", .{});
     }
     const blob = try svc.store.readAll(gpa, p.conf(), 1 << 20);
     defer gpa.free(blob);
@@ -328,8 +340,60 @@ fn checkStore(gpa: std.mem.Allocator) !void {
             gpa.free(b);
             return drive.fail("an ordinary-user token could read the stored configuration", .{});
         } else |err| if (err != error.AccessDenied) return drive.fail("expected AccessDenied reading the store, got {s}", .{@errorName(err)});
+        // Nor plant anything in it (a junction needs a directory to start from).
+        for ([_][]const u8{ p.root(), p.tunnels(), p.dir() }) |d| {
+            var b: [400]u8 = undefined;
+            var w: [400]u16 = undefined;
+            const planted = try win.W(&w, try std.fmt.bufPrint(&b, "{s}\\planted", .{d}));
+            if (win.CreateDirectoryW(planted.ptr, null) != 0) {
+                _ = win.RemoveDirectoryW(planted.ptr);
+                return drive.fail("an ordinary-user token could create a directory in {s}", .{d});
+            }
+        }
     }
     std.debug.print("  {s}: protected, {d} bytes of DPAPI ciphertext, ordinary user denied\n", .{ p.conf(), blob.len });
+
+    // What the service runs: the installer's own zwg.exe, byte for byte,
+    // and a wintun.dll that passes the service's signature check.
+    {
+        var b: [400]u8 = undefined;
+        const ours = try svc.store.readAll(gpa, zwg_path, svc.store.max_binary_bytes);
+        defer gpa.free(ours);
+        const theirs = try svc.store.readAll(gpa, try p.inDir(&b, svc.store.exe_file), svc.store.max_binary_bytes);
+        defer gpa.free(theirs);
+        if (!std.mem.eql(u8, ours, theirs)) return drive.fail("the service's zwg.exe differs from {s}", .{zwg_path});
+        const dll = try p.inDir(&b, svc.store.wintun_file);
+        if (svc.store.exists(dll)) {
+            var w: [tun.windows.path_max]u16 = undefined;
+            const dll_w = try win.W(&w, dll);
+            const h = tun.windows.openTrusted(dll_w) catch |err| return drive.fail("the service's wintun.dll: {s}", .{@errorName(err)});
+            _ = win.CloseHandle(h);
+            std.debug.print("  {s}: signed by {s}\n", .{ dll, tun.windows.wintun_signer });
+        } else std.debug.print("  no wintun.dll copied (the service loads System32's, after the same check)\n", .{});
+    }
+}
+
+/// A store directory: a plain directory (not a junction / symlink), owned
+/// by Administrators, protected DACL with exactly SYSTEM + Administrators.
+fn checkStoreDir(path: []const u8) !void {
+    var wbuf: [300]u16 = undefined;
+    const w = try win.W(&wbuf, path);
+    const attrs = win.GetFileAttributesW(w.ptr);
+    if (attrs == win.INVALID_FILE_ATTRIBUTES) return drive.fail("{s} does not exist", .{path});
+    if (attrs & win.FILE_ATTRIBUTE_DIRECTORY == 0 or attrs & win.FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        return drive.fail("{s} is not a plain directory (attributes 0x{x})", .{ path, attrs });
+    var dacl: ?*win.ACL = null;
+    var owner: ?win.PSID = null;
+    var sd: ?win.PSECURITY_DESCRIPTOR = null;
+    if (win.GetNamedSecurityInfoW(w.ptr, win.SE_FILE_OBJECT, win.OWNER_SECURITY_INFORMATION | win.DACL_SECURITY_INFORMATION, &owner, null, &dacl, null, &sd) != 0)
+        return drive.fail("cannot read the security of {s}", .{path});
+    defer _ = win.LocalFree(sd);
+    var control: u16 = 0;
+    var rev: u32 = 0;
+    _ = win.GetSecurityDescriptorControl(sd.?, &control, &rev);
+    if (control & win.SE_DACL_PROTECTED == 0) return drive.fail("the DACL of {s} is not protected", .{path});
+    if (dacl.?.ace_count != 2) return drive.fail("the DACL of {s} has {d} ACEs, expected 2 (SYSTEM, Administrators)", .{ path, dacl.?.ace_count });
+    if (win.IsWellKnownSid(owner.?, win.WinBuiltinAdministratorsSid) == 0) return drive.fail("the owner of {s} is not Administrators", .{path});
 }
 
 fn checkGone(arena: std.mem.Allocator, io: Io) !void {

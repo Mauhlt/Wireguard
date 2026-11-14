@@ -3,9 +3,12 @@
 //! timers) together.
 //!
 //! One thread runs `run`. Each turn it waits once on
-//!   {wake/stop events, UDP IPv4 socket, UDP IPv6 socket, TUN}
+//!   {wake/stop events, UDP IPv4 socket, UDP IPv6 socket, TUN, deadline timer}
 //! with the earliest peer timer deadline as the timeout (no deadline = wait
 //! forever), then drains every source and fires due timers. Nothing ticks.
+//! Time is the suspend-counting clock (`monotonic_clock`), and the deadline
+//! timer (`os.DeadlineTimer`) fires on that clock too, so a resume from
+//! sleep wakes the loop for every timer that fell due while asleep.
 //!
 //! Outbound: TUN -> route by destination (allowed IPs) -> peer -> encrypt
 //!   (no key: stage the packet, bounded, and start a handshake) -> UDP.
@@ -48,6 +51,17 @@ const batch_limit = 256;
 /// Largest datagram we accept (IPv4/IPv6 payload limit).
 const max_datagram = 65535;
 
+/// The clock every protocol timer runs on: one that keeps counting while
+/// the machine is suspended. WireGuard's timers are about time actually
+/// elapsed: a session older than REJECT_AFTER_TIME must not stay usable,
+/// nor a handshake retry or keepalive wait on, just because the laptop
+/// slept through it. std's `.boot` is QueryPerformanceCounter on Windows
+/// (counts suspend), CLOCK_BOOTTIME on Linux and CLOCK_MONOTONIC_RAW
+/// (mach_continuous_time) on macOS / iOS; `.awake` would be
+/// CLOCK_MONOTONIC / CLOCK_UPTIME_RAW there, which stop while asleep. The
+/// waits themselves are made suspend-aware by `os.DeadlineTimer`.
+pub const monotonic_clock: std.Io.Clock = .boot;
+
 /// Monotonic and wall-clock time. Tests shift `offset_ns` to simulate time
 /// passing (then `kick` the device so it re-reads its deadlines).
 pub const Clock = struct {
@@ -55,7 +69,7 @@ pub const Clock = struct {
     offset_ns: std.atomic.Value(i64) = .init(0),
 
     pub fn now(c: *const Clock) i64 {
-        const t = std.Io.Timestamp.now(c.io, .awake).nanoseconds;
+        const t = std.Io.Timestamp.now(c.io, monotonic_clock).nanoseconds;
         return @as(i64, @intCast(t)) + c.offset_ns.load(.monotonic);
     }
 
@@ -80,6 +94,9 @@ pub const Options = struct {
     private_key: crypto.PrivateKey,
     /// null or 0 = any free port.
     listen_port: ?u16 = null,
+    /// Listen on loopback only (the `--tun udp:<port>` test mode; unit
+    /// tests do anyway): never reachable from, nor visible to, the network.
+    loopback_only: bool = false,
     peers: []const PeerConfig = &.{},
 };
 
@@ -131,8 +148,14 @@ pub const Device = struct {
     udp4: ?os.Udp = null,
     udp6: ?os.Udp = null,
     listen_port: u16 = 0,
+    scope: os.Scope = .default,
 
     waker: tun_mod.queue.Waker,
+    /// Wakes the loop at the earliest timer deadline even across a
+    /// suspend (the wait timeout alone would not count the time asleep).
+    deadline_timer: os.DeadlineTimer,
+    /// The deadline `deadline_timer` is armed for (null: disarmed).
+    armed_deadline: ?i64 = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
     /// Extra handle that stops the loop when ready (`zwg down`).
     external_stop: ?os.WaitHandle = null,
@@ -177,6 +200,8 @@ pub const Device = struct {
         errdefer gpa.free(flush_buf);
         var waker = tun_mod.queue.Waker.init() catch return error.SystemResources;
         errdefer waker.deinit();
+        var deadline_timer = os.DeadlineTimer.init() catch return error.SystemResources;
+        errdefer deadline_timer.deinit();
 
         d.* = .{
             .gpa = gpa,
@@ -191,6 +216,8 @@ pub const Device = struct {
             .tun = tun,
             .mtu = tun.mtu(),
             .waker = waker,
+            .scope = if (options.loopback_only) .loopback else .default,
+            .deadline_timer = deadline_timer,
             .rx_buf = rx_buf,
             .tx_buf = tx_buf,
             .pkt_buf = pkt_buf,
@@ -217,6 +244,8 @@ pub const Device = struct {
         for (d.peers.items) |p| {
             _ = p.sess.deinit();
             p.hs.wipe();
+            // Staged plaintext packets waiting for a handshake.
+            std.crypto.secureZero(u8, p.staged.storage);
             p.staged.deinit(d.gpa);
             d.gpa.destroy(p);
         }
@@ -227,21 +256,23 @@ pub const Device = struct {
         if (d.udp4) |*u| u.close();
         if (d.udp6) |*u| u.close();
         d.waker.deinit();
+        d.deadline_timer.deinit();
         d.local.wipe();
         d.checker.wipe();
         std.crypto.secureZero(u8, std.mem.asBytes(&d.csprng));
         d.gpa.destroy(d.limiter);
-        d.gpa.free(d.rx_buf);
-        d.gpa.free(d.tx_buf);
-        d.gpa.free(d.pkt_buf);
-        d.gpa.free(d.flush_buf);
+        // Plaintext packets and ciphertext in flight: zeroed, not just freed.
+        for ([_][]u8{ d.rx_buf, d.tx_buf, d.pkt_buf, d.flush_buf }) |b| {
+            std.crypto.secureZero(u8, b);
+            d.gpa.free(b);
+        }
     }
 
     fn bind(d: *Device, port: u16) InitError!void {
-        d.udp4 = try os.Udp.open(.v4, port);
+        d.udp4 = try os.Udp.openScoped(.v4, port, d.scope);
         d.listen_port = d.udp4.?.localPort();
         // Same port for IPv6; a host without IPv6 just runs IPv4-only.
-        d.udp6 = os.Udp.open(.v6, d.listen_port) catch |err| blk: {
+        d.udp6 = os.Udp.openScoped(.v6, d.listen_port, d.scope) catch |err| blk: {
             log.info("IPv6 UDP socket unavailable ({s}); IPv4 only", .{@errorName(err)});
             break :blk null;
         };
@@ -312,7 +343,7 @@ pub const Device = struct {
             if (d.stop_requested.load(.acquire)) return;
             now = d.clock.now();
             const deadline = d.fireTimers(now);
-            var handles: [6]os.WaitHandle = undefined;
+            var handles: [7]os.WaitHandle = undefined;
             var n: usize = 0;
             handles[n] = d.waker.handle;
             n += 1;
@@ -335,11 +366,21 @@ pub const Device = struct {
             }
             handles[n] = d.tun.waitHandle();
             n += 1;
+            const timer_index = n;
+            if (d.deadline_timer.waitHandle()) |h| {
+                handles[n] = h;
+                n += 1;
+            }
 
             const timeout: ?u64 = if (more) 0 else if (deadline) |t| @intCast(@max(t - now, 0)) else null;
+            if (!more) d.armDeadline(deadline, now);
             const ready = os.wait(handles[0..n], timeout) catch return error.Unexpected;
             if (ready) |r| {
                 if (r == 0) d.waker.clear();
+                if (r == timer_index and n > timer_index) {
+                    d.deadline_timer.clear();
+                    d.armed_deadline = null;
+                }
                 if (d.external_stop != null and r == 1) return;
                 if (d.control) |c| if (r == control_index) c.ready(c.ctx, d);
             }
@@ -349,6 +390,16 @@ pub const Device = struct {
             if (d.udp6 != null) more = d.drainUdp(&d.udp6.?, now) or more;
             more = (try d.drainTun(now)) or more;
         }
+    }
+
+    /// Arm the suspend-aware timer for `deadline` (device clock), or disarm
+    /// it; nothing to do if it is already set for that deadline. The wait's
+    /// relative timeout stays too: whichever is first wakes the loop, and
+    /// the loop always recomputes from the clock.
+    fn armDeadline(d: *Device, deadline: ?i64, now: i64) void {
+        if (deadline == d.armed_deadline) return;
+        if (deadline) |t| d.deadline_timer.arm(@intCast(@max(t - now, 0))) else d.deadline_timer.disarm();
+        d.armed_deadline = deadline;
     }
 
     /// Fires due timers; returns the earliest remaining deadline.
@@ -685,3 +736,14 @@ pub const Device = struct {
         return d.peers.items[id];
     }
 };
+
+test "the device clock is the one that counts suspended time (.boot)" {
+    try std.testing.expectEqual(std.Io.Clock.boot, monotonic_clock);
+    var c: Clock = .{ .io = std.testing.io };
+    const a = c.now();
+    const b: i64 = @intCast(std.Io.Timestamp.now(std.testing.io, .boot).nanoseconds);
+    const e = c.now();
+    try std.testing.expect(a <= b and b <= e);
+    c.advance(5 * std.time.ns_per_s);
+    try std.testing.expect(c.now() >= e + 5 * std.time.ns_per_s);
+}

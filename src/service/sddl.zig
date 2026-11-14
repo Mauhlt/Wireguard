@@ -2,8 +2,8 @@
 //! here (pure, testable anywhere) and parsed by Windows at the point of use.
 //!
 //!   store directory  SYSTEM + Administrators full control, protected (no
-//!                    inherited ACEs from %ProgramData%, whose default ACL
-//!                    lets Users create and read files), inherited by
+//!                    inherited ACEs from %ProgramFiles%, whose default ACL
+//!                    lets Users read and run files), inherited by
 //!                    everything below: tunnels\<name>\tunnel.conf.dpapi,
 //!                    the service's copy of zwg.exe / wintun.dll, logs.
 //!   control pipe     (owner: the creating service, i.e. SYSTEM)
@@ -47,13 +47,13 @@ pub const Error = error{ InvalidSid, NoSpaceLeft };
 
 /// Control pipe DACL for `user_sid` (validated: it is spliced into SDDL).
 pub fn pipe(buf: []u8, user_sid: []const u8) Error![]const u8 {
-    if (!names.isValidSidString(user_sid)) return error.InvalidSid;
+    if (!names.isAccountSidString(user_sid)) return error.InvalidSid;
     return std.fmt.bufPrint(buf, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x{x};;;{s})", .{ pipe_user_access, user_sid });
 }
 
 /// Service object DACL for `user_sid`.
 pub fn service(buf: []u8, user_sid: []const u8) Error![]const u8 {
-    if (!names.isValidSidString(user_sid)) return error.InvalidSid;
+    if (!names.isAccountSidString(user_sid)) return error.InvalidSid;
     return std.fmt.bufPrint(buf, "D:" ++ service_default_aces ++ "(A;;0x{x};;;{s})", .{ service_user_access, user_sid });
 }
 

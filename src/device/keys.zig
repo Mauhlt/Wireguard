@@ -163,3 +163,28 @@ test "whitepaper-independent X25519 vector (RFC 7748 6.1)" {
     _ = try std.fmt.hexToBytes(&want, pub_hex);
     try std.testing.expectEqualSlices(u8, &want, &publicFromPrivate(&priv));
 }
+
+test "keys: cross-checked against wg.exe (WireGuard for Windows) genkey/pubkey" {
+    // Produced 2026-11-12 with "C:\Program Files\WireGuard\wg.exe":
+    //   wg genkey | tee priv | wg pubkey      (rows 1-3)
+    //   echo <unclamped key> | wg pubkey      (rows 4-5: wg clamps, so do we)
+    const cases = [_][2][]const u8{
+        .{ "CN3URi7MiszI1nhIbL8L7T6sGLUDBmGEDw2g2WNXW3Q=", "jkcY8Cd0RLrrWahhzDyxeqcMle8cBX6uN+vgVaKaC0k=" },
+        .{ "kGiTcwU7NANVTOLotHQsBwXaMqfDP+CHO0Tj0lOp1EE=", "QqNMArOgRqTJ5k93HZYyrD2g4bwR6miVlNqzwWpXvSc=" },
+        .{ "mOgFQxhFVe3FMZ37X5wAB5jBzHz9ckVAynAjYHXU5kw=", "DTS3j4hipiz49uYkZH0XDUbMSdFIs37Hc6kUkxDT3WM=" },
+        .{ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "L+V9o0fNYkMVKNqsX7spBzD/9oSvxM/C7ZCZX1jLO3Q=" },
+        .{ "//////////////////////////////////////////8=", "hHwNLDdSNPNl5mCVUYejc1oPdhPRYJ06ak2MU66qWiI=" },
+    };
+    for (cases) |c| {
+        const priv = try decode(c[0]);
+        try std.testing.expectEqualStrings(c[0], &encode(&priv));
+        const pub_ = publicFromPrivate(&priv);
+        try std.testing.expectEqualStrings(c[1], &encode(&pub_));
+    }
+    // wg genkey output is already clamped.
+    var k = try decode(cases[0][0]);
+    const before = k;
+    clamp(&k);
+    try std.testing.expectEqual(before, k);
+}
+

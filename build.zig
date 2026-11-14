@@ -12,16 +12,14 @@ pub fn build(b: *std.Build) void {
     });
 
     // `zwg`: bring a .conf up/down, show status, genkey/pubkey.
-    const exe = b.addExecutable(.{
-        .name = "zwg",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "WireGuard", .module = mod }},
-        }),
-    });
+    // `zwg up <conf> --tun udp:<port>` (the TUN is a 127.0.0.1 UDP socket,
+    // no adapter, no privileges) is a test-harness hook: compiled into zwg
+    // only with -Dtest-tun, and always into `zwg-testtun`, the copy the
+    // interop drivers run (never installed as a service binary).
+    const test_tun = b.option(bool, "test-tun", "Compile the `zwg up <conf> --tun udp:<port>` test mode into zwg (default: off)") orelse false;
+    const exe = zwgExe(b, "zwg", target, optimize, mod, test_tun);
     b.installArtifact(exe);
+    const zwg_testtun = zwgExe(b, "zwg-testtun", target, optimize, mod, true);
 
     // `-Dtest-filter=<substring>` builds only the matching tests, e.g. one fuzz
     // target: `zig build test --fuzz=1M -Doptimize=ReleaseSafe -Dtest-filter="fuzz: replay"`
@@ -83,8 +81,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_loopback = b.addRunArtifact(loopback);
-    run_loopback.addArtifactArg(exe);
+    run_loopback.addArtifactArg(zwg_testtun);
     interop.dependOn(&run_loopback.step);
+    // The release zwg must not have the test mode.
+    if (!test_tun) {
+        const run_no_tun = b.addRunArtifact(loopback);
+        run_no_tun.addArg("--refuses-tun");
+        run_no_tun.addArtifactArg(exe);
+        interop.dependOn(&run_no_tun.step);
+    }
 
     // The same runner against refpeer (reference model + UdpTun): proves the
     // harness and UdpTun across real processes before zwg exists.
@@ -103,7 +108,7 @@ pub fn build(b: *std.Build) void {
 
     // Cross-implementation over real processes: zwg (A) <-> refpeer (B).
     const run_loopback_cross = b.addRunArtifact(loopback);
-    run_loopback_cross.addArtifactArg(exe);
+    run_loopback_cross.addArtifactArg(zwg_testtun);
     run_loopback_cross.addArtifactArg(refpeer);
     interop.dependOn(&run_loopback_cross.step);
 
@@ -120,15 +125,7 @@ pub fn build(b: *std.Build) void {
         .target = linux_target,
         .optimize = optimize,
     });
-    const zwg_linux = b.addExecutable(.{
-        .name = "zwg",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = linux_target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "WireGuard", .module = linux_mod }},
-        }),
-    });
+    const zwg_linux = zwgExe(b, "zwg", linux_target, optimize, linux_mod, test_tun);
     const live_linux = b.addExecutable(.{
         .name = "zwg-live-linux",
         .root_module = b.createModule(.{
@@ -186,8 +183,9 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "WireGuard", .module = mod }},
             }),
         });
-        const live_step = b.step("interop-live", "Build zwg-interop-live.exe (run it elevated; see tests/interop/README.md)");
+        const live_step = b.step("interop-live", "Build zwg-interop-live.exe + zwg-testtun.exe (run it elevated; see tests/interop/README.md)");
         live_step.dependOn(&b.addInstallArtifact(live, .{}).step);
+        live_step.dependOn(&b.addInstallArtifact(zwg_testtun, .{}).step);
         live_step.dependOn(b.getInstallStep());
         interop.dependOn(&live.step); // keep it compiling
 
@@ -219,9 +217,25 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "WireGuard", .module = mod }},
             }),
         });
-        const service_step = b.step("interop-service", "Build zwg-service-live.exe (run it elevated; see tests/interop/README.md)");
+        const service_step = b.step("interop-service", "Build zwg-service-live.exe + zwg-testtun.exe (the peer) (run it elevated; see tests/interop/README.md)");
         service_step.dependOn(&b.addInstallArtifact(service_live, .{}).step);
+        service_step.dependOn(&b.addInstallArtifact(zwg_testtun, .{}).step);
         service_step.dependOn(b.getInstallStep());
         interop.dependOn(&service_live.step); // keep it compiling
     }
+}
+
+/// zwg (src/main.zig) for `target`, with or without the `--tun udp:<port>`
+/// test mode (build option `test_tun` in the `build_options` module).
+fn zwgExe(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, wg: *std.Build.Module, test_tun: bool) *std.Build.Step.Compile {
+    const options = b.addOptions();
+    options.addOption(bool, "test_tun", test_tun);
+    const m = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "WireGuard", .module = wg }},
+    });
+    m.addOptions("build_options", options);
+    return b.addExecutable(.{ .name = name, .root_module = m });
 }

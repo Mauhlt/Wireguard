@@ -20,7 +20,7 @@
 //!   name           zwgTunnel$<name>, display "zwg tunnel: <name>"
 //!   type           SERVICE_WIN32_OWN_PROCESS, LocalSystem
 //!   start          demand (default) or automatic (`--auto`)
-//!   binary         "<%ProgramData%\zwg\tunnels\<name>\zwg.exe>" /tunnelservice <name> <user SID>
+//!   binary         "<%ProgramFiles%\zwg\tunnels\<name>\zwg.exe>" /tunnelservice <name> <user SID>
 //!   dependencies   Nsi, TcpIp (adapters and routes need both)
 //!   SID type       unrestricted: the service gets its own SID
 //!                  (NT SERVICE\zwgTunnel$<name>) for firewall rules, while
@@ -187,7 +187,7 @@ pub const CreateOptions = struct {
 /// Create and configure the service (not started). Needs an elevated process.
 pub fn create(m: *const Manager, o: CreateOptions) Error!Service {
     std.debug.assert(names.isValid(o.tunnel));
-    if (!names.isValidSidString(o.user_sid)) return error.Unexpected;
+    if (!names.isAccountSidString(o.user_sid)) return error.Unexpected;
 
     var nb: [names.max_service_name]u8 = undefined;
     var name_w: [names.max_service_name + 1]u16 = undefined;

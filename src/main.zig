@@ -17,6 +17,10 @@ const dev = wg.device;
 const keys = dev.keys;
 const config = dev.config;
 const is_windows = @import("builtin").os.tag == .windows;
+/// `up <conf> --tun udp:<port>`: the TUN is a 127.0.0.1 UDP socket (no
+/// adapter, no privileges). A test-harness hook for tests/interop, compiled
+/// in only by `-Dtest-tun` and into the `zwg-testtun` build.
+const test_tun_enabled = @import("build_options").test_tun;
 
 // In the tunnel service, std.log output goes to the tunnel's log file.
 pub const std_options: std.Options = .{ .logFn = if (is_windows) wg.service.log.logFn else std.log.defaultLog };
@@ -28,13 +32,21 @@ const usage =
     \\  pubkey                 read a private key on stdin, print its public key
     \\  show <file.conf>       show a configuration (keys other than public ones hidden)
     \\  up <file.conf>         bring the tunnel up (foreground; needs Administrator on Windows)
+    \\
+++ (if (test_tun_enabled)
     \\  up <file.conf> --tun udp:<port>
     \\                         test mode: the TUN is a 127.0.0.1 UDP socket (tests/interop)
+    \\
+else "") ++
     \\  down <name|file.conf>  stop a tunnel started with `zwg up`
     \\
 ++ (if (is_windows) "\nInstalled tunnels (Windows service; nothing else runs elevated):\n" ++ wg.service.cli.usage else "");
 
 pub fn main(init: std.process.Init) !void {
+    // zwg runs elevated (installer, `zwg up`) and as SYSTEM (the service):
+    // DLLs loaded without a full path come from System32 only, never from
+    // the (possibly user-writable) application or current directory.
+    if (is_windows) wg.tun.windows.restrictDllSearch();
     const gpa = init.gpa;
     const io = init.io;
     var args: std.ArrayList([]const u8) = .empty;
@@ -97,8 +109,8 @@ fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.I
         try dev.show.write(out, interfaceName(args[1]), &c, null, null, 0);
         return 0;
     }
-    if (std.mem.eql(u8, cmd, "up") and (args.len == 2 or (args.len == 4 and std.mem.eql(u8, args[2], "--tun")))) {
-        const test_tun: ?u16 = if (args.len == 4) wg.tun.UdpTun.parseSpec(args[3]) catch {
+    if (std.mem.eql(u8, cmd, "up") and (args.len == 2 or (test_tun_enabled and args.len == 4 and std.mem.eql(u8, args[2], "--tun")))) {
+        const test_tun: ?u16 = if (test_tun_enabled and args.len == 4) wg.tun.UdpTun.parseSpec(args[3]) catch {
             try errw.writeAll("zwg: --tun expects udp:<port>\n");
             return 1;
         } else null;
@@ -149,7 +161,9 @@ fn loadConfig(gpa: std.mem.Allocator, io: std.Io, path: []const u8, errw: *std.I
     return c;
 }
 
-fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Config, test_tun: ?u16, out: *std.Io.Writer, errw: *std.Io.Writer) !u8 {
+fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Config, test_tun_arg: ?u16, out: *std.Io.Writer, errw: *std.Io.Writer) !u8 {
+    // Comptime-known null without -Dtest-tun: the UdpTun path is not compiled in.
+    const test_tun: ?u16 = if (comptime test_tun_enabled) test_tun_arg else null;
     const builtin = @import("builtin");
     const tun = wg.tun;
     if (comptime builtin.os.tag == .ios) {
@@ -169,7 +183,10 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
 
     // Resolve endpoints first: a typo should fail before an adapter appears.
     const peers = try gpa.alloc(dev.device.PeerConfig, c.peers.len);
-    defer gpa.free(peers);
+    defer {
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(peers)); // preshared keys
+        gpa.free(peers);
+    }
     for (c.peers, peers) |*p, *pc| {
         pc.* = .{
             .public_key = p.public_key,
@@ -209,6 +226,8 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
                 else => if (comptime builtin.os.tag == .windows and @hasDecl(tun.windows, "wintun_hint")) {
                     if (err == error.WintunNotFound) {
                         try errw.print("zwg: {s}\n", .{tun.windows.wintun_hint});
+                    } else if (err == error.WintunUntrusted) {
+                        try errw.print("zwg: {s}\n", .{tun.windows.untrusted_hint});
                     } else try errw.print("zwg: cannot create the TUN interface: {s}\n", .{@errorName(err)});
                 } else try errw.print("zwg: cannot create the TUN interface: {s}\n", .{@errorName(err)}),
             }
@@ -225,11 +244,14 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
         try errw.writeAll("zwg: warning: DNS is not configured by zwg yet; set it on the interface yourself\n");
 
     var clock: dev.device.Clock = .{ .io = io };
-    const d = try dev.Device.create(gpa, &clock, t, .{
+    var options: dev.device.Options = .{
         .private_key = c.interface.private_key,
         .listen_port = c.interface.listen_port,
         .peers = peers,
-    });
+        .loopback_only = test_tun != null,
+    };
+    defer std.crypto.secureZero(u8, &options.private_key);
+    const d = try dev.Device.create(gpa, &clock, t, options);
     defer d.destroy();
     d.external_stop = stop.waitHandle();
     dev.os.stopOnInterrupt(&stop);

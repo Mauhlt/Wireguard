@@ -62,9 +62,7 @@ pub fn tai64nAfter(a: *const Tai64n, b: *const Tai64n) bool;          // constan
 pub fn eql(comptime n: usize, a: *const [n]u8, b: *const [n]u8) bool; // constant time
 pub fn isZero(comptime n: usize, a: *const [n]u8) bool;               // constant time
 pub fn wipe(ptr: anytype) void;                                       // *T or []T; secureZero is an alias
-pub const key_b64_len = 44;
-pub fn keyToBase64(key: *const [32]u8) [44]u8;                        // wg / .conf format
-pub fn keyFromBase64(s: []const u8) error{InvalidKey}![32]u8;          // strict, canonical only
+// Key text (base64, 44 chars): device/keys.zig encode / decode, constant time.
 pub fn hexTo(comptime n: usize, comptime s: []const u8) [n]u8;        // test-vector helper
 ```
 
@@ -138,13 +136,25 @@ A small CLI `zwg` (up/down a .conf, show status like `wg show`, genkey/pubkey).
 `Tun` interface: `open(name, mtu)`, `readable event handle` (for the device's
 wait), `read(buf) ?[]u8`, `write(packet)`, `setAddress(cidr)`, `mtu`, `close`.
 Backends: Windows (Wintun — a signed kernel driver; load wintun.dll at
-runtime, do NOT ship it; document the exception: a userspace TUN on Windows
+runtime by full path after checking its Authenticode signer is WireGuard
+LLC, do NOT ship it; document the exception: a userspace TUN on Windows
 needs a signed driver), Linux (/dev/net/tun), macOS (utun via
 PF_SYSTEM/SYSPROTO_CONTROL), iOS (NEPacketTunnelProvider packetFlow: a
 callback adapter, no fd). Plus the test harness: known-answer tests for every
 crypto/handshake step, a two-device in-process loopback test (no TUN: a fake
 Tun), and a live interop test against the installed official WireGuard for
 Windows (wg.exe / wireguard.exe), documented step by step (needs admin once).
+
+## service (src/service, Windows only)
+
+`zwg installtunnel` runs a tunnel as a LocalSystem service (full design:
+tests/interop/README.md, "The tunnel service"). Its store is
+`%ProgramFiles%\zwg` (the known folder, never the environment): only
+administrators can create anything there, unlike %ProgramData%, where a user
+could pre-create the folder and swap it for a junction under the elevated
+installer. The installer resolves each store directory once, never through a
+reparse point, verifies and secures that same handle and keeps it open
+(no FILE_SHARE_DELETE) while it writes the files relative to it.
 
 ## Rules
 

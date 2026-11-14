@@ -30,8 +30,12 @@ zwg up <conf> --tun udp:<port>
   and routes are not applied in this mode (`setAddress` / `addRoute` are no-ops
   on UdpTun).
 * `zwg` with no arguments prints a usage text that mentions `--tun` (if a
-  binary does not, the runner reports `SKIP` for it). Implemented in
-  src/main.zig.
+  binary does not, the runner fails). Implemented in src/main.zig.
+* **Test builds only.** The mode is compiled in only with `-Dtest-tun`
+  (default off), and always into `zig-out\bin\zwg-testtun.exe`, which the
+  interop steps build and run; the release `zwg.exe` (what `installtunnel`
+  copies into the service) does not have it — `zig build interop` checks
+  that it refuses `up <conf> --tun udp:<port>` as a usage error.
 * The process is ended with a kill (TerminateProcess / SIGKILL) at the end of
   the test.
 
@@ -47,10 +51,10 @@ nor zwg for phase A.
 
 One admin prompt, one command:
 
-1. Build as your normal user: `zig build interop-live` (and `zig build` for zwg).
+1. Build as your normal user: `zig build interop-live` (builds zwg-testtun.exe too).
 2. Open **Terminal (Admin)** in the repo and run
    ```
-   zig-out\bin\zwg-interop-live.exe --record tests\interop\vectors\official.zig --zwg zig-out\bin\zwg.exe
+   zig-out\bin\zwg-interop-live.exe --record tests\interop\vectors\official.zig --zwg zig-out\bin\zwg-testtun.exe
    ```
    (without `--zwg`, phase B is skipped.)
 3. Commit the recorded `tests/interop/vectors/official.zig` (throwaway keys).
@@ -174,9 +178,16 @@ One process per target (`-Dtest-filter`) gives per-target coverage numbers.
 
 The one non-Zig runtime component: a layer-3 adapter on Windows needs a signed
 kernel driver, so zwg uses Wintun (WireGuard LLC). `src/tun/windows.zig` loads
-`wintun.dll` at runtime from the application directory or System32 only
-(`LoadLibraryExW` with `LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
-LOAD_LIBRARY_SEARCH_SYSTEM32`). It is never committed or shipped: download the
+`wintun.dll` at runtime by full path only: next to `zwg.exe`, else System32's
+(never the current directory or PATH). Before loading, it opens the file
+denying writes and deletes, checks its Authenticode signature through that
+handle (`WinVerifyTrust`, generic policy, no network: cached revocation data
+only) and requires the signer certificate's CN and O to be `WireGuard LLC`;
+the handle stays open until `LoadLibraryExW` has mapped the file, so it cannot
+be swapped in between. zwg calls `SetDefaultDllDirectories(System32)` first
+thing, so nothing else is ever loaded from the (possibly user-writable)
+application directory either. A tampered or unsigned DLL fails with
+`error.WintunUntrusted`. It is never committed or shipped: download the
 signed release from <https://www.wintun.net/> (wintun-0.14.1.zip), check the
 SHA-256 published there, and copy `wintun\bin\<arch>\wintun.dll` next to `zwg.exe`.
 
@@ -215,12 +226,18 @@ verb (`/installtunnel-elevated <abs path> <user SID> <auto>` or
 `/uninstalltunnel-elevated <name>`), hidden, and waits on the child's process
 handle for its exit code (mapped to a message, including the service's own
 failure reason). From an already elevated prompt the same code runs in-process.
-The elevated child re-reads and re-validates everything it is handed.
+The elevated child re-reads and re-validates everything it is handed, and
+copies the service's binaries only from handles it holds open denying writes
+and deletes: its own zwg.exe, verified to be the very file its running image
+was mapped from (`NtAreMappedFilesTheSame`; a running .exe can be renamed
+away and replaced), and wintun.dll, verified as above but never loaded by the
+elevated installer (the directory it comes from, e.g. zig-out\bin, is
+user-writable). The service verifies wintun.dll again before loading it.
 
 **Storage** (`store.zig`):
 
 ```
-%ProgramData%\zwg\                       O:BA, D:PAI (SYSTEM, Administrators: full; inherited)
+%ProgramFiles%\zwg\                      O:BA, D:PAI (SYSTEM, Administrators: full; inherited)
   tunnels\<name>\tunnel.conf.dpapi       the .conf, DPAPI machine scope + fixed entropy
   tunnels\<name>\zwg.exe, wintun.dll     what the service runs (copied at install)
   logs\<name>.log (+ .old)               bounded to 1 MiB each, never keys
@@ -231,11 +248,26 @@ The ACL is the access control: no non-admin process can open the files. DPAPI
 image without the machine's LSA secrets) is ciphertext; machine scope because
 the installer (elevated user) writes and the service (SYSTEM) reads. The
 service binary is copied into the protected tree so LocalSystem never runs an
-executable a user could replace (zig-out\bin is user-writable). %ProgramData%
-comes from `SHGetKnownFolderPath`, never the environment. Users may create
-folders in %ProgramData%, so a pre-existing `zwg` folder is used only if it is a
-real directory (no junction/symlink) owned by Administrators or SYSTEM; its DACL
-is reset either way.
+executable a user could replace (zig-out\bin is user-writable). %ProgramFiles%
+comes from `SHGetKnownFolderPath`, never the environment.
+
+Why %ProgramFiles% (as WireGuard for Windows' `%ProgramFiles%\WireGuard\Data`)
+and not %ProgramData%: Users may create folders in %ProgramData%, so a user
+could pre-create `%ProgramData%\zwg` and, between the elevated installer's
+checks and its writes, swap it for a junction — redirecting what SYSTEM writes
+and later runs (zwg.exe) and where the decrypted key goes. Only administrators
+(and TrustedInstaller) can create anything in %ProgramFiles%. On top of that the
+elevated installer and uninstaller (`store.Dirs`) resolve each store directory
+exactly once — the root by path, each subdirectory relative to its verified
+parent handle, never through a reparse point (`FILE_FLAG_OPEN_REPARSE_POINT`) —
+check that very handle (a plain directory per
+`GetFileInformationByHandleEx(FileAttributeTagInfo)`, owner Administrators or
+SYSTEM per `GetSecurityInfo`), reset owner and DACL on it (`SetSecurityInfo`),
+and keep the handles open without `FILE_SHARE_DELETE` until they are done, so
+nothing on the path can be renamed, deleted or replaced meanwhile. The files
+(conf, zwg.exe, wintun.dll) are written, wiped and deleted relative to those
+handles. An install made by an older zwg under `%ProgramData%\zwg` must be
+removed with that older zwg (`zwg uninstalltunnel <name>`) first.
 
 **Service** (`scm.zig`): `zwgTunnel$<name>`, SERVICE_WIN32_OWN_PROCESS,
 LocalSystem, demand start (or automatic with `--auto`), depends on Nsi and
@@ -299,13 +331,20 @@ in System32. Then, as your normal user `zig build interop-service`, and in
 zig-out\bin\zwg-service-live.exe --zwg zig-out\bin\zwg.exe
 ```
 
+(The service is installed from the release `zwg.exe`; the peer runs as
+`zwg-testtun.exe` from the same folder, the `-Dtest-tun` build; `--peer <exe>`
+picks another.)
+
 It installs `zwgTunnel$zwgsvctest` (10.79.0.1/24, peer 10.79.0.2 = a plain
-`zwg up --tun udp:<port>` process on 127.0.0.1), checks the store's DACL and
-encryption, then — impersonating an ordinary-user version of your token
+`zwg-testtun up --tun udp:<port>` process on 127.0.0.1), checks the store's DACL and
+encryption (every store directory under the Program Files known folder, a plain
+directory owned by Administrators with the protected DACL; the installer's
+verifier `Dirs.openExisting` accepts it; an ordinary user can neither read the
+conf nor create anything in the store), then — impersonating an ordinary-user version of your token
 (Administrators deny-only, medium integrity) — reads the handshake over the
 pipe, sends UDP both ways through the real Wintun adapter, checks another
 user is refused, runs `down` and `up`, then `zwg uninstalltunnel` and checks
-the service, `%ProgramData%\zwg\tunnels\zwgsvctest`, the log and the adapter
+the service, `%ProgramFiles%\zwg\tunnels\zwgsvctest`, the log and the adapter
 are gone. On any failure it uninstalls anyway, kills the peer and shreds both
 temporary .conf files in %TEMP%. Source: `service_live.zig` (separate from
 `live.zig` so the two can be folded into one live run later).

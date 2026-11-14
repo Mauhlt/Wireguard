@@ -64,9 +64,19 @@ pub const Result = enum(u8) {
     stop_timeout = 14,
     marked_for_delete = 15,
     cancelled = 16,
+    wintun_untrusted = 17,
+    image_changed = 18,
     /// 32 + state.Exit: the service started but stopped with that reason.
     service_exit_base = 32,
     _,
+
+    /// The elevated child's process exit code. Anything that does not fit
+    /// a u8 (a crash's NTSTATUS such as 0xC0000005, or 256, whose low byte
+    /// is 0 = ok) is a failure, never truncated into another result.
+    pub fn fromExitCode(code: u32) Result {
+        if (code > std.math.maxInt(u8)) return .failed;
+        return @enumFromInt(@as(u8, @intCast(code)));
+    }
 
     fn fromExit(e: state.Exit) Result {
         return @enumFromInt(32 + @as(u8, @intCast(@intFromEnum(e))));
@@ -75,7 +85,7 @@ pub const Result = enum(u8) {
     pub fn message(r: Result) []const u8 {
         return switch (r) {
             .ok => "done",
-            .failed => "failed (see %ProgramData%\\zwg\\logs, readable by administrators)",
+            .failed => "failed (see %ProgramFiles%\\zwg\\logs, readable by administrators)",
             .bad_args => "bad internal arguments",
             .not_elevated => "the elevated step is not elevated",
             .invalid_name => "invalid tunnel name: 1-32 of A-Z a-z 0-9 _ = + . - (the file name without .conf)",
@@ -84,13 +94,15 @@ pub const Result = enum(u8) {
             .already_installed => "a tunnel with that name is already installed (zwg uninstalltunnel <name> first)",
             .not_installed => "no tunnel with that name is installed",
             .wintun_missing => tun.windows.wintun_hint,
-            .untrusted_dir => "%ProgramData%\\zwg exists but is a link or not owned by Administrators/SYSTEM; remove it and retry",
-            .store_failed => "cannot write the protected store under %ProgramData%\\zwg",
+            .untrusted_dir => "a directory under %ProgramFiles%\\zwg is a link, not a directory, or not owned by Administrators/SYSTEM; remove it and retry",
+            .store_failed => "cannot write the protected store under %ProgramFiles%\\zwg",
             .service_failed => "the service could not be created or configured",
             .start_timeout => "the service did not reach RUNNING in time (it was removed again)",
             .stop_timeout => "the service did not stop in time (it is marked for deletion)",
             .marked_for_delete => "a previous service of that name is still being deleted; close Services/sc and retry",
             .cancelled => "the UAC prompt was declined; nothing changed",
+            .wintun_untrusted => tun.windows.untrusted_hint,
+            .image_changed => "zwg.exe on disk is no longer the program that is running (replaced during the install?); nothing installed",
             else => if (@intFromEnum(r) >= 32 and @intFromEnum(r) - 32 <= @intFromEnum(state.Exit.bad_arguments))
                 @as(state.Exit, @enumFromInt(@intFromEnum(r) - 32)).message()
             else
@@ -225,7 +237,7 @@ fn runElevated(params: []const u8) !Result {
     if (win.WaitForSingleObject(h, win.INFINITE) != win.WAIT_OBJECT_0) return .failed;
     var code: u32 = 1;
     if (win.GetExitCodeProcess(h, &code) == 0) return .failed;
-    return @enumFromInt(@as(u8, @truncate(code)));
+    return .fromExitCode(code);
 }
 
 // ---- the elevated steps --------------------------------------------------------
@@ -234,7 +246,9 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
     if (!win.isElevated()) return .not_elevated;
     const name = names.fromPath(conf_path);
     if (!names.isValid(name)) return .invalid_name;
-    if (!names.isValidSidString(user_sid)) return .bad_args;
+    // Only a user account may be granted the pipe and the service, never
+    // a group or well-known principal (Everyone, Users, ...).
+    if (!names.isAccountSidString(user_sid) or !win.isUserAccountSid(user_sid)) return .bad_args;
 
     // Read and validate again: this process trusts nothing it was handed.
     const text = std.Io.Dir.cwd().readFileAlloc(io, conf_path, gpa, .limited(config.max_config_bytes)) catch return .config_unreadable;
@@ -259,11 +273,32 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
         error.NotInstalled => {},
         else => return .service_failed,
     }
-    // Wintun must be loadable from where the service will look (its own
-    // directory, where we copy the DLL from next to us, or System32).
-    _ = tun.windows.probe() catch return .wintun_missing;
+    // What the service will run, opened now and held, denying writes and
+    // deletes, until copied from these very handles: this process's own
+    // image (the file on disk must still be the one it was started from)
+    // and wintun.dll from where the service will look (next to us: copied
+    // along; else System32's), Authenticode-signed by WireGuard LLC. The
+    // DLL is never loaded here: this process is elevated, and the
+    // directory it came from may be user-writable.
+    const self_file = win.openRunningImage() catch |err| {
+        _ = storeFail("open zwg.exe", err);
+        return if (err == error.NotRunningImage) .image_changed else .failed;
+    };
+    defer _ = win.CloseHandle(self_file);
+    var dll_w: [tun.windows.path_max]u16 = undefined;
+    var dll_from: tun.windows.Location = undefined;
+    const dll_path = tun.windows.locate(&dll_w, &dll_from) orelse return .wintun_missing;
+    const dll_file = tun.windows.openTrusted(dll_path) catch |err| return switch (err) {
+        error.WintunUntrusted => .wintun_untrusted,
+        error.WintunNotFound => .wintun_missing,
+    };
+    defer _ = win.CloseHandle(dll_file);
 
-    store.prepare(&paths) catch |err| return if (err == error.UntrustedDirectory) .untrusted_dir else storeFail("create the store directories", err);
+    // Each store directory is opened and verified once, and stays open
+    // (not deletable, not renamable) until this function returns; every
+    // file below is written relative to those handles.
+    var dirs = store.Dirs.prepare(&paths) catch |err| return if (err == error.UntrustedDirectory) .untrusted_dir else storeFail("create the store directories", err);
+    defer dirs.close();
     log.open(paths.log()) catch {};
     defer log.close();
     log.print("installtunnel {s}: for user {s}, start {s}", .{ name, user_sid, if (auto) "automatic" else "on demand" });
@@ -271,31 +306,24 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
     var installed = false;
     defer if (!installed) {
         log.print("installtunnel {s}: rolled back", .{name});
-        removeFiles(&paths);
+        removeFiles(&dirs, &paths);
     };
 
-    // What the service runs: copies in the protected tree.
-    var self_w: [600]u16 = undefined;
-    const self = win.selfExePath(&self_w) catch return .failed;
-    var self_buf: [1800]u8 = undefined;
-    const self_n = std.unicode.utf16LeToUtf8(&self_buf, self) catch return .failed;
-    const self_path = self_buf[0..self_n];
+    // What the service runs: copies in the protected tree, from the held
+    // and verified handles above.
     var exe_buf: [400]u8 = undefined;
     const exe_path = paths.inDir(&exe_buf, store.exe_file) catch return .store_failed;
-    store.copyInto(gpa, self_path, exe_path) catch |err| {
+    store.copyInto(gpa, self_file, dirs.dir.?, store.exe_file) catch |err| {
         log.print("copy zwg.exe: {s}", .{@errorName(err)});
         return storeFail("copy zwg.exe", err);
     };
-    var dll_src_buf: [1800]u8 = undefined;
-    const dll_src = std.fmt.bufPrint(&dll_src_buf, "{s}\\" ++ store.wintun_file, .{std.fs.path.dirname(self_path) orelse "."}) catch return .store_failed;
-    if (store.exists(dll_src)) {
-        var dll_buf: [400]u8 = undefined;
-        store.copyInto(gpa, dll_src, paths.inDir(&dll_buf, store.wintun_file) catch return .store_failed) catch |err| {
+    if (dll_from == .app_dir) {
+        store.copyInto(gpa, dll_file, dirs.dir.?, store.wintun_file) catch |err| {
             log.print("copy wintun.dll: {s}", .{@errorName(err)});
             return storeFail("copy wintun.dll", err);
         };
     }
-    store.storeConfig(gpa, &paths, text) catch |err| {
+    store.storeConfig(gpa, &dirs, text) catch |err| {
         log.print("store configuration: {s}", .{@errorName(err)});
         return storeFail("store the encrypted configuration", err);
     };
@@ -368,12 +396,19 @@ pub fn elevatedUninstall(name: []const u8) Result {
         s.delete() catch return .service_failed;
         break :blk true;
     };
-    const had_files = store.exists(paths.dir());
-    removeFiles(&paths);
-    var old_buf: [300]u8 = undefined;
-    store.delete(paths.log()) catch {};
-    store.delete(std.fmt.bufPrint(&old_buf, "{s}.old", .{paths.log()}) catch paths.log()) catch {};
-    store.removeDirs(&paths);
+    // The store, verified and held as at install (never through a link).
+    var dirs = store.Dirs.openExisting(&paths) catch |err| {
+        _ = storeFail("open the store directories", err);
+        return if (err == error.UntrustedDirectory) .untrusted_dir else .store_failed;
+    };
+    defer dirs.close();
+    const had_files = dirs.dir != null;
+    if (dirs.logs) |l| {
+        var log_buf: [64]u8 = undefined;
+        if (std.fmt.bufPrint(&log_buf, "{s}.log", .{name})) |f| store.deleteAt(l, f) catch {} else |_| {}
+        if (std.fmt.bufPrint(&log_buf, "{s}.log.old", .{name})) |f| store.deleteAt(l, f) catch {} else |_| {}
+    }
+    removeFiles(&dirs, &paths);
     if (!had_service and !had_files) return .not_installed;
     return result;
 }
@@ -387,12 +422,13 @@ fn storeFail(step: []const u8, err: anyerror) Result {
     return .store_failed;
 }
 
-fn removeFiles(paths: *const store.Paths) void {
-    store.wipe(paths.conf()) catch {};
-    var buf: [400]u8 = undefined;
-    if (paths.inDir(&buf, store.exe_file)) |p| store.delete(p) catch {} else |_| {}
-    if (paths.inDir(&buf, store.wintun_file)) |p| store.delete(p) catch {} else |_| {}
-    store.removeDirs(paths);
+fn removeFiles(dirs: *store.Dirs, paths: *const store.Paths) void {
+    if (dirs.dir) |d| {
+        store.wipeAt(d, store.conf_file) catch {};
+        store.deleteAt(d, store.exe_file) catch {};
+        store.deleteAt(d, store.wintun_file) catch {};
+    }
+    dirs.remove(paths);
 }
 
 // ---- unelevated: list, show, down, up ----------------------------------------------
@@ -572,6 +608,17 @@ test "down / up when the state change cannot be watched" {
     w = .fixed(&buf);
     try writeWaitFailed(&w, "home", .start, error.Timeout, 0);
     try std.testing.expectEqualStrings("zwg: home: waiting for the service to start: Timeout\n", w.buffered());
+}
+
+test "elevated child exit codes: never truncated into success" {
+    try std.testing.expectEqual(Result.ok, Result.fromExitCode(0));
+    try std.testing.expectEqual(Result.already_installed, Result.fromExitCode(7));
+    try std.testing.expectEqual(Result.fromExit(.wintun_missing), Result.fromExitCode(32 + 4));
+    for ([_]u32{ 256, 257, 0x1_0000, 0xC000_0005, 0xC000_0409, 0xFFFF_FFFF }) |c| {
+        try std.testing.expectEqual(Result.failed, Result.fromExitCode(c));
+    }
+    // An unknown code that fits is kept (and reads as a failure).
+    try std.testing.expectEqualStrings("failed", Result.fromExitCode(200).message());
 }
 
 test "result messages" {

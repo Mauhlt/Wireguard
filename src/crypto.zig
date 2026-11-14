@@ -126,7 +126,9 @@ pub fn kdf(comptime n: comptime_int, key: *const [key_len]u8, input: []const u8)
 }
 
 pub fn kdf1(key: *const [key_len]u8, input: []const u8) [key_len]u8 {
-    return kdf(1, key, input)[0];
+    var out = kdf(1, key, input);
+    defer wipe(&out); // runs after the result is copied out
+    return out[0];
 }
 pub fn kdf2(key: *const [key_len]u8, input: []const u8) [2][key_len]u8 {
     return kdf(2, key, input);
@@ -229,34 +231,6 @@ pub fn wipe(ptr: anytype) void {
 /// Alias for the name used in DESIGN.md.
 pub const secureZero = wipe;
 
-// ------------------------------------------------------------ key encoding
-
-/// Standard base64 with padding, 44 characters: the format of `wg genkey`,
-/// `wg pubkey` and .conf files.
-pub const key_b64_len = 44;
-
-pub fn keyToBase64(key: *const [key_len]u8) [key_b64_len]u8 {
-    var out: [key_b64_len]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&out, key);
-    return out;
-}
-
-/// Parses a 44-character base64 key (no surrounding whitespace). Rejects
-/// non-canonical encodings (the spare low bits of the last symbol must be
-/// zero), like `wg`.
-pub fn keyFromBase64(s: []const u8) error{InvalidKey}![key_len]u8 {
-    if (s.len != key_b64_len or s[43] != '=' or s[42] == '=') return error.InvalidKey;
-    var out: [key_len]u8 = undefined;
-    std.base64.standard.Decoder.decode(&out, s) catch return error.InvalidKey;
-    var back = keyToBase64(&out);
-    defer wipe(&back);
-    if (!std.mem.eql(u8, &back, s)) {
-        wipe(&out);
-        return error.InvalidKey;
-    }
-    return out;
-}
-
 /// Comptime hex literal to bytes (test vectors).
 pub fn hexTo(comptime n: usize, comptime s: []const u8) [n]u8 {
     const bytes = comptime blk: {
@@ -292,39 +266,6 @@ test "X25519: low-order public keys are rejected" {
     try testing.expectError(error.IdentityElement, dh(priv, one));
 }
 
-test "keys: cross-checked against wg.exe (WireGuard for Windows) genkey/pubkey" {
-    // Produced 2026-11-12 with "C:\Program Files\WireGuard\wg.exe":
-    //   wg genkey | tee priv | wg pubkey      (rows 1-3)
-    //   echo <unclamped key> | wg pubkey      (rows 4-5: wg clamps, so do we)
-    const cases = [_][2][]const u8{
-        .{ "CN3URi7MiszI1nhIbL8L7T6sGLUDBmGEDw2g2WNXW3Q=", "jkcY8Cd0RLrrWahhzDyxeqcMle8cBX6uN+vgVaKaC0k=" },
-        .{ "kGiTcwU7NANVTOLotHQsBwXaMqfDP+CHO0Tj0lOp1EE=", "QqNMArOgRqTJ5k93HZYyrD2g4bwR6miVlNqzwWpXvSc=" },
-        .{ "mOgFQxhFVe3FMZ37X5wAB5jBzHz9ckVAynAjYHXU5kw=", "DTS3j4hipiz49uYkZH0XDUbMSdFIs37Hc6kUkxDT3WM=" },
-        .{ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "L+V9o0fNYkMVKNqsX7spBzD/9oSvxM/C7ZCZX1jLO3Q=" },
-        .{ "//////////////////////////////////////////8=", "hHwNLDdSNPNl5mCVUYejc1oPdhPRYJ06ak2MU66qWiI=" },
-    };
-    for (cases) |c| {
-        const priv = try keyFromBase64(c[0]);
-        try testing.expectEqualStrings(c[0], &keyToBase64(&priv));
-        const pub_ = publicKey(priv);
-        try testing.expectEqualStrings(c[1], &keyToBase64(&pub_));
-    }
-    // wg genkey output is already clamped.
-    var k = try keyFromBase64(cases[0][0]);
-    const before = k;
-    clampPrivateKey(&k);
-    try testing.expectEqual(before, k);
-}
-
-test "base64 keys: reject malformed" {
-    try testing.expectError(error.InvalidKey, keyFromBase64(""));
-    try testing.expectError(error.InvalidKey, keyFromBase64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
-    try testing.expectError(error.InvalidKey, keyFromBase64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA!="));
-    try testing.expectError(error.InvalidKey, keyFromBase64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB=")); // non-canonical
-    try testing.expectError(error.InvalidKey, keyFromBase64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="));
-    const z = try keyFromBase64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-    try testing.expect(isZero(32, &z));
-}
 
 test "BLAKE2s-256: RFC 7693 appendix B ('abc'), split parts" {
     const want = hexTo(32, "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982");

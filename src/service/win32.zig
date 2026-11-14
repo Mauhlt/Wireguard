@@ -78,11 +78,16 @@ pub const GENERIC_WRITE: u32 = 0x4000_0000;
 pub const DELETE: u32 = 0x0001_0000;
 pub const READ_CONTROL: u32 = 0x0002_0000;
 pub const WRITE_DAC: u32 = 0x0004_0000;
+pub const WRITE_OWNER: u32 = 0x0008_0000;
 pub const SYNCHRONIZE: u32 = 0x0010_0000;
 pub const FILE_READ_DATA: u32 = 0x0001;
 pub const FILE_WRITE_DATA: u32 = 0x0002;
 pub const FILE_APPEND_DATA: u32 = 0x0004; // = FILE_CREATE_PIPE_INSTANCE on a pipe
 pub const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+pub const FILE_LIST_DIRECTORY: u32 = 0x0001;
+pub const FILE_ADD_FILE: u32 = 0x0002;
+pub const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+pub const FILE_TRAVERSE: u32 = 0x0020;
 pub const FILE_SHARE_READ: u32 = 1;
 pub const FILE_SHARE_WRITE: u32 = 2;
 pub const FILE_SHARE_DELETE: u32 = 4;
@@ -97,6 +102,7 @@ pub const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 pub const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
 pub const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 pub const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
 pub const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 pub const MOVEFILE_REPLACE_EXISTING: u32 = 1;
@@ -149,6 +155,24 @@ pub extern "kernel32" fn GetOverlappedResult(h: HANDLE, ov: *OVERLAPPED, n: *u32
 pub extern "kernel32" fn CancelIoEx(h: HANDLE, ov: ?*OVERLAPPED) callconv(.winapi) BOOL;
 pub extern "kernel32" fn CreatePipe(read: *HANDLE, write: *HANDLE, sa: ?*SECURITY_ATTRIBUTES, size: u32) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetSystemDirectoryW(buf: [*]u16, len: u32) callconv(.winapi) u32;
+pub extern "kernel32" fn GetFileInformationByHandleEx(h: HANDLE, class: c_int, info: *anyopaque, len: u32) callconv(.winapi) BOOL;
+pub extern "kernel32" fn SetFileInformationByHandle(h: HANDLE, class: c_int, info: *const anyopaque, len: u32) callconv(.winapi) BOOL;
+
+pub extern "kernel32" fn CreateFileMappingW(file: HANDLE, sa: ?*SECURITY_ATTRIBUTES, protect: u32, size_high: u32, size_low: u32, name: ?LPCWSTR) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn MapViewOfFile(mapping: HANDLE, access: u32, off_high: u32, off_low: u32, size: usize) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn UnmapViewOfFile(base: *const anyopaque) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetModuleHandleW(name: ?LPCWSTR) callconv(.winapi) ?*anyopaque;
+/// STATUS_SUCCESS (0) when both views are backed by the same file: the
+/// loader's own "is this the file that image came from" check.
+pub extern "ntdll" fn NtAreMappedFilesTheSame(image_view: *const anyopaque, file_view: *const anyopaque) callconv(.winapi) u32;
+pub const PAGE_READONLY: u32 = 0x02;
+pub const FILE_MAP_READ: u32 = 0x04;
+
+pub const FileBasicInfo: c_int = 0;
+pub const FileDispositionInfo: c_int = 4;
+pub const FileAttributeTagInfo: c_int = 9;
+pub const FILE_ATTRIBUTE_TAG_INFO = extern struct { attributes: u32, reparse_tag: u32 };
+pub const FILE_DISPOSITION_INFO = extern struct { delete_file: u8 };
 
 // Child processes under another token (the end-to-end driver runs zwg.exe
 // as an ordinary user).
@@ -236,6 +260,8 @@ pub extern "advapi32" fn CreateProcessAsUserW(token: HANDLE, app: ?LPCWSTR, cmdl
 pub extern "advapi32" fn ConvertSidToStringSidW(sid: PSID, out: *?LPWSTR) callconv(.winapi) BOOL;
 pub extern "advapi32" fn ConvertStringSidToSidW(s: LPCWSTR, out: *?PSID) callconv(.winapi) BOOL;
 pub extern "advapi32" fn IsValidSid(sid: PSID) callconv(.winapi) BOOL;
+pub extern "advapi32" fn LookupAccountSidW(system: ?LPCWSTR, sid: PSID, name: ?[*]u16, name_len: *u32, domain: ?[*]u16, domain_len: *u32, use: *c_int) callconv(.winapi) BOOL;
+pub const SidTypeUser: c_int = 1;
 pub extern "advapi32" fn EqualSid(a: PSID, b: PSID) callconv(.winapi) BOOL;
 pub extern "advapi32" fn GetLengthSid(sid: PSID) callconv(.winapi) u32;
 pub extern "advapi32" fn IsWellKnownSid(sid: PSID, kind: c_int) callconv(.winapi) BOOL;
@@ -246,6 +272,8 @@ pub extern "advapi32" fn GetSecurityDescriptorControl(sd: PSECURITY_DESCRIPTOR, 
 pub extern "advapi32" fn GetAce(acl: *ACL, index: u32, ace: *?*anyopaque) callconv(.winapi) BOOL;
 pub extern "advapi32" fn GetNamedSecurityInfoW(name: LPCWSTR, kind: c_int, info: u32, owner: ?*?PSID, group: ?*?PSID, dacl: ?*?*ACL, sacl: ?*?*ACL, sd: *?PSECURITY_DESCRIPTOR) callconv(.winapi) u32;
 pub extern "advapi32" fn SetNamedSecurityInfoW(name: LPWSTR, kind: c_int, info: u32, owner: ?PSID, group: ?PSID, dacl: ?*ACL, sacl: ?*ACL) callconv(.winapi) u32;
+pub extern "advapi32" fn GetSecurityInfo(h: HANDLE, kind: c_int, info: u32, owner: ?*?PSID, group: ?*?PSID, dacl: ?*?*ACL, sacl: ?*?*ACL, sd: *?PSECURITY_DESCRIPTOR) callconv(.winapi) u32;
+pub extern "advapi32" fn SetSecurityInfo(h: HANDLE, kind: c_int, info: u32, owner: ?PSID, group: ?PSID, dacl: ?*ACL, sacl: ?*ACL) callconv(.winapi) u32;
 
 // ---- advapi32: service control manager -------------------------------------
 
@@ -406,6 +434,8 @@ pub const SHELLEXECUTEINFOW = extern struct {
 pub const GUID = extern struct { data1: u32, data2: u16, data3: u16, data4: [8]u8 };
 /// FOLDERID_ProgramData {62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}
 pub const FOLDERID_ProgramData: GUID = .{ .data1 = 0x62AB5D82, .data2 = 0xFDC1, .data3 = 0x4DC3, .data4 = .{ 0xA9, 0xDD, 0x07, 0x0D, 0x1D, 0x49, 0x5D, 0x97 } };
+/// FOLDERID_ProgramFiles {905E63B6-C1BF-494E-B29C-65B732D3D21A}
+pub const FOLDERID_ProgramFiles: GUID = .{ .data1 = 0x905E63B6, .data2 = 0xC1BF, .data3 = 0x494E, .data4 = .{ 0xB2, 0x9C, 0x65, 0xB7, 0x32, 0xD3, 0xD2, 0x1A } };
 
 pub extern "shell32" fn ShellExecuteExW(info: *SHELLEXECUTEINFOW) callconv(.winapi) BOOL;
 pub extern "shell32" fn SHGetKnownFolderPath(id: *const GUID, flags: u32, token: ?HANDLE, path: *?LPWSTR) callconv(.winapi) i32;
@@ -455,12 +485,53 @@ pub fn currentUserSid(buf: []u8) error{ Unexpected, NameTooLong }![]u8 {
     return buf[0..span.len];
 }
 
+/// Does Windows know `sid` (a SID string) as a user account
+/// (LookupAccountSidW: SidTypeUser), not a group, alias or well-known SID?
+pub fn isUserAccountSid(sid: []const u8) bool {
+    var wbuf: [200]u16 = undefined;
+    const w = W(&wbuf, sid) catch return false;
+    var psid: ?PSID = null;
+    if (ConvertStringSidToSidW(w.ptr, &psid) == 0) return false;
+    defer _ = LocalFree(psid);
+    var name: [257]u16 = undefined;
+    var domain: [257]u16 = undefined;
+    var name_len: u32 = name.len;
+    var domain_len: u32 = domain.len;
+    var use: c_int = 0;
+    if (LookupAccountSidW(null, psid.?, &name, &name_len, &domain, &domain_len, &use) == 0) return false;
+    return use == SidTypeUser;
+}
+
 /// Path of the running executable (UTF-16, NUL-terminated, in `buf`).
 pub fn selfExePath(buf: []u16) error{Unexpected}![:0]u16 {
     const n = GetModuleFileNameW(null, buf.ptr, @intCast(buf.len));
     if (n == 0 or n >= buf.len) return error.Unexpected;
     buf[n] = 0;
     return buf[0..n :0];
+}
+
+/// This process's executable, opened for reading while denying writes and
+/// deletes to everyone else, and verified to be the very file the running
+/// image was mapped from (not something put at the same path since: a
+/// running .exe can be renamed away). Caller closes.
+pub fn openRunningImage() error{ Unexpected, NotRunningImage }!HANDLE {
+    var buf: [600]u16 = undefined;
+    const path = try selfExePath(&buf);
+    const h = CreateFileW(path.ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    if (h == INVALID_HANDLE_VALUE) return error.NotRunningImage;
+    errdefer _ = CloseHandle(h);
+    if (!isRunningImage(h)) return error.NotRunningImage;
+    return h;
+}
+
+/// Is the open file `h` the one this process's image was loaded from?
+pub fn isRunningImage(h: HANDLE) bool {
+    const mapping = CreateFileMappingW(h, null, PAGE_READONLY, 0, 0, null) orelse return false;
+    defer _ = CloseHandle(mapping);
+    const view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) orelse return false;
+    defer _ = UnmapViewOfFile(view);
+    const image = GetModuleHandleW(null) orelse return false;
+    return NtAreMappedFilesTheSame(image, view) == 0;
 }
 
 /// True when the process token is elevated.
@@ -614,6 +685,53 @@ pub fn runAsToken(token: HANDLE, cmdline: []const u8, out: []u8, timeout_ms: u32
     var code: u32 = 0;
     if (GetExitCodeProcess(pi.process.?, &code) == 0) return error.Unexpected;
     return .{ .exit_code = code, .output = out[0..n] };
+}
+
+test "user account SIDs: this user is one, SYSTEM / groups / aliases are not" {
+    var buf: [184]u8 = undefined;
+    try std.testing.expect(isUserAccountSid(try currentUserSid(&buf)));
+    for ([_][]const u8{ "S-1-5-18", "S-1-1-0", "S-1-5-11", "S-1-5-32-544", "S-1-5-32-545", "not a sid" }) |s|
+        try std.testing.expect(!isUserAccountSid(s));
+}
+
+test "the running image is recognised; a byte-identical copy is not it" {
+    const h = try openRunningImage();
+    defer _ = CloseHandle(h);
+    try std.testing.expect(isRunningImage(h));
+    // Writes are denied while it is held.
+    var buf: [600]u16 = undefined;
+    const self = try selfExePath(&buf);
+    const w = CreateFileW(self.ptr, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    if (w != INVALID_HANDLE_VALUE) {
+        _ = CloseHandle(w);
+        return error.TestUnexpectedResult;
+    }
+
+    // A copy: same bytes, another file.
+    var size: i64 = 0;
+    try std.testing.expect(GetFileSizeEx(h, &size) != 0);
+    const gpa = std.testing.allocator;
+    const data = try gpa.alloc(u8, @intCast(size));
+    defer gpa.free(data);
+    var got: usize = 0;
+    while (got < data.len) {
+        var n: u32 = 0;
+        var ov: OVERLAPPED = .{ .offset = @truncate(got), .offset_high = @truncate(@as(u64, got) >> 32) };
+        try std.testing.expect(ReadFile(h, data.ptr + got, @intCast(@min(data.len - got, 1 << 20)), &n, &ov) != 0 and n != 0);
+        got += n;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "copy.exe", .data = data });
+    var pbuf: [600]u8 = undefined;
+    const dn = try tmp.dir.realPath(std.testing.io, &pbuf);
+    var cw: [700]u16 = undefined;
+    var full: [700]u8 = undefined;
+    const copy_path = try std.fmt.bufPrint(&full, "{s}\\copy.exe", .{pbuf[0..dn]});
+    const c = CreateFileW((try W(&cw, copy_path)).ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    try std.testing.expect(c != INVALID_HANDLE_VALUE);
+    defer _ = CloseHandle(c);
+    try std.testing.expect(!isRunningImage(c));
 }
 
 test "runAsToken: a child under a restricted token, exit code and output" {

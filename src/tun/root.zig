@@ -169,3 +169,11 @@ fn refAll(comptime T: type) void {
         _ = &@field(T, name);
     }
 }
+
+test "utun read: end of file is Closed (not a spin), short frames are skipped" {
+    const frameLen = @import("darwin.zig").Utun.frameLen;
+    try std.testing.expectError(error.Closed, frameLen(0));
+    for ([_]isize{ 1, 2, 3, 4 }) |n| try std.testing.expectEqual(@as(?usize, null), try frameLen(n));
+    try std.testing.expectEqual(@as(?usize, 1), try frameLen(5));
+    try std.testing.expectEqual(@as(?usize, 1500), try frameLen(1504));
+}
