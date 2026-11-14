@@ -78,6 +78,11 @@ extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) c_int;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "kernel32" fn WaitForMultipleObjects(n: u32, handles: [*]const HANDLE, wait_all: c_int, ms: u32) callconv(.winapi) u32;
 extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (u32) callconv(.winapi) c_int, add: c_int) callconv(.winapi) c_int;
+extern "kernel32" fn CreateWaitableTimerExW(attrs: ?*anyopaque, name: ?[*:0]const u16, flags: u32, access: u32) callconv(.winapi) ?HANDLE;
+extern "kernel32" fn SetWaitableTimer(h: HANDLE, due: *const i64, period: i32, routine: ?*anyopaque, arg: ?*anyopaque, wake: c_int) callconv(.winapi) c_int;
+extern "kernel32" fn CancelWaitableTimer(h: HANDLE) callconv(.winapi) c_int;
+extern "kernel32" fn GetSystemTimePreciseAsFileTime(ft: *i64) callconv(.winapi) void;
+const TIMER_ALL_ACCESS: u32 = 0x1F0003;
 
 const INFINITE: u32 = 0xFFFF_FFFF;
 const WAIT_TIMEOUT: u32 = 258;
@@ -272,6 +277,50 @@ pub fn wait(handles: []const WaitHandle, timeout_ns: ?u64) common.WaitError!?usi
     if (r >= 0x80 and r < 0x80 + handles.len) return r - 0x80; // abandoned (mutex only)
     return error.Unexpected;
 }
+
+/// Becomes ready when a deadline passes on a clock that keeps counting
+/// while the machine sleeps. WaitForMultipleObjects' own timeout does not
+/// count time spent suspended (Windows 8 and later), so after a resume the
+/// loop would otherwise wait out the rest of its pre-suspend timeout before
+/// noticing the timers that fell due meanwhile. An auto-reset waitable
+/// timer with an *absolute* due time fires as soon as the machine resumes
+/// past it. The relative wait timeout stays as well: should the wall clock
+/// be set back, it still wakes the loop on time (a forward step fires the
+/// timer early, which only makes the loop recompute and re-arm).
+pub const DeadlineTimer = struct {
+    handle: HANDLE,
+
+    pub fn init() common.WaitError!DeadlineTimer {
+        return .{ .handle = CreateWaitableTimerExW(null, null, 0, TIMER_ALL_ACCESS) orelse return error.Unexpected };
+    }
+
+    pub fn deinit(t: *DeadlineTimer) void {
+        _ = CloseHandle(t.handle);
+        t.* = undefined;
+    }
+
+    pub fn waitHandle(t: *const DeadlineTimer) ?WaitHandle {
+        return t.handle;
+    }
+
+    /// Ready `ns` from now (replaces any earlier arming).
+    pub fn arm(t: *DeadlineTimer, ns: u64) void {
+        var now: i64 = 0;
+        GetSystemTimePreciseAsFileTime(&now);
+        const due: i64 = now +| @as(i64, @intCast(@min(ns / 100, std.math.maxInt(i64) / 2)));
+        // fResume = FALSE: never wakes a sleeping machine, only fires after it resumes.
+        _ = SetWaitableTimer(t.handle, &due, 0, null, null, 0);
+    }
+
+    pub fn disarm(t: *DeadlineTimer) void {
+        _ = CancelWaitableTimer(t.handle);
+    }
+
+    /// After it was reported ready (auto-reset: nothing to consume).
+    pub fn clear(t: *DeadlineTimer) void {
+        _ = t;
+    }
+};
 
 /// A named event `zwg down` can set to stop a running `zwg up` for the
 /// same interface name. Created by `up` (fails if one is already running).
