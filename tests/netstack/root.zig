@@ -7,4 +7,5 @@ test {
     _ = @import("e2e.zig");
     _ = @import("vlink.zig");
     _ = @import("priority.zig");
+    _ = @import("concurrency.zig");
 }
