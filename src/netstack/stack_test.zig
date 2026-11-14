@@ -963,3 +963,43 @@ test "TLP: bulk streams do not probe; an ACK disarms the probe" {
     try t.expectEqual(@as(?i64, null), r.stack.runTimers());
     try t.expectEqual(@as(u64, 0), r.stack.stats().tail_loss_probes);
 }
+test "SACK: a flood of random blocks costs bounded work and output per ACK" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try establishedSack(&r, l);
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff });
+    var data: [64 * 1024]u8 = undefined;
+    @memset(&data, 'f');
+    _ = try e.st.write(&data);
+    while (r.stack.output(&r.out)) |_| {}
+    const k0 = e.st.debugConn().?;
+    var prng = std.Random.DefaultPrng.init(0x5ac);
+    const rnd = prng.random();
+    var max_out_per_ack: usize = 0;
+    for (0..5000) |_| {
+        var bl: [4][2]u32 = undefined;
+        for (&bl) |*b| {
+            const off = rnd.uintLessThan(u32, k0.snd_max -% k0.snd_una + 4000);
+            b.* = .{ e.snd +% off, e.snd +% off +% rnd.uintLessThan(u32, 3000) -% 500 };
+        }
+        r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&bl) } });
+        var n: usize = 0;
+        while (r.stack.output(&r.out)) |p| {
+            const sg = try r.peer.expect(p);
+            // Retransmissions stay within what was sent and within one MSS.
+            try t.expect(sg.payload.len <= 1380);
+            n += 1;
+        }
+        max_out_per_ack = @max(max_out_per_ack, n);
+        const k = e.st.debugConn().?;
+        try t.expect(k.sacked_len <= tcp.max_sack_ranges);
+        for (k.sacked[0..k.sacked_len]) |rg| {
+            try t.expect(tcp.seqLe(k.snd_una, rg.start) and tcp.seqLt(rg.start, rg.end) and tcp.seqLe(rg.end, k.snd_max));
+        }
+    }
+    // Each ACK releases at most a handful of segments (pipe-limited), not
+    // a burst proportional to the junk it carried.
+    try t.expect(max_out_per_ack <= 12);
+}

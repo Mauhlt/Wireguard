@@ -260,11 +260,13 @@ for unit tests, tests/netstack and fuzzers alike.
 
 TCP: RFC 9293 state machine (both handshakes, simultaneous open, FIN/RST,
 TIME-WAIT bounded by Limits.time_wait_ns), MSS from the MTU (1420 ->
-1380), window scale (RFC 7323; SACK-permitted and timestamps parsed and
-ignored: no SACK), RTO per RFC 6298 with Karn's rule (200 ms floor like
-Linux, not 1 s), fast retransmit / NewReno (RFC 5681/6582), Limited
-Transmit (RFC 3042), Early Retransmit (RFC 5827), one duplicate ACK per
-out-of-order segment, RST handling per RFC 5961 (challenge ACKs), zero
+1380 over IPv4, 1360 over IPv6), window scale (RFC 7323; timestamps parsed
+and ignored), RTO per RFC 6298 with Karn's rule, SACK (below), NewReno
+(RFC 5681/6582) when the peer has no SACK, Limited Transmit (RFC 3042),
+Early Retransmit (RFC 5827), one duplicate ACK per out-of-order segment,
+RFC 5961 is implemented: an in-window RST that is not exactly rcv_nxt
+and any SYN on a synchronized connection get a challenge ACK, only an
+exact RST resets; tail loss probe for interactive streams (below); zero
 window probing and keepalive with an out-of-window probe (snd_una - 1),
 delayed ACK (every 2nd segment / 40 ms), receiver and sender SWS
 avoidance, no Nagle. Pure ACKs carry snd_max, not snd_nxt (as BSD): after
@@ -272,6 +274,40 @@ an RTO rolls snd_nxt back, a peer that already has everything would drop
 an ACK at snd_nxt as unacceptable, and two such peers deadlock. ISNs:
 keyed SipHash-2-4 over the 4-tuple plus a 4 us clock (RFC 6528); per-
 listener SYN backlog cap; half-open connections get no buffers.
+
+Minimum RTO: 200 ms, not RFC 6298's 1 s. A deliberate deviation (Linux
+does the same): both ends are ours, one hop through the tunnel, and a
+1 s floor would stall a stream for a second on every timeout.
+
+SACK (RFC 2018, recovery per RFC 6675): SACK-permitted is offered on our
+SYN and echoed on a SYN-ACK only if the peer's SYN offered it. Receiver:
+ACKs carry up to 4 blocks (all the 40-byte option space allows; the
+window-scale option is only on SYNs, which carry no blocks), built from
+the out-of-order ranges, the most recently changed first. Sender: a
+scoreboard of at most 16 SACKed ranges per connection (sorted, disjoint,
+inside [snd_una, snd_max]); every block is validated (start < end, inside
+[snd_una, snd_max], not longer than what is in flight; partly below
+snd_una is clipped, D-SACK and anything else is ignored and counted in
+Stats.sack_blocks_ignored). Work per ACK is bounded: at most 4 blocks,
+each merged into at most 16 ranges; ranges are sequence numbers, buffers
+are never split, so there is no "SACK Panic"-style MSS underflow or
+fragmentation. When a block does not fit a full scoreboard the
+connection uses NewReno until the scoreboard empties, never more memory.
+Recovery starts on DupThresh duplicate ACKs or when more than 2 MSS are
+SACKed above snd_una (IsLost); cwnd = ssthresh = FlightSize / 2, and
+while cwnd - pipe >= 1 MSS the sender sends NextSeg: the first lost hole
+not yet retransmitted (HighRxt), else new data. A partial ACK also
+retransmits the segment at snd_una (a hole with too little SACKed above
+it would otherwise wait for the RTO). Reneging (allowed by RFC 2018):
+data is freed only by the cumulative ACK, and the scoreboard is
+discarded on every RTO.
+
+Tail loss probe (RFC 8985 TLP), interactive streams only: when the last
+segment of a burst is outstanding and nothing else is queued, a probe
+deadline is armed at max(2 * SRTT, 10 ms), below the RTO. On expiry the
+last segment is sent again (no cwnd change); its ACK, or the SACK of it,
+repairs a lost keystroke in ~2 RTTs instead of a 200 ms RTO. One probe
+per tail; an ACK of new data disarms or re-arms it.
 Validation: IHL, total length, header checksum, TCP data offset, options,
 TCP checksum; fragments dropped; packets not addressed to Options.address
 dropped. The device already drops inner packets whose source is not in
