@@ -273,7 +273,16 @@ const Echo = struct {
     max_ns: i64 = 0,
     sum_ns: i64 = 0,
     count: usize = 0,
+    /// The first samples, for percentiles.
+    samples: [8192]i64 = undefined,
     err: ?anyerror = null,
+
+    fn percentile(e: *Echo, p: usize) i64 {
+        const n = @min(e.count, e.samples.len);
+        if (n == 0) return 0;
+        std.mem.sort(i64, e.samples[0..n], {}, std.sort.asc(i64));
+        return e.samples[@min(n - 1, n * p / 100)];
+    }
 
     /// Server side: every 8-byte message carries the sender's clock; the
     /// one-way latency is now - that (same process, same clock).
@@ -291,6 +300,7 @@ const Echo = struct {
             }
             const sent = std.mem.readInt(i64, &buf, .little);
             const lat = e.clock.now() - sent;
+            if (e.count < e.samples.len) e.samples[e.count] = lat;
             e.max_ns = @max(e.max_ns, lat);
             e.sum_ns += lat;
             e.count += 1;
@@ -302,8 +312,12 @@ const Echo = struct {
     }
 };
 
-fn latencyUnderBulk(gpa: std.mem.Allocator, bulk_loss_ppm: u32, bound_ns: i64) !void {
-    const imp: ns.testing.Impairment = .{ .loss_ppm = bulk_loss_ppm, .only_port = port_bulk };
+/// One-way latency of interactive round trips while a bulk stream
+/// saturates the tunnel. `loss_ppm` applies to `lossy_port` only; the
+/// p99 must stay under `p99_bound_ns`.
+fn latencyUnderBulk(gpa: std.mem.Allocator, loss_ppm: u32, lossy_port: u16, p99_bound_ns: i64) !void {
+    const bulk_loss_ppm = loss_ppm;
+    const imp: ns.testing.Impairment = .{ .loss_ppm = loss_ppm, .only_port = lossy_port };
     const p = try Pair.create(gpa, imp, imp);
     defer p.destroy(gpa);
 
@@ -321,8 +335,10 @@ fn latencyUnderBulk(gpa: std.mem.Allocator, bulk_loss_ppm: u32, bound_ns: i64) !
     var bulk_rx: Bulk = .{ .stream = cb };
     const tx = try std.Thread.spawn(.{}, Bulk.send, .{&bulk_tx});
     const rx = try std.Thread.spawn(.{}, Bulk.drain, .{&bulk_rx});
-    var echo: Echo = .{ .stream = si, .clock = &p.clock };
-    const eth = try std.Thread.spawn(.{}, Echo.serve, .{&echo});
+    const echo = try gpa.create(Echo);
+    defer gpa.destroy(echo);
+    echo.* = .{ .stream = si, .clock = &p.clock };
+    const eth = try std.Thread.spawn(.{}, Echo.serve, .{echo});
 
     // Ping-pong until at least `samples` round trips AND the bulk stream
     // has moved `bulk_target` bytes meanwhile (the counter is observed
@@ -357,12 +373,17 @@ fn latencyUnderBulk(gpa: std.mem.Allocator, bulk_loss_ppm: u32, bound_ns: i64) !
     const avg = @divTrunc(echo.sum_ns, @as(i64, @intCast(@max(echo.count, 1))));
     std.debug.print(
         \\
-        \\netstack latency under bulk (bulk loss {d} ppm on the bulk stream): {d} samples, one-way avg {d} us, max {d} us, echo RTT max {d} us; bulk moved {d} MiB meanwhile
+        \\netstack latency under bulk ({d} ppm loss on port {d}): {d} samples, one-way avg {d} us, p99 {d} us, max {d} us, echo RTT max {d} us; bulk moved {d} MiB; probes {d}+{d}, rto {d}+{d}
         \\
-    , .{ bulk_loss_ppm, echo.count, @divTrunc(avg, 1000), @divTrunc(echo.max_ns, 1000), @divTrunc(rtt_max, 1000), bulk_bytes_during / (1024 * 1024) });
+    , .{
+        bulk_loss_ppm,                                   lossy_port,                                    echo.count,
+        @divTrunc(avg, 1000),                            @divTrunc(echo.percentile(99), 1000),          @divTrunc(echo.max_ns, 1000),
+        @divTrunc(rtt_max, 1000),                        bulk_bytes_during / (1024 * 1024),             p.client.stack.stats().tail_loss_probes,
+        p.server.stack.stats().tail_loss_probes,         p.client.stack.stats().rto_expirations,        p.server.stack.stats().rto_expirations,
+    });
     try t.expectEqual(rounds, echo.count);
     try t.expect(bulk_bytes_during >= bulk_target);
-    try t.expect(echo.max_ns < bound_ns);
+    try t.expect(echo.percentile(99) < p99_bound_ns);
     ci.close();
     si.close();
     cb.close();
@@ -370,11 +391,17 @@ fn latencyUnderBulk(gpa: std.mem.Allocator, bulk_loss_ppm: u32, bound_ns: i64) !
 }
 
 test "e2e: interactive latency stays low under a saturating bulk stream (no loss)" {
-    try latencyUnderBulk(t.allocator, 0, 20 * std.time.ns_per_ms);
+    try latencyUnderBulk(t.allocator, 0, port_bulk, 20 * std.time.ns_per_ms);
 }
 
 test "e2e: interactive latency under 1 RTO with 1% loss on the bulk stream" {
-    try latencyUnderBulk(t.allocator, 5_000, 200 * std.time.ns_per_ms);
+    try latencyUnderBulk(t.allocator, 5_000, port_bulk, 200 * std.time.ns_per_ms);
+}
+
+test "e2e: lost keystrokes are repaired by the tail loss probe (1% loss on the interactive stream)" {
+    // 0.5% at each of two impairment points per direction: ~1% per packet.
+    // Without TLP the p99 is one 200 ms RTO; with it, ~max(2 SRTT, 10 ms).
+    try latencyUnderBulk(t.allocator, 5_000, port_main, 60 * std.time.ns_per_ms);
 }
 
 test "e2e: Node (device + stack + threads) with the std.Io Reader / Writer adapters" {

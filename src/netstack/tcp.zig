@@ -26,6 +26,10 @@ pub const max_rto_ns: i64 = 60 * sec;
 /// Clock granularity G in RFC 6298 (our clock is ns; 1 ms is generous).
 const rto_granularity_ns: i64 = 1 * ms;
 pub const delayed_ack_ns: i64 = 40 * ms;
+/// Tail loss probe (RFC 8985 7) floor for interactive streams. Our
+/// receiver ACKs short segments at once (no delayed-ACK allowance needed),
+/// so PTO = max(2 * SRTT, this), and always below the RTO.
+pub const tlp_min_ns: i64 = 10 * ms;
 /// SYN-ACK retransmissions before a half-open connection is dropped.
 pub const max_synack_retries = 3;
 pub const keepalive_interval_ns: i64 = 10 * sec;
@@ -211,6 +215,10 @@ pub const Conn = struct {
     unacked_segs: u8 = 0,
     probe_now: bool = false,
     retransmit_one: bool = false,
+    /// Tail loss probe due: re-send the last segment (interactive only).
+    tlp_now: bool = false,
+    /// One probe per tail: set when sent, cleared by an ACK of new data.
+    tlp_sent: bool = false,
 
     // timers (device clock ns; null = off)
     rto_at: ?i64 = null,
@@ -218,6 +226,7 @@ pub const Conn = struct {
     persist_at: ?i64 = null,
     keepalive_at: ?i64 = null,
     timewait_at: ?i64 = null,
+    tlp_at: ?i64 = null,
 
     // RTT (RFC 6298)
     srtt: i64 = 0,
@@ -755,7 +764,29 @@ pub const Conn = struct {
         if (c.cwnd > cwnd_cap) c.cwnd = cwnd_cap;
 
         c.rto_at = if (c.snd_una == c.snd_max) null else env.now + c.rto;
+        c.tlp_sent = false;
+        c.armTlp(env);
         return true;
+    }
+
+    /// RFC 8985 7.2: arm the probe timeout when an interactive stream has
+    /// data outstanding, nothing more to send, and no recovery running;
+    /// otherwise disarm it. A deadline like every other timer.
+    fn armTlp(c: *Conn, env: *const Env) void {
+        c.tlp_at = null;
+        if (c.priority != .interactive or c.tlp_sent or c.in_recovery or c.srtt == 0) return;
+        if (c.snd_una == c.snd_max or c.unsent() != 0 or !c.canSendData()) return;
+        const pto = @max(2 * c.srtt, tlp_min_ns);
+        if (pto >= c.rto) return; // the RTO comes first anyway
+        c.tlp_at = env.now + pto;
+    }
+
+    /// Where the tail-loss probe starts: the last full segment's worth of
+    /// what was sent (FIN included when it ends the stream).
+    fn tlpSeq(c: *const Conn) u32 {
+        const smss = c.sendMss();
+        const fl = c.snd_max -% c.snd_una;
+        return if (fl > smss) c.snd_max -% smss else c.snd_una;
     }
 
     /// May a new recovery start at this ACK? Not for losses in the window
@@ -1065,6 +1096,8 @@ pub const Conn = struct {
         c.persist_at = null;
         c.keepalive_at = null;
         c.timewait_at = null;
+        c.tlp_at = null;
+        c.tlp_now = false;
         c.ack_now = false;
         c.send_syn = false;
         c.probe_now = false;
@@ -1075,7 +1108,7 @@ pub const Conn = struct {
 
     pub fn nextDeadline(c: *const Conn) ?i64 {
         var d: ?i64 = null;
-        for ([_]?i64{ c.rto_at, c.delack_at, c.persist_at, c.keepalive_at, c.timewait_at }) |t| {
+        for ([_]?i64{ c.rto_at, c.delack_at, c.persist_at, c.keepalive_at, c.timewait_at, c.tlp_at }) |t| {
             if (t) |v| d = if (d) |x| @min(x, v) else v;
         }
         return d;
@@ -1094,6 +1127,15 @@ pub const Conn = struct {
             c.delack_at = null;
             c.ack_now = true;
             out.output = true;
+        };
+        if (c.tlp_at) |t| if (now >= t) {
+            c.tlp_at = null;
+            if (!c.tlp_sent and !c.in_recovery and c.snd_una != c.snd_max) {
+                c.tlp_sent = true;
+                c.tlp_now = true;
+                env.stats.tail_loss_probes += 1;
+                out.output = true;
+            }
         };
         if (c.rto_at) |t| if (now >= t) {
             c.rto_at = null;
@@ -1124,6 +1166,8 @@ pub const Conn = struct {
             c.clearSacked();
             c.sack_recovery = false;
             c.high_rxt = c.snd_una;
+            c.tlp_at = null;
+            c.tlp_now = false;
             c.rto = @min(c.rto * 2, max_rto_ns);
             c.backoff +|= 1;
             if (c.state == .syn_sent or c.state == .syn_received) c.send_syn = true;
@@ -1182,6 +1226,15 @@ pub const Conn = struct {
         }
 
         if (class == .any) {
+            // Tail loss probe: the last segment again, so a lost final
+            // segment is repaired by its ACK (or SACK) instead of an RTO.
+            // No congestion window change (RFC 8985 7.3).
+            if (c.tlp_now) {
+                c.tlp_now = false;
+                if (c.snd_una != c.snd_max) {
+                    if (c.segmentAt(env, buf, ip_id, c.tlpSeq(), c.mss, true)) |p| return p;
+                }
+            }
             // Fast / partial-ACK retransmission of the first unacked segment.
             if (c.retransmit_one) {
                 c.retransmit_one = false;
@@ -1300,6 +1353,7 @@ pub const Conn = struct {
         }
         if (seqLt(c.snd_max, end)) c.snd_max = end;
         if (c.rto_at == null) c.rto_at = env.now + c.rto;
+        if (!retransmit and c.tlp_at == null) c.armTlp(env);
         return c.emit(env, buf, ip_id, seq, flags, payload);
     }
 

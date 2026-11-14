@@ -155,6 +155,8 @@ pub const Stats = struct {
     /// SACK blocks rejected (outside [snd_una, snd_max], malformed) or
     /// dropped because the scoreboard was full.
     sack_blocks_ignored: u64 = 0,
+    /// Tail loss probes sent (interactive streams, RFC 8985).
+    tail_loss_probes: u64 = 0,
     timeouts: u64 = 0,
     /// ICMP and ICMPv6 echo replies sent.
     icmp_echo_replies: u64 = 0,

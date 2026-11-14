@@ -169,6 +169,7 @@ test "retransmission after loss: RTO, backoff, Karn" {
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try r.established(l);
+    e.st.setPriority(.bulk); // no tail loss probe: the RTO itself is under test
     const t0 = r.clock.now();
     _ = try e.st.write("lost");
     const first = try r.recv(); // dropped by the "network"
@@ -548,6 +549,9 @@ test "both ends in go-back-N after a blackout still recover (pure ACKs at snd_ma
     _ = l.pump();
     _ = l.pump();
     const s = try lis.accept();
+    // Bulk: no tail loss probes, the RTO path is under test.
+    c.setPriority(.bulk);
+    s.setPriority(.bulk);
     var data: [8 * 1380]u8 = undefined;
     for (&data, 0..) |*b, i| b.* = @truncate(i *% 7);
     _ = try c.write(&data);
@@ -786,6 +790,7 @@ test "SACK: reneging is survived (data kept until cumulatively ACKed, scoreboard
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try establishedSack(&r, l);
+    e.st.setPriority(.bulk); // the RTO, not a tail loss probe, is under test
     const mss = 1380;
     var data: [4 * mss]u8 = undefined;
     @memset(&data, 'r');
@@ -900,4 +905,101 @@ test "SACK: the receiver reports out-of-order data, most recent block first" {
     a = try r.recv();
     try t.expectEqual(e.rcv + 15, a.ack);
     try t.expectEqual(@as(usize, 1), a.options.sack.?.slice().len);
+}
+
+// ---- tail loss probe -----------------------------------------------------------
+
+test "TLP: a lost keystroke on an interactive stream is re-sent after ~2 SRTT, not an RTO" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try establishedSack(&r, l);
+    // Give the connection a realistic SRTT (20 ms): one timed round trip.
+    _ = try e.st.write("a");
+    const first = try r.recv();
+    r.clock.advance(20 * std.time.ns_per_ms);
+    r.send(.{ .seq = e.rcv, .ack = first.seq +% 1, .flags = .{ .ack = true }, .window = 4096 });
+    // A keystroke, lost on the way.
+    const t0 = r.clock.now();
+    _ = try e.st.write("k");
+    const lost = try r.recv();
+    try t.expectEqualStrings("k", lost.payload);
+    try r.expectSilent();
+    try r.fireNext();
+    const probe = try r.recv();
+    try t.expectEqual(lost.seq, probe.seq);
+    try t.expectEqualStrings("k", probe.payload);
+    const waited = r.clock.now() - t0;
+    try t.expect(waited >= tcp.tlp_min_ns);
+    try t.expect(waited < tcp.min_rto_ns); // well before any RTO
+    const st = r.stack.stats();
+    try t.expectEqual(@as(u64, 1), st.tail_loss_probes);
+    try t.expectEqual(@as(u64, 0), st.rto_expirations);
+    // One probe per tail: the next timer is the RTO, not another probe.
+    try r.fireNext();
+    try t.expectEqual(@as(u64, 1), r.stack.stats().tail_loss_probes);
+    try t.expectEqual(@as(u64, 1), r.stack.stats().rto_expirations);
+}
+
+test "TLP: bulk streams do not probe; an ACK disarms the probe" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try establishedSack(&r, l);
+    e.st.setPriority(.bulk);
+    _ = try e.st.write("bulk");
+    const d = try r.recv();
+    try r.fireNext();
+    try t.expectEqual(@as(u64, 0), r.stack.stats().tail_loss_probes);
+    try t.expectEqual(@as(u64, 1), r.stack.stats().rto_expirations);
+    r.send(.{ .seq = e.rcv, .ack = d.seq +% 4, .flags = .{ .ack = true }, .window = 4096 });
+    // Interactive again: data out, ACKed before the probe: no probe, no timer.
+    e.st.setPriority(.interactive);
+    _ = try e.st.write("i");
+    const i = try r.recv();
+    r.send(.{ .seq = e.rcv, .ack = i.seq +% 1, .flags = .{ .ack = true }, .window = 4096 });
+    try t.expectEqual(@as(?i64, null), r.stack.runTimers());
+    try t.expectEqual(@as(u64, 0), r.stack.stats().tail_loss_probes);
+}
+test "SACK: a flood of random blocks costs bounded work and output per ACK" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try establishedSack(&r, l);
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff });
+    var data: [64 * 1024]u8 = undefined;
+    @memset(&data, 'f');
+    _ = try e.st.write(&data);
+    while (r.stack.output(&r.out)) |_| {}
+    const k0 = e.st.debugConn().?;
+    var prng = std.Random.DefaultPrng.init(0x5ac);
+    const rnd = prng.random();
+    var max_out_per_ack: usize = 0;
+    for (0..5000) |_| {
+        var bl: [4][2]u32 = undefined;
+        for (&bl) |*b| {
+            const off = rnd.uintLessThan(u32, k0.snd_max -% k0.snd_una + 4000);
+            b.* = .{ e.snd +% off, e.snd +% off +% rnd.uintLessThan(u32, 3000) -% 500 };
+        }
+        r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&bl) } });
+        var n: usize = 0;
+        while (r.stack.output(&r.out)) |p| {
+            const sg = try r.peer.expect(p);
+            // Retransmissions stay within what was sent and within one MSS.
+            try t.expect(sg.payload.len <= 1380);
+            n += 1;
+        }
+        max_out_per_ack = @max(max_out_per_ack, n);
+        const k = e.st.debugConn().?;
+        try t.expect(k.sacked_len <= tcp.max_sack_ranges);
+        for (k.sacked[0..k.sacked_len]) |rg| {
+            try t.expect(tcp.seqLe(k.snd_una, rg.start) and tcp.seqLt(rg.start, rg.end) and tcp.seqLe(rg.end, k.snd_max));
+        }
+    }
+    // Each ACK releases at most a handful of segments (pipe-limited), not
+    // a burst proportional to the junk it carried.
+    try t.expect(max_out_per_ack <= 12);
 }

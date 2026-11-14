@@ -42,6 +42,8 @@ fn fuzzWire(_: void, s: *Smith) anyerror!void {
     try testing.expectEqual(a.options.window_scale, b.options.window_scale);
     try testing.expectEqual(a.options.sack_permitted, b.options.sack_permitted);
     try testing.expectEqual(a.options.timestamp, b.options.timestamp);
+    try testing.expectEqual(a.options.sack == null, b.options.sack == null);
+    if (a.options.sack) |sa| try testing.expectEqualSlices(wire.SackBlock, sa.slice(), b.options.sack.?.slice());
     try testing.expectEqualSlices(u8, a.payload, b.payload);
     try testing.expectEqual(p.ip.header.src, again.ip.header.src);
     try testing.expectEqual(p.ip.header.dst, again.ip.header.dst);
@@ -61,6 +63,17 @@ test "fuzz: netstack wire parsers (round trip)" {
     std.mem.writeInt(u32, corpus_buf[0..4], @intCast(p.len), .little);
     @memcpy(corpus_buf[4..][0..p.len], p);
     try testing.fuzz({}, fuzzWire, .{ .corpus = &.{corpus_buf[0 .. 4 + p.len]} });
+}
+
+/// SACK blocks near `ack` (often plausible, sometimes hostile: reversed,
+/// huge, overlapping, outside anything sent).
+fn drawSack(s: *Smith, ack: u32) wire.Sack {
+    var sk: wire.Sack = .{ .len = s.valueRangeAtMost(u8, 1, wire.max_sack_blocks) };
+    for (sk.blocks[0..sk.len]) |*b| {
+        const start = if (s.boolWeighted(3, 1)) ack +% s.valueRangeAtMost(u32, 0, 20_000) else s.value(u32);
+        b.* = .{ .start = start, .end = if (s.boolWeighted(3, 1)) start +% s.valueRangeAtMost(u32, 0, 3000) else s.value(u32) };
+    }
+    return sk;
 }
 
 fn fuzzInput(_: void, s: *Smith) anyerror!void {
@@ -96,6 +109,8 @@ fn fuzzInput(_: void, s: *Smith) anyerror!void {
                     .options = .{
                         .mss = if (s.boolWeighted(1, 3)) s.value(u16) else null,
                         .window_scale = if (s.boolWeighted(1, 3)) s.value(u8) else null,
+                        .sack_permitted = s.boolWeighted(1, 1),
+                        .sack = if (s.boolWeighted(1, 1)) drawSack(s, ack) else null,
                     },
                     .payload = payload[0..len],
                 });
