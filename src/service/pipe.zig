@@ -154,16 +154,7 @@ pub const Server = struct {
         const s: *Server = @ptrCast(@alignCast(ctx));
         win.AcquireSRWLockExclusive(&s.lock);
         defer win.ReleaseSRWLockExclusive(&s.lock);
-        const n = @min(s.peers.len, d.peers.items.len);
-        for (s.peers[0..n], d.peers.items[0..n], s.conf.peers[0..n]) |*out, p, *c| out.* = .{
-            .public_key = p.public_key,
-            .endpoint = p.endpoint,
-            .last_handshake_ns = p.last_handshake_wall_ns,
-            .tx_bytes = p.tx_bytes,
-            .rx_bytes = p.rx_bytes,
-            .persistent_keepalive = p.persistent_keepalive,
-            .allowed_ips = c.allowed_ips,
-        };
+        const n = livePeers(s.peers, s.conf.peers, d);
         var w: std.Io.Writer = .fixed(s.snapshot);
         if (uapi.encodeGet(&w, .{ .public_key = s.public_key, .listen_port = d.listen_port }, s.peers[0..n])) |_| {
             s.snapshot_len = w.buffered().len;
@@ -271,6 +262,31 @@ pub const Server = struct {
         return s.out[0..s.snapshot_len];
     }
 };
+
+/// The configured peers the device has now, matched by public key (a
+/// peer's position changes when `Device.setPeers` adds, removes or reorders
+/// peers), in configuration order. Allowed IPs come from the configuration
+/// (the device keeps only its routing table). A peer added later that the
+/// configuration does not list is not reported: the snapshot buffers are
+/// sized for the configuration. Returns how many entries of `out` are set.
+fn livePeers(out: []uapi.Peer, conf_peers: []const config.Peer, d: *const Device) usize {
+    var n: usize = 0;
+    for (conf_peers) |*c| {
+        if (n == out.len) break;
+        const p = d.peerByKey(c.public_key) orelse continue;
+        out[n] = .{
+            .public_key = p.public_key,
+            .endpoint = p.endpoint,
+            .last_handshake_ns = p.last_handshake_wall_ns,
+            .tx_bytes = p.tx_bytes,
+            .rx_bytes = p.rx_bytes,
+            .persistent_keepalive = p.persistent_keepalive,
+            .allowed_ips = c.allowed_ips,
+        };
+        n += 1;
+    }
+    return n;
+}
 
 const IoError = error{ Timeout, Stopped, Failed };
 
@@ -420,6 +436,7 @@ test "query: no such tunnel" {
 const testing = std.testing;
 const tun = @import("../tun/root.zig");
 const dev = @import("../device/device.zig");
+const Cidr = @import("../device/ip.zig").Cidr;
 
 fn rep(comptime s: []const u8, comptime n: usize) []const u8 {
     comptime {
@@ -562,4 +579,60 @@ test "control pipe end to end: device state over get=1, set refused, garbage ref
         const r = try queryNamed(gpa, pipe_name, 3 * client_deadline_ms); // waits in WaitNamedPipe, then served
         gpa.free(r);
     }
+}
+
+test "livePeers matches the device's peers to the configuration by public key after setPeers" {
+    const gpa = testing.allocator;
+    const ka = keys.publicFromPrivate(&keys.generatePrivate(testing.io));
+    const kb = keys.publicFromPrivate(&keys.generatePrivate(testing.io));
+    const kc = keys.publicFromPrivate(&keys.generatePrivate(testing.io));
+    var a_ips = [_]Cidr{try .parse("10.20.0.1/32")};
+    var b_ips = [_]Cidr{ try .parse("10.20.0.2/32"), try .parse("fd00::2/128") };
+    const conf_peers = [_]config.Peer{
+        .{ .public_key = ka, .allowed_ips = &a_ips },
+        .{ .public_key = kb, .allowed_ips = &b_ips },
+    };
+
+    var clock: dev.Clock = .{ .io = testing.io };
+    var fake: tun.FakeTun = try .init(gpa, .{});
+    defer fake.deinit();
+    const d = try Device.create(gpa, &clock, fake.tun(), .{
+        .private_key = keys.generatePrivate(testing.io),
+        .peers = &.{
+            .{ .public_key = ka, .allowed_ips = &a_ips, .persistent_keepalive = 1 },
+            .{ .public_key = kb, .allowed_ips = &b_ips, .persistent_keepalive = 2 },
+        },
+    });
+    defer d.destroy();
+
+    var out: [conf_peers.len]uapi.Peer = undefined;
+    try testing.expectEqual(@as(usize, 2), livePeers(&out, &conf_peers, d));
+    try testing.expectEqual(ka, out[0].public_key);
+    try testing.expectEqual(@as(usize, 1), out[0].allowed_ips.len);
+    try testing.expectEqual(kb, out[1].public_key);
+    try testing.expectEqual(@as(usize, 2), out[1].allowed_ips.len);
+
+    // a removed, c added (not configured), b moved to the front: each
+    // reported peer still carries its own state and allowed IPs.
+    try d.setPeers(&.{
+        .{ .public_key = kb, .allowed_ips = &b_ips, .persistent_keepalive = 2 },
+        .{ .public_key = kc, .persistent_keepalive = 3 },
+    });
+    try testing.expectEqual(@as(usize, 1), livePeers(&out, &conf_peers, d));
+    try testing.expectEqual(kb, out[0].public_key);
+    try testing.expectEqual(@as(u16, 2), out[0].persistent_keepalive);
+    try testing.expectEqual(@as(usize, 2), out[0].allowed_ips.len);
+
+    // a back, after c and b.
+    try d.setPeers(&.{
+        .{ .public_key = kc, .persistent_keepalive = 3 },
+        .{ .public_key = kb, .allowed_ips = &b_ips, .persistent_keepalive = 2 },
+        .{ .public_key = ka, .allowed_ips = &a_ips, .persistent_keepalive = 1 },
+    });
+    try testing.expectEqual(@as(usize, 2), livePeers(&out, &conf_peers, d));
+    try testing.expectEqual(ka, out[0].public_key);
+    try testing.expectEqual(@as(u16, 1), out[0].persistent_keepalive);
+    try testing.expectEqual(@as(usize, 1), out[0].allowed_ips.len);
+    try testing.expectEqual(kb, out[1].public_key);
+    try testing.expectEqual(@as(u16, 2), out[1].persistent_keepalive);
 }
