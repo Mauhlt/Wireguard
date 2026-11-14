@@ -546,13 +546,13 @@ fn expectInvalid(text: []const u8, line: u32, needle: []const u8) !void {
     }
 }
 
-/// Wraps testing.allocator and remembers whether any block given back
+/// Test helper: wraps testing.allocator and remembers whether any block given back
 /// still contained one of `needles` (key bytes).
-const FreeSpy = struct {
+pub const FreeSpy = struct {
     needles: []const []const u8,
     leaked: bool = false,
 
-    fn allocator(s: *FreeSpy) std.mem.Allocator {
+    pub fn allocator(s: *FreeSpy) std.mem.Allocator {
         return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
     fn alloc(_: *anyopaque, len: usize, al: std.mem.Alignment, ret: usize) ?[*]u8 {

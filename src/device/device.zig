@@ -21,9 +21,13 @@
 //!   (resolver.zig: off the loop thread, woken by its Waker, deadlines in
 //!   the same timer wait).
 //!
-//! Memory is fixed after setup: per-peer staging rings, one receive and one
-//! send buffer, a bounded index table and a fixed-size rate limiter. Network
-//! input never allocates.
+//! Peer table: `setPeers` replaces it while the loop runs (from any thread;
+//!   it is applied on the loop thread, woken like `kick`). Kept peers keep
+//!   their sessions; removed ones are wiped.
+//!
+//! Memory is fixed after setup and after each peer-table change: per-peer
+//! staging rings, one receive and one send buffer, a bounded index table
+//! and a fixed-size rate limiter. Network input never allocates.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -219,6 +223,10 @@ pub const Device = struct {
     control: ?Control = null,
     /// Lookups of endpoint names (null: no peer has one).
     resolver: ?*resolver.Shared = null,
+    /// How endpoint names are looked up (`setPeers` makes new slots).
+    lookup: resolver.Lookup = .system,
+    /// `setPeers` hands its table to the loop thread through this.
+    peer_update: PeerUpdate = .{},
 
     stats: Stats = .{},
     rx_buf: []u8,
@@ -236,13 +244,60 @@ pub const Device = struct {
         ready: *const fn (ctx: *anyopaque, d: *Device) void,
     };
 
-    pub const InitError = error{ OutOfMemory, SystemResources, DuplicatePeer, InvalidPeer, InvalidHost } || os.OpenError;
+    /// The hand-over between `setPeers` (any thread) and the loop thread:
+    /// one request at a time, served on the loop's next turn.
+    const PeerUpdate = struct {
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
+        /// `run` is running, on `loop_thread` (guarded by `mutex`).
+        running: bool = false,
+        loop_thread: std.Thread.Id = 0,
+        /// The request the loop has yet to serve (guarded by `mutex`).
+        pending: ?*Request = null,
+        /// `pending != null`, readable without the lock (the loop checks
+        /// it every turn).
+        flag: std.atomic.Value(bool) = .init(false),
+
+        const Request = struct {
+            peers: []const PeerConfig,
+            result: InitError!void = {},
+            done: bool = false,
+        };
+    };
+
+    pub const InitError = error{
+        OutOfMemory,
+        SystemResources,
+        /// Two peers with the same public key.
+        DuplicatePeer,
+        /// A peer with our own public key, or an invalid allowed-IPs prefix.
+        InvalidPeer,
+        /// An endpoint name that is empty or longer than `resolver.max_host`.
+        InvalidHost,
+        /// More than `config.max_peers` peers.
+        TooManyPeers,
+        /// A peer with more than `config.max_list_entries` allowed IPs.
+        TooManyAllowedIps,
+        /// The same prefix in the allowed IPs of two peers.
+        OverlappingAllowedIps,
+    } || os.OpenError;
 
     /// Creates the device, binds its UDP sockets and adds the peers. The
     /// Device must stay at its address (it is heap-allocated).
     pub fn create(gpa: std.mem.Allocator, clock: *Clock, tun: tun_mod.Tun, options: Options) InitError!*Device {
         const d = try gpa.create(Device);
         errdefer gpa.destroy(d);
+        try d.init(gpa, clock, tun, options);
+        // From here on, teardown frees what init made (each thing once).
+        errdefer d.teardown();
+
+        try d.bind(options.listen_port orelse 0);
+        try d.applyPeers(options.peers, null);
+        return d;
+    }
+
+    /// All or nothing: on error, nothing is left to free.
+    fn init(d: *Device, gpa: std.mem.Allocator, clock: *Clock, tun: tun_mod.Tun, options: Options) InitError!void {
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
         clock.io.random(&seed);
         const limiter = try gpa.create(ratelimit.Ratelimiter);
@@ -279,40 +334,12 @@ pub const Device = struct {
             .tx_buf = tx_buf,
             .pkt_buf = pkt_buf,
             .flush_buf = flush_buf,
+            .lookup = options.lookup,
         };
         std.crypto.secureZero(u8, &seed);
         d.rng = d.csprng.random();
         d.checker = noise.CookieChecker.init(&d.local.public);
         limiter.* = .init(d.rng);
-        errdefer d.teardown();
-
-        try d.bind(options.listen_port orelse 0);
-        for (options.peers) |*pc| _ = try d.addPeer(pc);
-        try d.initResolver(options.peers, options.lookup);
-        return d;
-    }
-
-    /// One resolver slot per peer whose endpoint is a DNS name.
-    fn initResolver(d: *Device, configs: []const PeerConfig, lookup: resolver.Lookup) InitError!void {
-        var count: usize = 0;
-        for (configs) |*pc| count += @intFromBool(pc.endpoint_name != null);
-        if (count == 0) return;
-        const hosts = try d.gpa.alloc([]const u8, count);
-        defer d.gpa.free(hosts);
-        const ports = try d.gpa.alloc(u16, count);
-        defer d.gpa.free(ports);
-        var i: u32 = 0;
-        for (configs, d.peers.items) |*pc, p| if (pc.endpoint_name) |n| {
-            hosts[i] = n.host;
-            ports[i] = n.port;
-            p.resolve = .{ .slot = i };
-            i += 1;
-        };
-        d.resolver = resolver.Shared.create(d.clock.io, lookup, hosts, ports) catch |err| return switch (err) {
-            error.InvalidHost => error.InvalidHost,
-            error.SystemResources => error.SystemResources,
-            error.OutOfMemory => error.OutOfMemory,
-        };
     }
 
     pub fn destroy(d: *Device) void {
@@ -325,14 +352,7 @@ pub const Device = struct {
         // A lookup still in flight finishes on its own and frees the rest.
         if (d.resolver) |r| r.release();
         d.resolver = null;
-        for (d.peers.items) |p| {
-            _ = p.sess.deinit();
-            p.hs.wipe();
-            // Staged plaintext packets waiting for a handshake.
-            std.crypto.secureZero(u8, p.staged.storage);
-            p.staged.deinit(d.gpa);
-            d.gpa.destroy(p);
-        }
+        for (d.peers.items) |p| d.destroyPeer(p);
         d.peers.deinit(d.gpa);
         d.by_key.deinit(d.gpa);
         d.routes.deinit();
@@ -372,16 +392,96 @@ pub const Device = struct {
         try d.bind(port);
     }
 
-    pub fn addPeer(d: *Device, pc: *const PeerConfig) InitError!PeerId {
-        if (d.by_key.contains(pc.public_key)) return error.DuplicatePeer;
-        if (crypto.eql(32, &pc.public_key, &d.local.public)) return error.InvalidPeer;
-        const id: PeerId = @intCast(d.peers.items.len);
+    // ---- the peer table -----------------------------------------------------
+
+    /// Replaces the peer table with `cfgs`, in that order (a peer's id is
+    /// its position). The startup path and `setPeers` both come here, on
+    /// the loop thread or while `run` is not running. Everything that can
+    /// fail (the checks and every allocation) comes before the first
+    /// change, so an error leaves the device exactly as it was. `now` is
+    /// null while the loop is not running (`run` starts the peers).
+    fn applyPeers(d: *Device, cfgs: []const PeerConfig, now: ?i64) InitError!void {
+        try d.checkPeers(cfgs);
+        const gpa = d.gpa;
+        const n: u32 = @intCast(cfgs.len);
+
+        // The new key map and routing table, built aside; building them
+        // finds duplicate keys and prefixes claimed by two peers. After
+        // the swaps below, these deferred frees free the old ones.
+        var by_key: std.AutoHashMapUnmanaged(crypto.PublicKey, PeerId) = .empty;
+        defer by_key.deinit(gpa);
+        try by_key.ensureTotalCapacity(gpa, n);
+        var routes: AllowedIps(PeerId) = .init(gpa);
+        defer routes.deinit();
+        // Per new position: the current peer with that key, or a new one.
+        const kept = try gpa.alloc(?*Peer, n);
+        defer gpa.free(kept);
+        const fresh = try gpa.alloc(?*Peer, n);
+        defer gpa.free(fresh);
+        @memset(fresh, null);
+        errdefer for (fresh) |f| if (f) |p| d.destroyPeer(p);
+        for (cfgs, kept, 0..) |*pc, *k, i| {
+            const id: PeerId = @intCast(i);
+            const gop = by_key.getOrPutAssumeCapacity(pc.public_key);
+            if (gop.found_existing) return error.DuplicatePeer;
+            gop.value_ptr.* = id;
+            for (pc.allowed_ips) |c| {
+                if (routes.exact(c)) |owner| if (owner != id) return error.OverlappingAllowedIps;
+                try routes.insert(c, id);
+            }
+            k.* = d.peerByKey(pc.public_key);
+        }
+        for (cfgs, kept, fresh) |*pc, k, *f| if (k == null) {
+            f.* = try d.newPeer(pc);
+        };
+        const names = try d.prepareResolver(cfgs, kept);
+        errdefer if (names.shared) |s| if (s != d.resolver) s.release();
+        // Old id -> new id (null: removed).
+        const moved = try gpa.alloc(?PeerId, d.peers.items.len);
+        defer gpa.free(moved);
+        try d.peers.ensureTotalCapacity(gpa, n);
+
+        // ---- nothing below fails ----
+        @memset(moved, null);
+        for (kept, 0..) |k, i| if (k) |p| {
+            moved[p.id] = @intCast(i);
+        };
+        for (d.peers.items, moved) |p, m| if (m == null) d.destroyPeer(p);
+        d.indices.remap(moved);
+        d.peers.clearRetainingCapacity();
+        for (cfgs, kept, fresh, 0..) |*pc, k, f, i| {
+            const p = k orelse f.?;
+            p.id = @intCast(i);
+            d.peers.appendAssumeCapacity(p);
+            if (k != null) d.updatePeer(p, pc, now);
+        }
+        std.mem.swap(@TypeOf(by_key), &d.by_key, &by_key);
+        std.mem.swap(AllowedIps(PeerId), &d.routes, &routes);
+        d.installResolver(names, cfgs, kept);
+        // One in-flight handshake plus three keypairs per peer.
+        d.indices.limit = 4 * @as(usize, n) + 16;
+        if (now) |t| for (fresh) |f| if (f) |p| d.startPeer(p, t);
+    }
+
+    /// The checks that need no memory: limits and keys.
+    fn checkPeers(d: *const Device, cfgs: []const PeerConfig) InitError!void {
+        if (cfgs.len > config.max_peers) return error.TooManyPeers;
+        for (cfgs) |*pc| {
+            if (crypto.eql(32, &pc.public_key, &d.local.public)) return error.InvalidPeer;
+            if (pc.allowed_ips.len > config.max_list_entries) return error.TooManyAllowedIps;
+            for (pc.allowed_ips) |c| if (c.prefix > c.addr.bits()) return error.InvalidPeer;
+            if (pc.endpoint_name) |nm| if (nm.host.len == 0 or nm.host.len > resolver.max_host) return error.InvalidHost;
+        }
+    }
+
+    /// A peer as configured, with fresh handshake and session state. Its
+    /// id is set, and it is registered, by `applyPeers`.
+    fn newPeer(d: *Device, pc: *const PeerConfig) InitError!*Peer {
         const p = try d.gpa.create(Peer);
         errdefer d.gpa.destroy(p);
-        var staged = try tun_mod.queue.PacketRing.init(d.gpa, max_staged, @max(d.mtu, 1280));
-        errdefer staged.deinit(d.gpa);
+        const staged = try tun_mod.queue.PacketRing.init(d.gpa, max_staged, @max(d.mtu, 1280));
         p.* = .{
-            .id = id,
+            .id = 0,
             .public_key = pc.public_key,
             .hs = noise.Handshake.init(&d.local, pc.public_key, pc.preshared_key orelse @splat(0)),
             .sess = session.Peer.init(session.Jitter.fromRandom(&d.rng)),
@@ -389,16 +489,205 @@ pub const Device = struct {
             .persistent_keepalive = pc.persistent_keepalive,
             .staged = staged,
         };
-        try d.peers.append(d.gpa, p);
-        errdefer _ = d.peers.pop();
-        try d.by_key.put(d.gpa, pc.public_key, id);
-        for (pc.allowed_ips) |c| try d.routes.insert(c, id);
-        // One in-flight handshake plus three keypairs per peer.
-        d.indices.limit = 4 * d.peers.items.len + 16;
-        return id;
+        return p;
+    }
+
+    /// Wipes a peer's session keys, handshake state (preshared key
+    /// included) and staged packets, gives its indices back and frees it.
+    fn destroyPeer(d: *Device, p: *Peer) void {
+        d.retire(p.sess.deinit());
+        if (p.handshake_index) |i| d.indices.remove(i);
+        p.hs.wipe();
+        // Staged plaintext packets waiting for a handshake.
+        std.crypto.secureZero(u8, p.staged.storage);
+        p.staged.deinit(d.gpa);
+        std.crypto.secureZero(u8, std.mem.asBytes(p));
+        d.gpa.destroy(p);
+    }
+
+    /// A kept peer takes its new settings. Its sessions, timers, counters
+    /// and endpoint stay, unless the new config names an endpoint (then
+    /// that one) or another preshared key (then its sessions go: none made
+    /// with the old key may carry on).
+    fn updatePeer(d: *Device, p: *Peer, pc: *const PeerConfig, now: ?i64) void {
+        if (pc.endpoint) |e| p.endpoint = e;
+        var psk: crypto.PresharedKey = pc.preshared_key orelse @splat(0);
+        defer crypto.wipe(&psk);
+        const new_psk = !crypto.eql(32, &psk, &p.hs.psk);
+        if (new_psk) {
+            p.hs.setPresharedKey(psk);
+            p.hs.clear();
+            if (p.handshake_index) |i| d.indices.remove(i);
+            p.handshake_index = null;
+            d.retire(p.sess.keypairs.clear());
+        }
+        const keepalive = pc.persistent_keepalive != p.persistent_keepalive;
+        p.persistent_keepalive = pc.persistent_keepalive;
+        const t = now orelse return; // `run` arms the timers when it starts
+        if (keepalive) d.applyActions(p, p.sess.setPersistentKeepalive(p.persistent_keepalive), t);
+        // Traffic waiting, or a keepalive wanted: a new session now.
+        if (new_psk and (p.persistent_keepalive != 0 or !p.staged.isEmpty()))
+            if (p.sess.wantHandshake(t)) d.sendInitiation(p, t);
+    }
+
+    /// The endpoint-name slots for a new peer table (`prepareResolver`).
+    const Names = struct {
+        /// null: no peer has a name. The current `Device.resolver` when
+        /// every named peer keeps its slot and name; else new slots.
+        shared: ?*resolver.Shared,
+    };
+
+    /// One lookup slot per peer whose endpoint is a DNS name, in table
+    /// order. The current slots are kept if they still fit exactly.
+    fn prepareResolver(d: *Device, cfgs: []const PeerConfig, kept: []const ?*Peer) InitError!Names {
+        var count: u32 = 0;
+        var fits = true;
+        for (cfgs, kept) |*pc, k| if (pc.endpoint_name) |nm| {
+            fits = fits and d.keepsSlot(k, count, nm);
+            count += 1;
+        };
+        if (count == 0) return .{ .shared = null };
+        if (fits and count == d.resolver.?.slots.len) return .{ .shared = d.resolver };
+        const hosts = try d.gpa.alloc([]const u8, count);
+        defer d.gpa.free(hosts);
+        const ports = try d.gpa.alloc(u16, count);
+        defer d.gpa.free(ports);
+        var i: usize = 0;
+        for (cfgs) |*pc| if (pc.endpoint_name) |nm| {
+            hosts[i] = nm.host;
+            ports[i] = nm.port;
+            i += 1;
+        };
+        const s = resolver.Shared.create(d.clock.io, d.lookup, hosts, ports) catch |err| return switch (err) {
+            error.InvalidHost => error.InvalidHost,
+            error.SystemResources => error.SystemResources,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        return .{ .shared = s };
+    }
+
+    /// Is `k` a current peer that looks `nm` up in slot `slot`?
+    fn keepsSlot(d: *const Device, k: ?*Peer, slot: u32, nm: config.Endpoint) bool {
+        const p = k orelse return false;
+        const rv = p.resolve orelse return false;
+        return rv.slot == slot and d.slotIs(rv.slot, nm);
+    }
+
+    /// Does current slot `slot` look up `nm`?
+    fn slotIs(d: *const Device, slot: u32, nm: config.Endpoint) bool {
+        const s = &(d.resolver orelse return false).slots[slot];
+        return s.port == nm.port and std.mem.eql(u8, s.host, nm.host);
+    }
+
+    /// Commit half of `prepareResolver` (`d.peers` is the new table). A
+    /// kept peer whose name did not change keeps its lookup schedule.
+    fn installResolver(d: *Device, names: Names, cfgs: []const PeerConfig, kept: []const ?*Peer) void {
+        const renewed = names.shared != d.resolver;
+        var slot: u32 = 0;
+        for (cfgs, kept, d.peers.items) |*pc, k, p| {
+            const old = if (k != null) p.resolve else null;
+            const nm = pc.endpoint_name orelse {
+                p.resolve = null;
+                continue;
+            };
+            var rv: Peer.Resolve = .{ .slot = slot };
+            if (old) |o| if (d.slotIs(o.slot, nm)) {
+                rv.schedule = o.schedule;
+                if (renewed and rv.schedule.busy) {
+                    // Its answer lands in the old slots: ask again now.
+                    rv.schedule.busy = false;
+                    rv.schedule.due_at = d.clock.now();
+                }
+            };
+            p.resolve = rv;
+            slot += 1;
+        }
+        // A lookup still in flight finishes on its own and frees the rest.
+        if (renewed) if (d.resolver) |r| r.release();
+        d.resolver = names.shared;
     }
 
     // ---- control from other threads -------------------------------------
+
+    /// Replaces the peer table, while the tunnel runs or not (Portal pairs
+    /// or forgets a device without restarting the tunnel). Thread-safe:
+    /// while `run` is running, the change is handed to the loop thread
+    /// (woken like `kick`) and applied between two turns; this returns once
+    /// it is applied, or with the error that left everything unchanged.
+    /// Calls from several threads are applied one at a time, in turn.
+    /// Nothing in `peers` is used after this returns (the routing table
+    /// and the endpoint-name slots keep their own copies).
+    ///
+    /// Peers are matched by public key:
+    ///   * kept: sessions, timers, counters and the (roamed) endpoint stay;
+    ///     allowed IPs, persistent keepalive and, if given, the endpoint
+    ///     are updated. Another preshared key drops its sessions.
+    ///   * removed: torn down; keys, session and handshake state wiped,
+    ///     staged packets wiped and freed, its indices and routes gone.
+    ///   * added: as at startup.
+    /// The whole set is checked before anything changes: duplicate keys,
+    /// our own key, the same prefix in two peers (nested prefixes are
+    /// longest-prefix routing, as in the kernel), at most
+    /// `config.max_peers` peers with `config.max_list_entries` allowed IPs
+    /// each, and endpoint-name lengths.
+    pub fn setPeers(d: *Device, peers: []const PeerConfig) InitError!void {
+        const u = &d.peer_update;
+        const io = d.clock.io;
+        u.mutex.lockUncancelable(io);
+        defer u.mutex.unlock(io);
+        while (true) {
+            // Not running: nothing else touches the device (`run` waits
+            // for the lock before it starts).
+            if (!u.running) return d.applyPeers(peers, null);
+            // From the loop thread itself (a control hook): apply here.
+            if (u.loop_thread == std.Thread.getCurrentId()) return d.applyPeers(peers, d.clock.now());
+            if (u.pending == null) break;
+            u.cond.waitUncancelable(io, &u.mutex);
+        }
+        var req: PeerUpdate.Request = .{ .peers = peers };
+        u.pending = &req;
+        u.flag.store(true, .release);
+        d.waker.signal();
+        while (!req.done) u.cond.waitUncancelable(io, &u.mutex);
+        return req.result;
+    }
+
+    /// Loop thread: applies the `setPeers` request waiting, if any.
+    fn servePeerUpdate(d: *Device, now: ?i64) void {
+        const u = &d.peer_update;
+        u.mutex.lockUncancelable(d.clock.io);
+        defer u.mutex.unlock(d.clock.io);
+        d.serveLocked(now);
+    }
+
+    fn serveLocked(d: *Device, now: ?i64) void {
+        const u = &d.peer_update;
+        const req = u.pending orelse return;
+        req.result = d.applyPeers(req.peers, now);
+        req.done = true;
+        u.pending = null;
+        u.flag.store(false, .release);
+        u.cond.broadcast(d.clock.io);
+    }
+
+    fn enterLoop(d: *Device) void {
+        const u = &d.peer_update;
+        u.mutex.lockUncancelable(d.clock.io);
+        defer u.mutex.unlock(d.clock.io);
+        u.running = true;
+        u.loop_thread = std.Thread.getCurrentId();
+    }
+
+    /// `run` returns: a request that came too late for the loop is
+    /// applied here; later ones apply directly.
+    fn leaveLoop(d: *Device) void {
+        const u = &d.peer_update;
+        u.mutex.lockUncancelable(d.clock.io);
+        defer u.mutex.unlock(d.clock.io);
+        d.serveLocked(null);
+        u.running = false;
+        u.cond.broadcast(d.clock.io);
+    }
 
     /// Ask `run` to return (thread-safe).
     pub fn stop(d: *Device) void {
@@ -417,14 +706,10 @@ pub const Device = struct {
     pub const RunError = error{ TunClosed, Unexpected };
 
     pub fn run(d: *Device) RunError!void {
+        d.enterLoop();
+        defer d.leaveLoop();
         var now = d.clock.now();
-        for (d.peers.items) |p| {
-            d.applyActions(p, p.sess.start(), now);
-            d.applyActions(p, p.sess.setPersistentKeepalive(p.persistent_keepalive), now);
-            // A name that could not be resolved at start: try again now
-            // (then on the failure backoff).
-            if (p.endpoint == null) if (p.resolve != null) d.requestLookup(p, now);
-        }
+        for (d.peers.items) |p| d.startPeer(p, now);
         var more = false;
         while (true) {
             if (d.stop_requested.load(.acquire)) return;
@@ -480,12 +765,23 @@ pub const Device = struct {
                     d.collectLookups(d.clock.now());
                 };
             }
+            if (d.peer_update.flag.load(.acquire)) d.servePeerUpdate(d.clock.now());
             more = false;
             now = d.clock.now();
             if (d.udp4 != null) more = d.drainUdp(&d.udp4.?, now) or more;
             if (d.udp6 != null) more = d.drainUdp(&d.udp6.?, now) or more;
             more = (try d.drainTun(now)) or more;
         }
+    }
+
+    /// Arms a peer's timers as the loop starts it (`run`, or `setPeers`
+    /// adding it while the loop runs).
+    fn startPeer(d: *Device, p: *Peer, now: i64) void {
+        d.applyActions(p, p.sess.start(), now);
+        d.applyActions(p, p.sess.setPersistentKeepalive(p.persistent_keepalive), now);
+        // A name that could not be resolved yet: try again now (then on
+        // the failure backoff).
+        if (p.endpoint == null) if (p.resolve != null) d.requestLookup(p, now);
     }
 
     /// Arm the suspend-aware timer for `deadline` (device clock), or disarm
