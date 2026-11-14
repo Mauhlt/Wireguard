@@ -327,7 +327,13 @@ reorder timer, a deadline in the connection's single next-deadline
 function. Retransmissions get new timestamps, so a lost retransmission is
 detected by later deliveries instead of the RTO. reo_wnd = min_RTT / 4 *
 reo_wnd_mult, capped at SRTT, and 0 while recovering before any
-reordering has been seen. The RTO marks everything outstanding lost. TLP
+reordering has been seen. The RTO marks everything outstanding lost. RACK-TLP
+congestion response (RFC 8985 7.4): a probe's fate is decided by the ACK
+that covers it; a D-SACK of the probe means the original had arrived (no
+reduction, Stats.tlp_unneeded); a cumulative ACK without one means the
+probe repaired a lost tail segment: ssthresh = cwnd = cwnd / 2, once per
+episode, skipped when a recovery during the episode already reduced it
+(Stats.tlp_loss_repairs). TLP
 (the probe of RACK-TLP) stays limited to interactive streams; bulk
 streams have enough data in flight for RACK to detect tail losses.
 
