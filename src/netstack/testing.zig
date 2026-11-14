@@ -27,15 +27,11 @@ pub const Peer = struct {
         payload: []const u8 = &.{},
     };
 
-    /// A complete, valid IPv4/TCP packet peer -> stack in `out`.
+    /// A complete, valid IPv4/TCP or IPv6/TCP packet peer -> stack in
+    /// `out` (the endpoints' family).
     pub fn packet(p: *Peer, out: []u8, s: Seg) []u8 {
         p.ip_id +%= 1;
-        return wire.buildTcp4(out, .{
-            .protocol = wire.proto_tcp,
-            .id = p.ip_id,
-            .src = p.peer.addr.v4,
-            .dst = p.stack.addr.v4,
-        }, .{
+        return wire.buildTcp(out, p.peer.addr, p.stack.addr, p.ip_id, .{
             .src_port = p.peer.port,
             .dst_port = p.stack.port,
             .seq = s.seq,
@@ -49,9 +45,9 @@ pub const Peer = struct {
 
     /// Parses a packet the stack sent and checks it is stack -> peer.
     pub fn expect(p: *const Peer, pkt: []const u8) !wire.Tcp {
-        const t = try wire.parseTcp4(pkt);
-        try std.testing.expectEqual(p.stack.addr.v4, t.ip.header.src);
-        try std.testing.expectEqual(p.peer.addr.v4, t.ip.header.dst);
+        const t = try wire.parseTcp(pkt);
+        try std.testing.expect(t.ip.src.eql(p.stack.addr));
+        try std.testing.expect(t.ip.dst.eql(p.peer.addr));
         try std.testing.expectEqual(p.stack.port, t.tcp.src_port);
         try std.testing.expectEqual(p.peer.port, t.tcp.dst_port);
         return t.tcp;
