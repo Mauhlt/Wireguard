@@ -286,3 +286,158 @@ test "control hook runs on the loop thread when its handle is signaled" {
     d.stop();
     t.join();
 }
+
+/// Endpoint names in tests: every name resolves to 127.0.0.1:<port>, where
+/// the port is whatever the test points it at (0: fail).
+const FakeDns = struct {
+    port: std.atomic.Value(u16) = .init(0),
+    calls: std.atomic.Value(u32) = .init(0),
+
+    fn lookup(ctx: ?*anyopaque, io: std.Io, host: []const u8, port: u16) anyerror!std.Io.net.IpAddress {
+        _ = io;
+        _ = host;
+        _ = port;
+        const f: *FakeDns = @ptrCast(@alignCast(ctx.?));
+        _ = f.calls.fetchAdd(1, .monotonic);
+        const p = f.port.load(.monotonic);
+        if (p == 0) return error.UnknownHostName;
+        return .{ .ip4 = .loopback(p) };
+    }
+};
+
+fn keyPair() struct { priv: crypto.PrivateKey, public: crypto.PublicKey } {
+    var priv: crypto.PrivateKey = undefined;
+    testing.io.random(&priv);
+    crypto.clampPrivateKey(&priv);
+    return .{ .priv = priv, .public = crypto.publicKey(priv) };
+}
+
+// Outlive their tests: a lookup thread may still be finishing.
+var dns_at_start: FakeDns = .{};
+var dns_moved: FakeDns = .{};
+
+test "endpoint name not resolvable at start: looked up again, then the tunnel comes up" {
+    const gpa = testing.allocator;
+    var clock: dev.Clock = .{ .io = testing.io };
+    const ka = keyPair();
+    const kb = keyPair();
+
+    var b: Node = .{ .fake = try .init(gpa, .{}), .device = undefined };
+    defer b.fake.deinit();
+    b.device = try Device.create(gpa, &clock, b.fake.tun(), .{
+        .private_key = kb.priv,
+        .peers = &.{.{ .public_key = ka.public, .allowed_ips = &.{try ip.Cidr.parse("10.8.0.2/32")} }},
+    });
+    defer b.device.destroy();
+
+    // A's endpoint is a name that did not resolve at start (endpoint null);
+    // the first retry inside the device fails too, the next one works.
+    var a: Node = .{ .fake = try .init(gpa, .{}), .device = undefined };
+    defer a.fake.deinit();
+    a.device = try Device.create(gpa, &clock, a.fake.tun(), .{
+        .private_key = ka.priv,
+        .peers = &.{.{
+            .public_key = kb.public,
+            .endpoint_name = .{ .host = "home.example.org", .port = 51820 },
+            .allowed_ips = &.{try ip.Cidr.parse("10.8.0.1/32")},
+            .persistent_keepalive = 25,
+        }},
+        .lookup = .{ .ctx = &dns_at_start, .func = FakeDns.lookup },
+    });
+    defer a.device.destroy();
+
+    try b.start();
+    defer b.halt();
+    try a.start();
+    defer a.halt();
+
+    var pbuf: [128]u8 = undefined;
+    const p1 = ipv4Packet(&pbuf, .{ 10, 8, 0, 2 }, .{ 10, 8, 0, 1 }, "after the name resolved");
+    var rounds: usize = 0;
+    var delivered = false;
+    var r: [256]u8 = undefined;
+    while (!delivered and rounds < 20) : (rounds += 1) {
+        a.halt();
+        // From the second round on, DNS works; the failure backoff (1 s,
+        // 2 s, ...) is waited out on simulated time.
+        if (rounds == 1) dns_at_start.port.store(b.device.listen_port, .monotonic);
+        clock.advance(3 * std.time.ns_per_s);
+        try a.start();
+        try a.fake.inject(p1);
+        if (try b.fake.takeWait(&r, 300)) |got| {
+            try testing.expectEqualSlices(u8, p1, got);
+            delivered = true;
+        }
+    }
+    try testing.expect(delivered);
+    a.halt();
+    try testing.expect(dns_at_start.calls.load(.monotonic) >= 2);
+    try testing.expect(a.device.stats.endpoint_lookup_failures >= 1);
+    try testing.expectEqual(b.device.listen_port, a.device.peerByKey(kb.public).?.endpoint.?.getPort());
+}
+
+test "endpoint name moved (dynamic DNS): unanswered handshakes look it up again" {
+    const gpa = testing.allocator;
+    var clock: dev.Clock = .{ .io = testing.io };
+    const ka = keyPair();
+    const kb = keyPair();
+
+    var b: Node = .{ .fake = try .init(gpa, .{}), .device = undefined };
+    defer b.fake.deinit();
+    b.device = try Device.create(gpa, &clock, b.fake.tun(), .{
+        .private_key = kb.priv,
+        .peers = &.{.{ .public_key = ka.public, .allowed_ips = &.{try ip.Cidr.parse("10.8.0.2/32")} }},
+    });
+    defer b.device.destroy();
+
+    // The address the name resolved to at start: a socket that swallows
+    // everything (the desk's old address). The name now points at B.
+    var old = try os.Udp.open(.v4, 0);
+    defer old.close();
+    dns_moved.port.store(b.device.listen_port, .monotonic);
+
+    var a: Node = .{ .fake = try .init(gpa, .{}), .device = undefined };
+    defer a.fake.deinit();
+    a.device = try Device.create(gpa, &clock, a.fake.tun(), .{
+        .private_key = ka.priv,
+        .peers = &.{.{
+            .public_key = kb.public,
+            .endpoint = .{ .ip4 = .loopback(old.localPort()) },
+            .endpoint_name = .{ .host = "home.example.org", .port = 51820 },
+            .allowed_ips = &.{try ip.Cidr.parse("10.8.0.1/32")},
+        }},
+        .lookup = .{ .ctx = &dns_moved, .func = FakeDns.lookup },
+    });
+    defer a.device.destroy();
+
+    try b.start();
+    defer b.halt();
+    try a.start();
+    defer a.halt();
+
+    var pbuf: [128]u8 = undefined;
+    const p1 = ipv4Packet(&pbuf, .{ 10, 8, 0, 2 }, .{ 10, 8, 0, 1 }, "to the new address");
+    try a.fake.inject(p1); // staged; the initiation goes to the old address
+    var r: [256]u8 = undefined;
+    try testing.expectEqual(@as(?[]u8, null), try b.fake.takeWait(&r, 200));
+    try testing.expectEqual(@as(u32, 0), dns_moved.calls.load(.monotonic)); // answered so far: not looked up
+
+    // Retransmissions (REKEY_TIMEOUT + jitter) on simulated time: the first
+    // looks the name up, a later one reaches B and the staged packet flows.
+    var rounds: usize = 0;
+    var delivered = false;
+    while (!delivered and rounds < 10) : (rounds += 1) {
+        a.halt();
+        clock.advance(6 * std.time.ns_per_s);
+        try a.start();
+        if (try b.fake.takeWait(&r, 500)) |got| {
+            try testing.expectEqualSlices(u8, p1, got);
+            delivered = true;
+        }
+    }
+    try testing.expect(delivered);
+    a.halt();
+    try testing.expect(dns_moved.calls.load(.monotonic) >= 1);
+    try testing.expectEqual(@as(u64, 1), a.device.stats.endpoint_updates);
+    try testing.expectEqual(b.device.listen_port, a.device.peerByKey(kb.public).?.endpoint.?.getPort());
+}

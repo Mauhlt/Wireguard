@@ -181,7 +181,8 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
     };
     defer stop.close();
 
-    // Resolve endpoints first: a typo should fail before an adapter appears.
+    // Resolve endpoint names first. One that does not resolve yet (no
+    // network, DNS not up) is looked up again in the background.
     const peers = try gpa.alloc(dev.device.PeerConfig, c.peers.len);
     defer {
         std.crypto.secureZero(u8, std.mem.sliceAsBytes(peers)); // preshared keys
@@ -193,9 +194,10 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
             .preshared_key = p.preshared_key,
             .allowed_ips = p.allowed_ips,
             .persistent_keepalive = p.persistent_keepalive,
-            .endpoint = if (p.endpoint) |e| resolveEndpoint(io, e) catch |err| {
-                try errw.print("zwg: cannot resolve endpoint {f}: {s}\n", .{ e, @errorName(err) });
-                return 1;
+            .endpoint_name = endpointName(p.endpoint),
+            .endpoint = if (p.endpoint) |e| e.literal() orelse dev.device.resolver.systemLookup(null, io, e.host, e.port) catch |err| blk: {
+                try errw.print("zwg: warning: cannot resolve endpoint {f} yet ({s}); retrying in the background\n", .{ e, @errorName(err) });
+                break :blk null;
             } else null,
         };
     }
@@ -280,25 +282,10 @@ fn toTunCidr(c: dev.ip.Cidr) wg.tun.Cidr {
     };
 }
 
-/// IP literal, or a DNS lookup (IPv4 preferred: the device always has an
-/// IPv4 socket, IPv6 only when the host supports it).
-fn resolveEndpoint(io: std.Io, e: config.Endpoint) !std.Io.net.IpAddress {
-    if (e.literal()) |a| return a;
-    const host = try std.Io.net.HostName.init(e.host);
-    var buf: [32]std.Io.net.HostName.LookupResult = undefined;
-    var q: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buf);
-    try host.lookup(io, &q, .{ .port = e.port });
-    var got: [32]std.Io.net.HostName.LookupResult = undefined;
-    const n = q.get(io, &got, 0) catch 0;
-    var v6: ?std.Io.net.IpAddress = null;
-    for (got[0..n]) |r| switch (r) {
-        .address => |a| switch (a) {
-            .ip4 => return a,
-            .ip6 => if (v6 == null) {
-                v6 = a;
-            },
-        },
-        else => {},
-    };
-    return v6 orelse error.UnknownHostName;
+/// The endpoint's DNS name, to look up again while the peer is silent
+/// (null for an IP literal or no endpoint).
+fn endpointName(endpoint: ?config.Endpoint) ?dev.device.EndpointName {
+    const e = endpoint orelse return null;
+    if (e.literal() != null) return null;
+    return .{ .host = e.host, .port = e.port };
 }

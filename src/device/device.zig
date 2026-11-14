@@ -16,6 +16,10 @@
 //!   cookie reply (3) or decrypt (4) -> source address must be in the
 //!   peer's allowed IPs -> TUN. Every authenticated packet updates the
 //!   peer's endpoint (roaming).
+//! Endpoint names: a peer configured with a DNS name is looked up again
+//!   while its handshakes go unanswered, or until a failed lookup succeeds
+//!   (resolver.zig: off the loop thread, woken by its Waker, deadlines in
+//!   the same timer wait).
 //!
 //! Memory is fixed after setup: per-peer staging rings, one receive and one
 //! send buffer, a bounded index table and a fixed-size rate limiter. Network
@@ -37,6 +41,7 @@ const AllowedIps = @import("allowed_ips.zig").AllowedIps;
 const IndexTable = @import("index_table.zig").IndexTable;
 const ratelimit = @import("ratelimit.zig");
 const show = @import("show.zig");
+pub const resolver = @import("resolver.zig");
 
 const log = std.log.scoped(.zwg);
 
@@ -82,10 +87,19 @@ pub const Clock = struct {
     }
 };
 
+pub const EndpointName = struct {
+    host: []const u8,
+    port: u16,
+};
+
 pub const PeerConfig = struct {
     public_key: crypto.PublicKey,
     preshared_key: ?crypto.PresharedKey = null,
     endpoint: ?net.IpAddress = null,
+    /// The configured endpoint when it is a DNS name (`endpoint` is what it
+    /// resolved to at start, or null if that failed): looked up again while
+    /// the peer does not answer (resolver.zig). null for an IP literal.
+    endpoint_name: ?EndpointName = null,
     allowed_ips: []const ip.Cidr = &.{},
     persistent_keepalive: u16 = 0,
 };
@@ -98,6 +112,8 @@ pub const Options = struct {
     /// tests do anyway): never reachable from, nor visible to, the network.
     loopback_only: bool = false,
     peers: []const PeerConfig = &.{},
+    /// How endpoint names are looked up (tests substitute a fake).
+    lookup: resolver.Lookup = .system,
 };
 
 pub const Peer = struct {
@@ -113,6 +129,16 @@ pub const Peer = struct {
     rx_bytes: u64 = 0,
     tx_bytes: u64 = 0,
     last_handshake_wall_ns: ?i96 = null,
+    /// When the last authenticated packet from this peer arrived (device clock).
+    last_authenticated: ?i64 = null,
+    /// Set when the endpoint is a DNS name: its slot in `Device.resolver`
+    /// and when to look it up again.
+    resolve: ?Resolve = null,
+
+    pub const Resolve = struct {
+        slot: u32,
+        schedule: resolver.Schedule = .{},
+    };
 };
 
 pub const Stats = struct {
@@ -125,6 +151,9 @@ pub const Stats = struct {
     cookie_replies_sent: u64 = 0,
     tun_write_drops: u64 = 0,
     udp_send_errors: u64 = 0,
+    endpoint_lookups: u64 = 0,
+    endpoint_lookup_failures: u64 = 0,
+    endpoint_updates: u64 = 0,
 };
 
 pub const Device = struct {
@@ -162,6 +191,8 @@ pub const Device = struct {
     /// Extra wait source serviced on the loop thread (the tunnel service's
     /// control pipe asks for status snapshots through it).
     control: ?Control = null,
+    /// Lookups of endpoint names (null: no peer has one).
+    resolver: ?*resolver.Shared = null,
 
     stats: Stats = .{},
     rx_buf: []u8,
@@ -179,7 +210,7 @@ pub const Device = struct {
         ready: *const fn (ctx: *anyopaque, d: *Device) void,
     };
 
-    pub const InitError = error{ OutOfMemory, SystemResources, DuplicatePeer, InvalidPeer } || os.OpenError;
+    pub const InitError = error{ OutOfMemory, SystemResources, DuplicatePeer, InvalidPeer, InvalidHost } || os.OpenError;
 
     /// Creates the device, binds its UDP sockets and adds the peers. The
     /// Device must stay at its address (it is heap-allocated).
@@ -231,7 +262,31 @@ pub const Device = struct {
 
         try d.bind(options.listen_port orelse 0);
         for (options.peers) |*pc| _ = try d.addPeer(pc);
+        try d.initResolver(options.peers, options.lookup);
         return d;
+    }
+
+    /// One resolver slot per peer whose endpoint is a DNS name.
+    fn initResolver(d: *Device, configs: []const PeerConfig, lookup: resolver.Lookup) InitError!void {
+        var count: usize = 0;
+        for (configs) |*pc| count += @intFromBool(pc.endpoint_name != null);
+        if (count == 0) return;
+        const hosts = try d.gpa.alloc([]const u8, count);
+        defer d.gpa.free(hosts);
+        const ports = try d.gpa.alloc(u16, count);
+        defer d.gpa.free(ports);
+        var i: u32 = 0;
+        for (configs, d.peers.items) |*pc, p| if (pc.endpoint_name) |n| {
+            hosts[i] = n.host;
+            ports[i] = n.port;
+            p.resolve = .{ .slot = i };
+            i += 1;
+        };
+        d.resolver = resolver.Shared.create(d.clock.io, lookup, hosts, ports) catch |err| return switch (err) {
+            error.InvalidHost => error.InvalidHost,
+            error.SystemResources => error.SystemResources,
+            error.OutOfMemory => error.OutOfMemory,
+        };
     }
 
     pub fn destroy(d: *Device) void {
@@ -241,6 +296,9 @@ pub const Device = struct {
     }
 
     fn teardown(d: *Device) void {
+        // A lookup still in flight finishes on its own and frees the rest.
+        if (d.resolver) |r| r.release();
+        d.resolver = null;
         for (d.peers.items) |p| {
             _ = p.sess.deinit();
             p.hs.wipe();
@@ -337,13 +395,16 @@ pub const Device = struct {
         for (d.peers.items) |p| {
             d.applyActions(p, p.sess.start(), now);
             d.applyActions(p, p.sess.setPersistentKeepalive(p.persistent_keepalive), now);
+            // A name that could not be resolved at start: try again now
+            // (then on the failure backoff).
+            if (p.endpoint == null) if (p.resolve != null) d.requestLookup(p, now);
         }
         var more = false;
         while (true) {
             if (d.stop_requested.load(.acquire)) return;
             now = d.clock.now();
             const deadline = d.fireTimers(now);
-            var handles: [7]os.WaitHandle = undefined;
+            var handles: [8]os.WaitHandle = undefined;
             var n: usize = 0;
             handles[n] = d.waker.handle;
             n += 1;
@@ -354,6 +415,11 @@ pub const Device = struct {
             const control_index = n;
             if (d.control) |c| {
                 handles[n] = c.handle;
+                n += 1;
+            }
+            const resolver_index = n;
+            if (d.resolver) |rs| {
+                handles[n] = rs.waker.handle;
                 n += 1;
             }
             if (d.udp4) |*u| {
@@ -383,6 +449,10 @@ pub const Device = struct {
                 }
                 if (d.external_stop != null and r == 1) return;
                 if (d.control) |c| if (r == control_index) c.ready(c.ctx, d);
+                if (d.resolver) |rs| if (r == resolver_index) {
+                    rs.waker.clear();
+                    d.collectLookups(d.clock.now());
+                };
             }
             more = false;
             now = d.clock.now();
@@ -406,6 +476,10 @@ pub const Device = struct {
     fn fireTimers(d: *Device, now: i64) ?i64 {
         var earliest: ?i64 = null;
         for (d.peers.items) |p| {
+            if (p.resolve) |*rv| {
+                if (rv.schedule.fire(now)) d.startLookup(p, now);
+                if (rv.schedule.next()) |t| earliest = if (earliest) |e| @min(e, t) else t;
+            }
             var guard: usize = 0;
             while (p.sess.next(now)) |t| {
                 if (t > now or guard == 8) {
@@ -432,6 +506,53 @@ pub const Device = struct {
         }
         if (a.initiate_handshake) d.sendInitiation(p, now);
         if (a.send_keepalive) d.sendData(p, &.{}, now);
+        // The far end did not answer our last initiation: its name may now
+        // point somewhere else (dynamic DNS).
+        if (a.handshake_retry and p.resolve != null) d.requestLookup(p, now);
+    }
+
+    // ---- endpoint names ---------------------------------------------------
+
+    fn requestLookup(d: *Device, p: *Peer, now: i64) void {
+        const rv = &p.resolve.?;
+        if (rv.schedule.request(now)) d.startLookup(p, now);
+    }
+
+    fn startLookup(d: *Device, p: *Peer, now: i64) void {
+        const rv = &p.resolve.?;
+        d.stats.endpoint_lookups += 1;
+        if (!d.resolver.?.start(rv.slot)) {
+            d.stats.endpoint_lookup_failures += 1;
+            rv.schedule.finished(now, false);
+        }
+    }
+
+    /// Answers of finished lookups (on the loop thread).
+    fn collectLookups(d: *Device, now: i64) void {
+        const rs = d.resolver orelse return;
+        for (d.peers.items) |p| {
+            const rv = if (p.resolve) |*r| r else continue;
+            const r = rs.take(rv.slot);
+            if (!r.done) continue;
+            rv.schedule.finished(now, r.result != null);
+            const addr = r.result orelse {
+                d.stats.endpoint_lookup_failures += 1;
+                log.info("peer {d}: endpoint name lookup failed; retrying", .{p.id});
+                continue;
+            };
+            // Something authenticated arrived since the lookup started:
+            // the endpoint it came from is the better one.
+            if (p.last_authenticated) |t| if (rv.schedule.last_start) |s| if (t >= s) continue;
+            const was = p.endpoint;
+            if (was) |w| if (w.eql(&addr)) continue;
+            p.endpoint = addr;
+            d.stats.endpoint_updates += 1;
+            log.info("peer {d}: endpoint name now resolves to {f}", .{ p.id, addr });
+            // No endpoint until now: nothing was sent, so no timer is
+            // armed; start the handshake if the peer wants traffic.
+            if (was == null and (p.persistent_keepalive != 0 or !p.staged.isEmpty()))
+                if (p.sess.wantHandshake(now)) d.sendInitiation(p, now);
+        }
     }
 
     fn retire(d: *Device, r: session.Retired) void {
@@ -647,6 +768,7 @@ pub const Device = struct {
         p.handshake_index = null;
         d.retire(p.sess.responderSession(&seed, now));
         p.endpoint = from;
+        p.last_authenticated = now;
         d.sendUdp(from, resp.asBytes());
         p.rx_bytes += msg.len;
         p.tx_bytes += noise.Response.size;
@@ -666,6 +788,7 @@ pub const Device = struct {
         p.handshake_index = null;
         d.retire(p.sess.initiatorSession(&seed, now));
         p.endpoint = from;
+        p.last_authenticated = now;
         p.rx_bytes += msg.len;
         p.last_handshake_wall_ns = d.clock.wall();
         if (p.staged.isEmpty()) {
@@ -686,6 +809,7 @@ pub const Device = struct {
         };
         // Authenticated: roam to wherever it came from.
         p.endpoint = from;
+        p.last_authenticated = now;
         p.rx_bytes += msg.len;
         d.retire(r.retired);
         if (r.confirmed) {
