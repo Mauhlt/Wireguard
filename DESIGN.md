@@ -370,7 +370,7 @@ from a source that cannot be a peer dropped before TCP or ICMP see them
 ::ffff:0:0/96.
 The device already drops inner packets whose source is not in the
 peer's AllowedIPs. Memory: buffers allocated per established
-connection, bounded by Limits (defaults: ~33 MiB worst case, rings ~1.4 MiB
+connection, bounded by Limits (defaults: ~34 MiB worst case, ~8 KiB fixed state per connection, rings ~1.4 MiB
 idle); wiped when freed.
 
 Tests: unit and state-machine tests inline (src/netstack/*.zig, manual

@@ -48,7 +48,7 @@ pub const Endpoint = struct {
 /// Hard bounds. Worst-case memory is about
 ///   max_connections * (send_buffer + recv_buffer)       stream buffers
 /// + 2 * ring_packets * mtu                               the two rings
-/// + max_connections * small fixed state (< 1 KiB)
+/// + max_connections * fixed state (~8 KiB: @sizeOf(tcp.Conn), mostly RACK's 256-record ring)
 /// (64 * 512 KiB + 2 * 512 * 1420 = ~33.4 MiB with the defaults; buffers
 /// are allocated when a connection is established and freed when it ends,
 /// so an idle stack holds only the rings).
