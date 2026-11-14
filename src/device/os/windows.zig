@@ -256,7 +256,12 @@ pub const Udp = struct {
                 // Oversized datagram (truncated) or a stale ICMP report:
                 // drop it and keep draining.
                 WSAEMSGSIZE, WSAECONNRESET, WSAENETRESET => continue,
-                else => return error.Unexpected,
+                // Clear the manual-reset event first: left set, the device
+                // loop would wake at once and spin on the same error.
+                else => {
+                    _ = ResetEvent(u.event);
+                    return error.Unexpected;
+                },
             };
             const from = fromSockaddr(&ss) orelse continue;
             return .{ .len = @intCast(n), .from = from };
