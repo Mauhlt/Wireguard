@@ -717,8 +717,8 @@ test "hostile: allocation-failure sweep over create / listen / dial / accept: no
 /// `Stream.debugConn` (which returns a copy of it).
 const ConnType = @typeInfo(@typeInfo(@TypeOf(ns.Stream.debugConn)).@"fn".return_type.?).optional.child;
 
-test "hostile: per-connection fixed state matches the Limits doc (< 1 KiB)" {
-    // root.zig: "max_connections * small fixed state (< 1 KiB)".
+test "hostile: per-connection fixed state matches the Limits doc (~8 KiB)" {
+    // root.zig: "max_connections * fixed state (~8 KiB: @sizeOf(tcp.Conn), ...)".
     std.debug.print("tcp.Conn is {d} bytes\n", .{@sizeOf(ConnType)});
-    try t.expect(@sizeOf(ConnType) < 1024);
+    try t.expect(@sizeOf(ConnType) <= 8 * 1024);
 }
