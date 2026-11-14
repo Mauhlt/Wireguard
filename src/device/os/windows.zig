@@ -90,6 +90,45 @@ extern "kernel32" fn CancelWaitableTimer(h: HANDLE) callconv(.winapi) c_int;
 extern "kernel32" fn GetSystemTimePreciseAsFileTime(ft: *i64) callconv(.winapi) void;
 const TIMER_ALL_ACCESS: u32 = 0x1F0003;
 
+// The stop event's security descriptor.
+const SECURITY_ATTRIBUTES = extern struct { length: u32 = @sizeOf(SECURITY_ATTRIBUTES), descriptor: ?*anyopaque, inherit: c_int = 0 };
+extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+extern "kernel32" fn LocalFree(mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "advapi32" fn OpenProcessToken(process: HANDLE, access: u32, token: *HANDLE) callconv(.winapi) c_int;
+extern "advapi32" fn GetTokenInformation(token: HANDLE, class: c_int, info: ?*anyopaque, len: u32, ret_len: *u32) callconv(.winapi) c_int;
+extern "advapi32" fn ConvertSidToStringSidW(sid: *anyopaque, out: *?[*:0]u16) callconv(.winapi) c_int;
+extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl: [*:0]const u16, revision: u32, sd: *?*anyopaque, size: ?*u32) callconv(.winapi) c_int;
+const TOKEN_QUERY: u32 = 0x0008;
+const TokenUser: c_int = 1;
+
+/// "D:P(A;;GA;;;SY)(A;;GA;;;<this user's SID>)": the stop event of a
+/// `zwg up` is this user's (elevated or not; SYSTEM for the service) and
+/// nobody else's: no other account in the session can signal it, open it
+/// or hold it. Caller LocalFrees the descriptor.
+fn userOnlyDescriptor() common.StopError!*anyopaque {
+    var token: HANDLE = undefined;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == 0) return error.Unexpected;
+    defer _ = CloseHandle(token);
+    var info: [256]u8 align(8) = undefined;
+    var len: u32 = 0;
+    if (GetTokenInformation(token, TokenUser, &info, info.len, &len) == 0) return error.Unexpected;
+    const sid: *anyopaque = @as(*const ?*anyopaque, @ptrCast(&info)).* orelse return error.Unexpected;
+    var sid_str: ?[*:0]u16 = null;
+    if (ConvertSidToStringSidW(sid, &sid_str) == 0) return error.Unexpected;
+    defer _ = LocalFree(sid_str);
+    const prefix = std.unicode.utf8ToUtf16LeStringLiteral("D:P(A;;GA;;;SY)(A;;GA;;;");
+    const s = std.mem.span(sid_str.?);
+    var buf: [prefix.len + 200]u16 = undefined;
+    if (s.len + 2 > buf.len - prefix.len) return error.Unexpected;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..][0..s.len], s);
+    buf[prefix.len + s.len] = ')';
+    buf[prefix.len + s.len + 1] = 0;
+    var sd: ?*anyopaque = null;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(buf[0 .. prefix.len + s.len + 1 :0].ptr, 1, &sd, null) == 0) return error.Unexpected;
+    return sd.?;
+}
+
 const INFINITE: u32 = 0xFFFF_FFFF;
 const WAIT_TIMEOUT: u32 = 258;
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;
@@ -349,7 +388,10 @@ pub const StopSignal = struct {
     pub fn create(name: []const u8) common.StopError!StopSignal {
         var wbuf: [128]u16 = undefined;
         const w = try eventName(&wbuf, name);
-        const h = CreateEventW(null, 1, 0, w) orelse return error.Unexpected;
+        const sd = try userOnlyDescriptor();
+        defer _ = LocalFree(sd);
+        var sa: SECURITY_ATTRIBUTES = .{ .descriptor = sd };
+        const h = CreateEventW(&sa, 1, 0, w) orelse return error.Unexpected;
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
             _ = CloseHandle(h);
             return error.AlreadyRunning;
@@ -435,4 +477,39 @@ test "the device's port cannot be taken over with SO_REUSEADDR (SO_EXCLUSIVEADDR
     try std.testing.expect(e == WSAEACCES or e == WSAEADDRINUSE);
     // A plain second open of the same port is refused as well.
     try std.testing.expectError(error.AddressInUse, Udp.openScoped(.v4, port, .loopback));
+}
+
+test "the stop event has an explicit DACL: SYSTEM and this user only" {
+    const S = struct {
+        extern "advapi32" fn GetSecurityInfo(h: HANDLE, kind: c_int, info: u32, owner: ?*?*anyopaque, group: ?*?*anyopaque, dacl: ?*?*Acl, sacl: ?*?*anyopaque, sd: *?*anyopaque) callconv(.winapi) u32;
+        extern "advapi32" fn GetSecurityDescriptorControl(sd: *anyopaque, control: *u16, revision: *u32) callconv(.winapi) c_int;
+        const Acl = extern struct { revision: u8, sbz1: u8, size: u16, ace_count: u16, sbz2: u16 };
+    };
+    var s = try StopSignal.create("zwg-test-dacl");
+    defer s.close();
+    var dacl: ?*S.Acl = null;
+    var sd: ?*anyopaque = null;
+    const SE_KERNEL_OBJECT: c_int = 6;
+    const DACL_SECURITY_INFORMATION: u32 = 4;
+    try std.testing.expectEqual(@as(u32, 0), S.GetSecurityInfo(s.handle, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, null, null, &dacl, null, &sd));
+    defer _ = LocalFree(sd);
+    try std.testing.expectEqual(@as(u16, 2), dacl.?.ace_count);
+    var control: u16 = 0;
+    var rev: u32 = 0;
+    try std.testing.expect(S.GetSecurityDescriptorControl(sd.?, &control, &rev) != 0);
+    try std.testing.expect(control & 0x1000 != 0); // SE_DACL_PROTECTED
+    // Another account in the same session (this token with our user SID
+    // deny-only: the logon SID and every group stay) cannot open it; the
+    // default DACL would have let the logon session in.
+    {
+        const w32 = @import("../../service/win32.zig");
+        const t = try w32.restrictedToken(true);
+        defer _ = CloseHandle(t);
+        try std.testing.expect(w32.ImpersonateLoggedOnUser(t) != 0);
+        defer _ = w32.RevertToSelf();
+        try std.testing.expectError(error.NotRunning, StopSignal.signalExisting("zwg-test-dacl"));
+    }
+    // `zwg down` (same user) can still signal it.
+    try StopSignal.signalExisting("zwg-test-dacl");
+    try std.testing.expectEqual(@as(?usize, 0), try wait(&.{s.waitHandle()}, std.time.ns_per_s));
 }
