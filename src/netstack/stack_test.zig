@@ -396,3 +396,281 @@ test "bulk stream: write stops at the unsent low-watermark; interactive goes fir
     try t.expectEqual(@as(u16, 40001), first.dst_port);
     try t.expectEqualStrings("key", first.payload);
 }
+
+/// Two manually driven stacks joined by an in-process link with seeded
+/// loss and reordering. When the link is idle the shared clock jumps to
+/// the earliest timer deadline, so a run is fast and deterministic.
+const Link = struct {
+    clock: root.Clock,
+    a: *root.Stack,
+    b: *root.Stack,
+    prng: std.Random.DefaultPrng,
+    loss_ppm: u32,
+    reorder_ppm: u32,
+    dup_ppm: u32 = 0,
+    held: ?struct { to_b: bool, len: usize } = null,
+    held_buf: [2048]u8 = undefined,
+    buf: [2048]u8 = undefined,
+    dropped: usize = 0,
+
+    fn init(l: *Link, seed: u64, loss_ppm: u32, reorder_ppm: u32, limits: root.Limits) !void {
+        l.* = .{ .clock = .{ .io = t.io }, .a = undefined, .b = undefined, .prng = .init(seed), .loss_ppm = loss_ppm, .reorder_ppm = reorder_ppm };
+        l.a = try root.Stack.create(t.allocator, &l.clock, .{ .address = stack_addr, .limits = limits });
+        l.b = try root.Stack.create(t.allocator, &l.clock, .{ .address = peer_addr, .limits = limits });
+    }
+
+    fn deinit(l: *Link) void {
+        l.a.destroy();
+        l.b.destroy();
+    }
+
+    fn hit(l: *Link, ppm: u32) bool {
+        return ppm != 0 and l.prng.random().uintLessThan(u32, 1_000_000) < ppm;
+    }
+
+    /// Moves every pending packet once; returns how many moved.
+    fn pump(l: *Link) usize {
+        var moved: usize = 0;
+        for ([_]bool{ true, false }) |to_b| {
+            const from = if (to_b) l.a else l.b;
+            const to = if (to_b) l.b else l.a;
+            while (from.output(&l.buf)) |p| {
+                moved += 1;
+                if (l.hit(l.loss_ppm)) {
+                    l.dropped += 1;
+                    continue;
+                }
+                if (l.held == null and l.hit(l.reorder_ppm)) {
+                    @memcpy(l.held_buf[0..p.len], p);
+                    l.held = .{ .to_b = to_b, .len = p.len };
+                    continue;
+                }
+                to.input(p);
+                if (l.hit(l.dup_ppm)) to.input(p);
+                if (l.held) |h| {
+                    l.held = null;
+                    (if (h.to_b) l.b else l.a).input(l.held_buf[0..h.len]);
+                }
+            }
+        }
+        return moved;
+    }
+
+    /// Runs until `done` or no packet and no timer is left.
+    fn run(l: *Link, ctx: anytype, comptime done: fn (@TypeOf(ctx)) bool) !void {
+        var idle_rounds: usize = 0;
+        while (true) {
+            ctx.step();
+            if (done(ctx)) return;
+            if (l.pump() > 0) {
+                idle_rounds = 0;
+                continue;
+            }
+            if (l.held) |h| {
+                l.held = null;
+                (if (h.to_b) l.b else l.a).input(l.held_buf[0..h.len]);
+                continue;
+            }
+            const da = l.a.runTimers();
+            const db = l.b.runTimers();
+            if (l.pump() > 0) continue; // a timer that was already due fired
+            const d = if (da != null and db != null) @min(da.?, db.?) else da orelse db orelse return error.Stalled;
+            const now = l.clock.now();
+            if (d > now) l.clock.advance(d - now);
+            _ = l.a.runTimers();
+            _ = l.b.runTimers();
+            idle_rounds += 1;
+            if (idle_rounds > 10_000) return error.Stalled;
+        }
+    }
+};
+
+const Both = struct {
+    ab: Transfer,
+    ba: Transfer,
+    fn step(x: *Both) void {
+        x.ab.step();
+        x.ba.step();
+    }
+    fn done(x: *Both) bool {
+        return x.ab.eof and x.ba.eof;
+    }
+};
+
+fn bothWays(seed: u64, loss_ppm: u32, reorder_ppm: u32, dup_ppm: u32, size: usize) !void {
+    var l: Link = undefined;
+    try l.init(seed, loss_ppm, reorder_ppm, .{});
+    defer l.deinit();
+    l.dup_ppm = dup_ppm;
+    const lis = try l.b.listen(8420);
+    const c = try l.a.dial(.{ .addr = peer_addr, .port = 8420 });
+    var srv: ?root.Stream = null;
+    var guard: usize = 0;
+    while (srv == null) : (guard += 1) {
+        if (guard > 1000) return error.NoAccept;
+        if (l.pump() == 0) {
+            const d = l.a.runTimers() orelse l.b.runTimers() orelse return error.Stalled;
+            const now = l.clock.now();
+            if (d > now) l.clock.advance(d - now);
+            _ = l.a.runTimers();
+            _ = l.b.runTimers();
+        }
+        srv = lis.accept() catch null;
+    }
+    const d1 = try t.allocator.alloc(u8, size);
+    defer t.allocator.free(d1);
+    const d2 = try t.allocator.alloc(u8, size);
+    defer t.allocator.free(d2);
+    var prng = std.Random.DefaultPrng.init(seed);
+    prng.random().bytes(d1);
+    prng.random().bytes(d2);
+    var x: Both = .{ .ab = .{ .tx = c, .rx = srv.?, .data = d1 }, .ba = .{ .tx = srv.?, .rx = c, .data = d2 } };
+    defer x.ab.got.deinit(t.allocator);
+    defer x.ba.got.deinit(t.allocator);
+    l.run(&x, Both.done) catch |e| {
+        var pr: [1]u8 = undefined;
+        std.debug.print("errors: a={any} b={any}\n", .{ c.read(&pr), srv.?.read(&pr) });
+        for ([_]root.Stream{ c, srv.? }) |s| if (s.debugConn()) |k| std.debug.print("  {t} una={d} nxt={d} max={d} base={d} wnd={d} cwnd={d} ssth={d} rec={} rcv_nxt={d} rcvlen={d} ooo={d} unsent={d} sndlen={d} rto_at={?d} persist={?d} rto={d} backoff={d} fin_q={} eof={} err={?}\n", .{ k.state, k.snd_una, k.snd_nxt, k.snd_max, k.snd_base, k.snd_wnd, k.cwnd, k.ssthresh, k.in_recovery, k.rcv_nxt, k.rcv.len, k.ooo_len, k.unsent(), k.snd.len, k.rto_at, k.persist_at, k.rto, k.backoff, k.fin_queued, k.eof, k.err }) else std.debug.print("  (stale)\n", .{});
+        if (l.a.output(&l.buf)) |p| std.debug.print("a would send {any}\n", .{(try wire.parseTcp4(p)).tcp}) else std.debug.print("a sends nothing\n", .{});
+        std.debug.print("stalled both ways (seed {d}): ab sent {d} got {d}, ba sent {d} got {d}, dropped {d}\n  a={any}\n  b={any}\n", .{ seed, x.ab.sent, x.ab.got.items.len, x.ba.sent, x.ba.got.items.len, l.dropped, c.status(), srv.?.status() });
+        return e;
+    };
+    try t.expectEqualSlices(u8, d1, x.ab.got.items);
+    try t.expectEqualSlices(u8, d2, x.ba.got.items);
+}
+
+test "both ends in go-back-N after a blackout still recover (pure ACKs at snd_max)" {
+    var l: Link = undefined;
+    try l.init(99, 0, 0, .{});
+    defer l.deinit();
+    const lis = try l.b.listen(8420);
+    const c = try l.a.dial(.{ .addr = peer_addr, .port = 8420 });
+    _ = l.pump();
+    _ = l.pump();
+    const s = try lis.accept();
+    var data: [8 * 1380]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 7);
+    _ = try c.write(&data);
+    _ = try s.write(&data);
+    // Both send their whole window before hearing from the other (so no
+    // segment acknowledges the other's data), the data crosses, and every
+    // ACK after that is lost: both time out and go back to snd_una while
+    // the peer already holds everything.
+    var buf: [2048]u8 = undefined;
+    var from_a: std.ArrayList([]u8) = .empty;
+    var from_b: std.ArrayList([]u8) = .empty;
+    defer {
+        for (from_a.items) |p| t.allocator.free(p);
+        for (from_b.items) |p| t.allocator.free(p);
+        from_a.deinit(t.allocator);
+        from_b.deinit(t.allocator);
+    }
+    while (l.a.output(&buf)) |p| try from_a.append(t.allocator, try t.allocator.dupe(u8, p));
+    while (l.b.output(&buf)) |p| try from_b.append(t.allocator, try t.allocator.dupe(u8, p));
+    try t.expect(from_a.items.len >= 8 and from_b.items.len >= 8);
+    for (from_a.items) |p| l.b.input(p);
+    for (from_b.items) |p| l.a.input(p);
+    while (l.a.output(&buf)) |_| {} // ACKs: lost
+    while (l.b.output(&buf)) |_| {}
+    const rto_at = l.a.runTimers() orelse return error.NoTimer;
+    const t_now = l.clock.now();
+    if (rto_at > t_now) l.clock.advance(rto_at - t_now + std.time.ns_per_ms);
+    _ = l.a.runTimers();
+    _ = l.b.runTimers();
+    try t.expect(c.debugConn().?.snd_nxt != c.debugConn().?.snd_max);
+    try t.expect(s.debugConn().?.snd_nxt != s.debugConn().?.snd_max);
+    // Now the link is clean: both must drain completely.
+    var guard: usize = 0;
+    while (guard < 1000) : (guard += 1) {
+        if (l.pump() == 0) {
+            const ka = c.debugConn().?;
+            const kb = s.debugConn().?;
+            if (ka.snd_una == ka.snd_max and kb.snd_una == kb.snd_max) break;
+            const d = l.a.runTimers() orelse l.b.runTimers() orelse return error.Stalled;
+            const now = l.clock.now();
+            if (d > now) l.clock.advance(d - now);
+            _ = l.a.runTimers();
+            _ = l.b.runTimers();
+        }
+    }
+    try t.expectEqual(c.debugConn().?.snd_max, c.debugConn().?.snd_una);
+    try t.expectEqual(s.debugConn().?.snd_max, s.debugConn().?.snd_una);
+    var got: [data.len]u8 = undefined;
+    try t.expectEqual(data.len, try c.read(&got));
+    try t.expectEqualSlices(u8, &data, &got);
+}
+
+test "two stacks, both directions at once, loss + reordering + duplication" {
+    for (0..40) |seed| try bothWays(seed + 10, 10_000, 10_000, 2_000, 1 << 20);
+}
+
+const Transfer = struct {
+    tx: root.Stream,
+    rx: root.Stream,
+    data: []const u8,
+    sent: usize = 0,
+    got: std.ArrayList(u8) = .empty,
+    eof: bool = false,
+
+    fn step(x: *Transfer) void {
+        while (x.sent < x.data.len) {
+            const n = x.tx.write(x.data[x.sent..]) catch break;
+            x.sent += n;
+            if (x.sent == x.data.len) x.tx.shutdown();
+        }
+        var buf: [16 * 1024]u8 = undefined;
+        while (true) {
+            const n = x.rx.read(&buf) catch break;
+            if (n == 0) {
+                x.eof = true;
+                break;
+            }
+            x.got.appendSlice(t.allocator, buf[0..n]) catch @panic("oom");
+        }
+    }
+
+    fn done(x: *Transfer) bool {
+        return x.eof;
+    }
+};
+
+fn lossyTransfer(seed: u64, loss_ppm: u32, reorder_ppm: u32, size: usize) !void {
+    var l: Link = undefined;
+    try l.init(seed, loss_ppm, reorder_ppm, .{ .recv_buffer = 64 * 1024, .send_buffer = 64 * 1024 });
+    defer l.deinit();
+    const lis = try l.b.listen(8420);
+    const c = try l.a.dial(.{ .addr = peer_addr, .port = 8420 });
+    var srv: ?root.Stream = null;
+    var guard: usize = 0;
+    while (srv == null) : (guard += 1) {
+        if (guard > 1000) return error.NoAccept;
+        if (l.pump() == 0) {
+            const d = l.a.runTimers() orelse l.b.runTimers() orelse return error.Stalled;
+            const now = l.clock.now();
+            if (d > now) l.clock.advance(d - now);
+            _ = l.a.runTimers();
+            _ = l.b.runTimers();
+        }
+        srv = lis.accept() catch null;
+    }
+    const data = try t.allocator.alloc(u8, size);
+    defer t.allocator.free(data);
+    var prng = std.Random.DefaultPrng.init(seed);
+    prng.random().bytes(data);
+    var x: Transfer = .{ .tx = c, .rx = srv.?, .data = data };
+    defer x.got.deinit(t.allocator);
+    l.run(&x, Transfer.done) catch |e| {
+        std.debug.print("stalled: sent {d} got {d} dropped {d} a={any} b={any}\n", .{ x.sent, x.got.items.len, l.dropped, c.status(), srv.?.status() });
+        return e;
+    };
+    try t.expectEqualSlices(u8, data, x.got.items);
+    const st = l.a.stats();
+    std.debug.print("lossy link seed {d} loss {d} reorder {d}: {d} KiB in {d} ms simulated, rto {d} fast {d} retrans {d} dropped {d}\n", .{ seed, loss_ppm, reorder_ppm, size / 1024, @divTrunc(l.clock.offset_ns.load(.monotonic), std.time.ns_per_ms), st.rto_expirations, st.fast_retransmits, st.retransmits, l.dropped });
+}
+
+test "two stacks over a lossy, reordering link: data intact" {
+    try lossyTransfer(1, 0, 0, 1 << 20);
+    try lossyTransfer(2, 10_000, 0, 1 << 20);
+    try lossyTransfer(3, 10_000, 10_000, 1 << 20);
+    try lossyTransfer(4, 50_000, 20_000, 256 << 10);
+}

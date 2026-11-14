@@ -145,6 +145,8 @@ pub const Stats = struct {
     rst_sent: u64 = 0,
     retransmits: u64 = 0,
     fast_retransmits: u64 = 0,
+    /// Retransmission timer expirations (each a go-back-N restart).
+    rto_expirations: u64 = 0,
     timeouts: u64 = 0,
     icmp_echo_replies: u64 = 0,
     connections: u16 = 0,
@@ -176,4 +178,5 @@ test {
     _ = stack_impl;
     _ = @import("tcp.zig");
     _ = @import("stack_test.zig");
+    _ = @import("fuzz.zig");
 }

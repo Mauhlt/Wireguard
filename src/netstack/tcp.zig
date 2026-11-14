@@ -38,6 +38,9 @@ const min_peer_mss: u16 = 64;
 pub const initial_cwnd_segments = 10;
 /// Storage bound for out-of-order ranges (Limits.max_ooo_segments <= this).
 pub const max_ooo_ranges = 64;
+/// Duplicate ACKs owed at most (one per out-of-order segment): enough for
+/// the sender's fast retransmit (3) and some NewReno window inflation.
+const max_dup_acks_owed = 8;
 
 pub const ConnError = error{ ConnectionRefused, ConnectionReset, ConnectionTimedOut };
 
@@ -191,6 +194,10 @@ pub const Conn = struct {
     // what to send
     send_syn: bool = false,
     ack_now: bool = false,
+    /// Separate duplicate ACKs to send (RFC 5681 4.2: one per out-of-order
+    /// segment, at once). A flag would merge a burst of them into one and
+    /// the sender would never see three.
+    dup_acks_owed: u8 = 0,
     unacked_segs: u8 = 0,
     probe_now: bool = false,
     retransmit_one: bool = false,
@@ -651,7 +658,7 @@ pub const Conn = struct {
                 c.snd_wnd == old_wnd and c.snd_max != c.snd_una)
             {
                 c.dupacks += 1;
-                if (c.dupacks == 3 and !c.in_recovery) {
+                if (c.dupacks == c.dupThreshold() and !c.in_recovery) {
                     // RFC 6582 3.2 step 2: only if this is not a loss we
                     // already recovered from (ack - 1 > recover).
                     if (seqLt(c.recover, ack -% 1) or c.recover == c.iss) {
@@ -711,6 +718,16 @@ pub const Conn = struct {
         return true;
     }
 
+    /// Duplicate ACKs that trigger fast retransmit: 3, or fewer when fewer
+    /// than 4 segments are outstanding and there is no new data to send
+    /// (Early Retransmit, RFC 5827): with so little in flight a single
+    /// loss could never produce 3 and would wait for the RTO.
+    fn dupThreshold(c: *const Conn) u32 {
+        const outstanding = (c.snd_max -% c.snd_una + c.mss - 1) / c.mss;
+        if (c.unsent() == 0 and outstanding < 4) return @max(outstanding -| 1, 1);
+        return 3;
+    }
+
     fn sampleRtt(c: *Conn, now: i64) void {
         const r = @max(now - c.rtt_start, 0);
         if (c.srtt == 0) {
@@ -745,6 +762,7 @@ pub const Conn = struct {
             // Out of order: store in place, remember the range, ACK now
             // (the duplicate ACK drives the sender's fast retransmit).
             c.ack_now = true;
+            if (c.dup_acks_owed < max_dup_acks_owed) c.dup_acks_owed += 1;
             if (!c.addRange(env, seq, seq +% len32(data.len))) {
                 env.stats.dropped_ooo += 1;
                 return;
@@ -864,7 +882,7 @@ pub const Conn = struct {
                 out.notify = true;
                 return out;
             }
-            env.stats.retransmits += 1;
+            env.stats.rto_expirations += 1;
             // RFC 5681 (4): loss window; RFC 6298 5.5: back off.
             const fl = c.snd_max -% c.snd_una;
             c.ssthresh = @max(fl / 2, 2 * @as(u32, c.mss));
@@ -910,17 +928,25 @@ pub const Conn = struct {
             .syn_sent => return if (c.send_syn) c.emitSyn(env, buf, ip_id, false) else null,
             .syn_received => {
                 if (c.send_syn) return c.emitSyn(env, buf, ip_id, true);
-                if (c.ack_now) return c.emit(env, buf, ip_id, c.snd_nxt, .{}, &.{});
+                if (c.ack_now) return c.pureAck(env, buf, ip_id);
                 return null;
             },
             .time_wait, .fin_wait_2 => {
                 if (c.ack_now or c.probe_now) {
                     c.probe_now = false;
-                    return c.emit(env, buf, ip_id, c.snd_nxt, .{}, &.{});
+                    return c.pureAck(env, buf, ip_id);
                 }
                 return null;
             },
             else => {},
+        }
+
+        // Owed duplicate ACKs first: pure ACKs, each one separate.
+        if (c.dup_acks_owed > 0) {
+            c.dup_acks_owed -= 1;
+            const p = c.pureAck(env, buf, ip_id);
+            if (c.dup_acks_owed > 0) c.ack_now = true;
+            return p;
         }
 
         if (class == .any) {
@@ -945,8 +971,18 @@ pub const Conn = struct {
             c.probe_now = false;
             return c.emit(env, buf, ip_id, c.snd_una -% 1, .{}, &.{});
         }
-        if (c.ack_now) return c.emit(env, buf, ip_id, c.snd_nxt, .{}, &.{});
+        if (c.ack_now) return c.pureAck(env, buf, ip_id);
         return null;
+    }
+
+    /// An ACK without data. Its sequence number is snd_max, not snd_nxt
+    /// (BSD tcp_output does the same): after a retransmission timeout
+    /// snd_nxt is rolled back to snd_una, and the peer, which may already
+    /// hold everything up to snd_max, would find a pure ACK at snd_nxt
+    /// "unacceptable" and drop it unprocessed. With both ends in that
+    /// state the connection would never recover.
+    fn pureAck(c: *Conn, env: *const Env, buf: []u8, ip_id: u16) ?[]u8 {
+        return c.emit(env, buf, ip_id, c.snd_max, .{}, &.{});
     }
 
     /// New (or go-back-N) data within min(snd_wnd, cwnd), or a FIN.
@@ -956,7 +992,11 @@ pub const Conn = struct {
         const fin_pending = c.fin_queued and seqLe(c.snd_nxt, c.finSeq());
         if (left == 0 and !fin_pending) return null;
         const fl = c.flight();
-        const avail = @min(c.snd_wnd, c.cwnd) -| fl;
+        // Limited Transmit (RFC 3042): on the first and second duplicate
+        // ACK one new segment each, beyond cwnd, so that a loss in a small
+        // window still produces the three duplicates fast retransmit needs.
+        const limited: u32 = if (!c.in_recovery and c.dupacks > 0 and c.dupacks < 3) c.dupacks * @as(u32, c.mss) else 0;
+        const avail = @min(c.snd_wnd, c.cwnd +| limited) -| fl;
         const n = @min(@min(left, c.mss), avail);
         // Sender SWS avoidance (RFC 9293 3.8.6.2.1): a full segment, all
         // that is left, or nothing in flight. No Nagle: small writes go
@@ -990,9 +1030,9 @@ pub const Conn = struct {
         if (c.fin_queued and seq +% n == c.finSeq()) flags.fin = true;
         if (n == 0 and !flags.fin) return null;
         const end = seq +% n +% @intFromBool(flags.fin);
-        if (retransmit) {
-            env.stats.retransmits += 1;
-        } else {
+        // Anything below snd_max was sent before (go-back-N or fast retransmit).
+        if (retransmit or seqLt(seq, c.snd_max)) env.stats.retransmits += 1;
+        if (!retransmit) {
             // Karn: time only segments never sent before.
             if (c.rtt_seq == null and c.backoff == 0 and seqLe(c.snd_max, seq)) {
                 c.rtt_seq = end;

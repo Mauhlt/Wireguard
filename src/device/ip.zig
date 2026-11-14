@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const net = std.Io.net;
+const TunCidr = @import("../tun/root.zig").Cidr;
 
 pub const Family = enum { v4, v6 };
 
@@ -79,6 +80,14 @@ pub const Cidr = struct {
         } else max;
         if (prefix > max) return error.InvalidPrefix;
         return .{ .addr = addr, .prefix = prefix };
+    }
+
+    /// The same prefix as the TUN layer's type (`Tun.setAddress` / `addRoute`).
+    pub fn toTun(c: Cidr) TunCidr {
+        return switch (c.addr) {
+            .v4 => |b| TunCidr.ip4(b, c.prefix),
+            .v6 => |b| TunCidr.ip6(b, c.prefix),
+        };
     }
 
     /// The prefix with host bits cleared (what routing uses).

@@ -277,7 +277,9 @@ pub const Tcp = struct {
 
     /// Sequence space the segment occupies (payload + SYN + FIN).
     pub fn segLen(t: Tcp) u32 {
-        return @as(u32, @intCast(t.payload.len)) + @intFromBool(t.flags.syn) + @intFromBool(t.flags.fin);
+        // Saturating: parsed payloads are < 64 KiB, but a hand-built Tcp may be anything.
+        const n = std.math.cast(u32, t.payload.len) orelse std.math.maxInt(u32);
+        return n +| @intFromBool(t.flags.syn) +| @intFromBool(t.flags.fin);
     }
 
     pub fn headerLen(t: Tcp) usize {

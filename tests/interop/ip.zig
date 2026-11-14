@@ -1,17 +1,11 @@
 //! Tiny IPv4 + UDP packet builder/parser for the interop drivers (the
 //! traffic we push through tunnels and expect back).
 const std = @import("std");
+/// The one Internet checksum / IPv4 header codec (src/netstack/wire.zig).
+const wire = @import("WireGuard").netstack.wire;
+const checksum = wire.checksum;
 
 pub const header_len = 20 + 8;
-
-fn checksum(data: []const u8) u16 {
-    var sum: u32 = 0;
-    var i: usize = 0;
-    while (i + 1 < data.len) : (i += 2) sum += std.mem.readInt(u16, data[i..][0..2], .big);
-    if (i < data.len) sum += @as(u32, data[i]) << 8;
-    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
-    return ~@as(u16, @truncate(sum));
-}
 
 /// IPv4/UDP datagram src:sport -> dst:dport carrying `payload`. UDP checksum
 /// is computed (Windows accepts 0 too, but some stacks count it as an error).
@@ -19,17 +13,8 @@ pub fn buildUdp4(out: []u8, src: [4]u8, sport: u16, dst: [4]u8, dport: u16, payl
     const total = header_len + payload.len;
     std.debug.assert(out.len >= total and total <= 0xffff);
     const p = out[0..total];
-    p[0] = 0x45; // v4, IHL 5
-    p[1] = 0;
-    std.mem.writeInt(u16, p[2..4], @intCast(total), .big);
-    std.mem.writeInt(u16, p[4..6], id, .big);
-    std.mem.writeInt(u16, p[6..8], 0x4000, .big); // DF
-    p[8] = 64; // TTL
-    p[9] = 17; // UDP
-    @memset(p[10..12], 0);
-    p[12..16].* = src;
-    p[16..20].* = dst;
-    std.mem.writeInt(u16, p[10..12], checksum(p[0..20]), .big);
+    // IPv4 header: DF, TTL 64, protocol UDP, checksum filled in.
+    (wire.Ip4{ .id = id, .protocol = 17, .src = src, .dst = dst }).write(p, 8 + payload.len) catch @panic("buildUdp4: packet too large");
 
     const u = p[20..];
     std.mem.writeInt(u16, u[0..2], sport, .big);
@@ -39,14 +24,9 @@ pub fn buildUdp4(out: []u8, src: [4]u8, sport: u16, dst: [4]u8, dport: u16, payl
     @memcpy(u[8..][0..payload.len], payload);
 
     // Pseudo-header checksum.
-    var pseudo: [12 + 65535]u8 = undefined;
-    pseudo[0..4].* = src;
-    pseudo[4..8].* = dst;
-    pseudo[8] = 0;
-    pseudo[9] = 17;
-    std.mem.writeInt(u16, pseudo[10..12], @intCast(8 + payload.len), .big);
-    @memcpy(pseudo[12..][0..u.len], u);
-    var c = checksum(pseudo[0 .. 12 + u.len]);
+    var sum = wire.pseudoHeader(.{ .v4 = src }, .{ .v4 = dst }, 17, @intCast(u.len));
+    sum.add(u);
+    var c = sum.final();
     if (c == 0) c = 0xffff;
     std.mem.writeInt(u16, u[6..8], c, .big);
     return p;
