@@ -8,4 +8,5 @@ test {
     _ = @import("vlink.zig");
     _ = @import("priority.zig");
     _ = @import("concurrency.zig");
+    _ = @import("sack.zig");
 }
