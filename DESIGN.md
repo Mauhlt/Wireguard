@@ -132,6 +132,10 @@ event loop: waits on {UDP readable, TUN readable, earliest timer deadline};
 outbound: TUN → route by dst IP → peer → encrypt → UDP; inbound: UDP →
 type dispatch → noise / decrypt → check source IP against allowed IPs → TUN.
 A small CLI `zwg` (up/down a .conf, show status like `wg show`, genkey/pubkey).
+`Device.setPeers` replaces the peer table while the tunnel runs (any thread;
+applied on the loop thread through its waker, all checks and allocations
+before the first change): kept peers keep their sessions, removed ones are
+wiped, a new preshared key drops that peer's sessions.
 
 ## tun (src/tun)
 
