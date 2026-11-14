@@ -69,6 +69,11 @@ pub const Limits = struct {
     ring_packets: u32 = 512,
     /// TIME-WAIT duration (2*MSL; short: both ends are ours, one hop).
     time_wait_ns: u64 = 2 * std.time.ns_per_s,
+    /// An orphaned FIN-WAIT-2 (the application closed, the peer ACKed our
+    /// FIN but never sends its own) is freed after this long (like Linux
+    /// tcp_fin_timeout). A half-closed stream the application still holds
+    /// (shutdown) keeps waiting.
+    fin_wait2_ns: u64 = 30 * std.time.ns_per_s,
     /// A connect or a retransmission that gets no answer for this long
     /// fails the connection with error.ConnectionTimedOut.
     user_timeout_ns: u64 = 60 * std.time.ns_per_s,

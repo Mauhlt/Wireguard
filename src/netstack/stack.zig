@@ -509,7 +509,15 @@ pub const Stack = struct {
             }
         }
         if (out.notify) s.notifySlot(sl);
+        s.orphanTimers(sl);
         s.maybeRelease(i);
+    }
+
+    /// Arms the orphaned FIN-WAIT-2 deadline once the host has let go.
+    fn orphanTimers(s: *Stack, sl: *Slot) void {
+        if (sl.handle_open or sl.conn.state != .fin_wait_2) return;
+        const e = s.env(s.clock.now());
+        sl.conn.orphanFinWait2(&e);
     }
 
     /// RST the peer (if it knows the connection) and fail it locally.
@@ -1063,6 +1071,7 @@ pub const Stream = struct {
         sl.handle_open = false;
         sl.gen +%= 1;
         s.notifySlot(sl);
+        s.orphanTimers(sl);
         s.maybeRelease(i);
         s.kickThread();
     }

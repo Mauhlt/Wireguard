@@ -1086,6 +1086,14 @@ pub const Conn = struct {
         c.giveup_at = null;
     }
 
+    /// The application released the connection: an orphaned FIN-WAIT-2
+    /// ends after Limits.fin_wait2_ns (the TIME-WAIT deadline is reused; a
+    /// FIN from the peer moves it to TIME-WAIT as usual).
+    pub fn orphanFinWait2(c: *Conn, env: *const Env) void {
+        if (c.state != .fin_wait_2 or c.timewait_at != null) return;
+        c.timewait_at = env.now +| nsI64(env.limits.fin_wait2_ns);
+    }
+
     pub fn fail(c: *Conn, e: ConnError) void {
         c.err = e;
         c.state = .closed;
@@ -1138,7 +1146,9 @@ pub const Conn = struct {
 
     pub fn nextDeadline(c: *const Conn) ?i64 {
         var d: ?i64 = null;
-        for ([_]?i64{ c.rto_at, c.delack_at, c.persist_at, c.keepalive_at, c.timewait_at, c.tlp_at, c.giveup_at }) |t| {
+        // giveup_at is stale once an ACK cleared stalled_since: no wakeup.
+        const giveup = if (c.stalled_since != null) c.giveup_at else null;
+        for ([_]?i64{ c.rto_at, c.delack_at, c.persist_at, c.keepalive_at, c.timewait_at, c.tlp_at, giveup }) |t| {
             if (t) |v| d = if (d) |x| @min(x, v) else v;
         }
         return d;
@@ -1158,10 +1168,9 @@ pub const Conn = struct {
             c.ack_now = true;
             out.output = true;
         };
-        if (c.giveup_at) |t| if (now >= t) {
+        if (c.giveup_at) |t| if (now >= t and c.stalled_since != null) {
             c.giveup_at = null;
-            // Stale if an ACK made progress since (stalled_since cleared).
-            if (c.stalled_since != null and c.rto_at != null) return c.giveUp(env);
+            if (c.rto_at != null) return c.giveUp(env);
         };
         if (c.tlp_at) |t| if (now >= t) {
             c.tlp_at = null;
