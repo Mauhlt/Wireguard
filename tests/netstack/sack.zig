@@ -359,8 +359,11 @@ test "sack: reneging peer (SACKs data it never kept): data retransmitted after R
 test "sack: more holes than the scoreboard holds: falls back, still completes, no worse than NewReno" {
     try needSack();
     if (comptime !has_sack) return;
-    const with = try runSender(.{ .strategy = .many_holes, .loss_ppm = 0 });
-    const without = try runSender(.{ .strategy = .many_holes, .loss_ppm = 0, .offer_sack = false });
+    // A virtual RTT: with rtt_ns = 0 every RTT sample (and so RACK's
+    // reo_wnd = min_RTT / 4) is microseconds of real time, which a busy
+    // machine changes from run to run; the comparison then flaked.
+    const with = try runSender(.{ .strategy = .many_holes, .loss_ppm = 0, .rtt_ns = 20 * ms });
+    const without = try runSender(.{ .strategy = .many_holes, .loss_ppm = 0, .offer_sack = false, .rtt_ns = 20 * ms });
     // The scoreboard fallback must not make recovery slower than plain
     // NewReno on the same loss pattern (10% slack).
     try t.expect(with.virtual_ns * 10 <= without.virtual_ns * 11 + 10 * hz.ms);

@@ -371,9 +371,14 @@ test "hostile: memory stays within the Limits formula with every connection busy
         _ = h.drain();
         peak = @max(peak, h.liveBytes());
     }
+    // root.zig's Limits doc: buffers + the two rings + per-connection fixed
+    // state. That state is the connection record (tcp.Conn, RACK's ring
+    // included); its size comes from the type, not from slack. The doc's
+    // "< 1 KiB" is checked separately (see the next test).
+    const conn_state = @sizeOf(ConnType) + 64; // + the slot's bookkeeping
     const bound = @as(usize, limits.max_connections) * (limits.send_buffer + limits.recv_buffer) +
-        2 * @as(usize, limits.ring_packets) * 1420 + @as(usize, limits.max_connections) * 1024 + 64 * 1024;
-    std.debug.print("netstack memory: peak {d} bytes, bound {d}\n", .{ peak, bound });
+        2 * @as(usize, limits.ring_packets) * 1420 + @as(usize, limits.max_connections) * conn_state + 64 * 1024;
+    std.debug.print("netstack memory: peak {d} bytes, bound {d} (fixed state {d} bytes per connection)\n", .{ peak, bound, conn_state });
     try t.expect(peak <= bound);
     for (&conns) |*c| c.stream.abort();
 }
@@ -707,4 +712,13 @@ test "hostile: allocation-failure sweep over create / listen / dial / accept: no
         if (try allocScenario(i)) break;
     } else return error.SweepDidNotFinish;
     std.debug.print("allocation-failure sweep: {d} failure points\n", .{i});
+}
+/// The per-connection record (tcp.Conn), reached through the public
+/// `Stream.debugConn` (which returns a copy of it).
+const ConnType = @typeInfo(@typeInfo(@TypeOf(ns.Stream.debugConn)).@"fn".return_type.?).optional.child;
+
+test "hostile: per-connection fixed state matches the Limits doc (< 1 KiB)" {
+    // root.zig: "max_connections * small fixed state (< 1 KiB)".
+    std.debug.print("tcp.Conn is {d} bytes\n", .{@sizeOf(ConnType)});
+    try t.expect(@sizeOf(ConnType) < 1024);
 }
