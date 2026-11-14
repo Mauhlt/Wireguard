@@ -157,6 +157,13 @@ pub const Stats = struct {
     sack_blocks_ignored: u64 = 0,
     /// Tail loss probes sent (interactive streams, RFC 8985).
     tail_loss_probes: u64 = 0,
+    /// Segments RACK (RFC 8985) declared lost, retransmissions included.
+    rack_losses: u64 = 0,
+    /// D-SACK blocks received (valid) / sent (RFC 2883).
+    dsacks_received: u64 = 0,
+    dsacks_sent: u64 = 0,
+    /// Recoveries undone because D-SACKs proved them spurious.
+    spurious_undos: u64 = 0,
     timeouts: u64 = 0,
     /// ICMP and ICMPv6 echo replies sent.
     icmp_echo_replies: u64 = 0,
@@ -188,6 +195,7 @@ test {
     _ = testing;
     _ = stack_impl;
     _ = @import("tcp.zig");
+    _ = @import("rack.zig");
     _ = @import("stack_test.zig");
     _ = @import("fuzz.zig");
 }

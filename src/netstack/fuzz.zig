@@ -70,7 +70,13 @@ test "fuzz: netstack wire parsers (round trip)" {
 fn drawSack(s: *Smith, ack: u32) wire.Sack {
     var sk: wire.Sack = .{ .len = s.valueRangeAtMost(u8, 1, wire.max_sack_blocks) };
     for (sk.blocks[0..sk.len]) |*b| {
-        const start = if (s.boolWeighted(3, 1)) ack +% s.valueRangeAtMost(u32, 0, 20_000) else s.value(u32);
+        // Often near the ACK (plausible SACK), sometimes just below it (a
+        // D-SACK shape), sometimes anywhere.
+        const start = switch (s.valueRangeAtMost(u8, 0, 3)) {
+            0, 1 => ack +% s.valueRangeAtMost(u32, 0, 20_000),
+            2 => ack -% s.valueRangeAtMost(u32, 1, 70_000),
+            else => s.value(u32),
+        };
         b.* = .{ .start = start, .end = if (s.boolWeighted(3, 1)) start +% s.valueRangeAtMost(u32, 0, 3000) else s.value(u32) };
     }
     return sk;

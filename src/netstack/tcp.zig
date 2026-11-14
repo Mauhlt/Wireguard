@@ -9,6 +9,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const wire = @import("wire.zig");
+const rack_mod = @import("rack.zig");
 
 const Endpoint = root.Endpoint;
 const State = root.State;
@@ -30,6 +31,10 @@ pub const delayed_ack_ns: i64 = 40 * ms;
 /// receiver ACKs short segments at once (no delayed-ACK allowance needed),
 /// so PTO = max(2 * SRTT, this), and always below the RTO.
 pub const tlp_min_ns: i64 = 10 * ms;
+/// A D-SACK-proven spurious fast retransmit may undo the congestion
+/// window cut at most this often (and once per recovery episode), so fake
+/// D-SACKs cannot keep a sender's window inflated.
+pub const undo_min_interval_ns: i64 = 1 * sec;
 /// SYN-ACK retransmissions before a half-open connection is dropped.
 pub const max_synack_retries = 3;
 pub const keepalive_interval_ns: i64 = 10 * sec;
@@ -204,6 +209,9 @@ pub const Conn = struct {
     fin_seq: ?u32 = null,
     /// The peer's FIN was consumed: reads end once rcv is drained.
     eof: bool = false,
+    /// A duplicate segment arrived: report it as a D-SACK first block in
+    /// the next ACK (RFC 2883).
+    dsack_out: ?Range = null,
 
     // what to send
     send_syn: bool = false,
@@ -258,6 +266,21 @@ pub const Conn = struct {
     sack_recovery: bool = false,
     /// Highest sequence number retransmitted in this recovery (HighRxt).
     high_rxt: u32 = 0,
+
+    /// RACK (RFC 8985): transmit records and time-based loss detection.
+    rack: rack_mod.Rack = .{},
+
+    // Spurious retransmission undo (RFC 3708 with D-SACK, RFC 2883 4)
+    prior_cwnd: u32 = 0,
+    prior_ssthresh: u32 = 0,
+    /// Retransmissions in the last recovery not yet D-SACKed.
+    undo_retrans: u16 = 0,
+    /// D-SACKs that matched those retransmissions.
+    undo_dsacks: u16 = 0,
+    undo_armed: bool = false,
+    undo_lo: u32 = 0,
+    undo_hi: u32 = 0,
+    last_undo_at: ?i64 = null,
 
     keepalive_sent: u8 = 0,
     err: ?ConnError = null,
@@ -470,8 +493,11 @@ pub const Conn = struct {
         else
             inWindow(seg.seq, c.rcv_nxt, wnd) or inWindow(seg.seq +% seg_len -% 1, c.rcv_nxt, wnd);
         if (!ok) {
-            // A zero-window probe or a duplicate: answer with an ACK.
+            // A zero-window probe or a duplicate: answer with an ACK (a
+            // segment entirely below rcv_nxt is a D-SACK).
             if (!seg.flags.rst) {
+                const end = seg.seq +% len32(seg.payload.len);
+                if (seg.payload.len > 0 and seqLe(end, c.rcv_nxt)) c.noteDuplicate(seg.seq, end);
                 c.ack_now = true;
                 out.output = true;
             }
@@ -515,6 +541,7 @@ pub const Conn = struct {
         // Trim to the window.
         if (seqLt(seg.seq, c.rcv_nxt)) {
             const d = c.rcv_nxt -% seg.seq;
+            if (seg.payload.len > 0) c.noteDuplicate(seg.seq, seg.seq +% @min(d, len32(seg.payload.len)));
             if (d >= seg.payload.len) {
                 if (seg.flags.fin and d > seg.payload.len) seg.flags.fin = false;
                 seg.payload = seg.payload[seg.payload.len..];
@@ -695,8 +722,11 @@ pub const Conn = struct {
         // SACK blocks first: on duplicate ACKs is where they matter.
         var sacked_more = false;
         if (c.sack_ok) if (seg.options.sack) |*s| {
-            sacked_more = c.takeSack(env, s);
+            sacked_more = c.takeSack(env, s, ack);
         };
+        // RACK: what this ACK delivered, and what that proves lost.
+        if (c.sack_ok) c.rack.delivered(if (seqLt(c.snd_una, ack)) ack else c.snd_una, c.sacked[0..c.sacked_len], env.now);
+        const rack_lost = c.usingSack() and c.rackDetect(env) > 0;
         if (seqLe(ack, c.snd_una)) {
             // Duplicate ACK (RFC 5681 2): no data, no window change,
             // data outstanding, ack == snd_una.
@@ -704,12 +734,11 @@ pub const Conn = struct {
                 c.snd_wnd == old_wnd and c.snd_max != c.snd_una;
             if (dup) c.dupacks += 1;
             if (!c.in_recovery) {
-                // DupThresh duplicates (Early Retransmit lowers it), or with
-                // SACK enough SACKed above snd_una to call it lost (RFC
-                // 6675 IsLost); never for a loss already recovered from.
-                const by_dupacks = dup and c.dupacks >= c.dupThreshold();
-                const by_sack = c.usingSack() and sacked_more and c.lostWith(c.sackedBytes());
-                if ((by_dupacks or by_sack) and c.mayRecover(ack)) c.enterRecovery(env);
+                // With SACK, RACK decides (time-based, RFC 8985); DupThresh
+                // duplicates (Early Retransmit lowers it) only when there is
+                // no SACK information. Never for a loss already recovered.
+                const by_dupacks = dup and c.dupacks >= c.dupThreshold() and (!c.usingSack() or c.sacked_len == 0);
+                if ((rack_lost or by_dupacks) and c.mayRecover(ack)) c.enterRecovery(env);
             } else if (dup and !c.sack_recovery) {
                 c.cwnd +|= c.mss; // NewReno inflation
             }
@@ -739,17 +768,15 @@ pub const Conn = struct {
                 c.in_recovery = false;
                 c.sack_recovery = false;
                 c.dupacks = 0;
+                c.rack.onRecoveryEnd();
+                c.maybeUndo(env);
             } else if (!c.sack_recovery) {
                 // NewReno partial ACK: retransmit the next hole, deflate.
                 c.retransmit_one = true;
                 c.cwnd = (c.cwnd -| acked) +| c.mss;
             }
-            // SACK recovery: pipe and NextSeg drive the retransmissions;
-            // a partial ACK also retransmits the segment at snd_una (as
-            // NewReno / Linux do): RFC 6675 IsLost would not call a hole
-            // with fewer than DupThresh segments SACKed above it lost,
-            // and without this it would wait for the RTO.
-            if (c.sack_recovery) c.retransmit_one = true;
+            // SACK recovery: RACK marks holes lost (including lost
+            // retransmissions); pipe and NextSeg resend them.
             if (c.sack_recovery and c.sack_degraded) c.sack_recovery = false;
         } else {
             c.dupacks = 0;
@@ -758,6 +785,7 @@ pub const Conn = struct {
             } else {
                 c.cwnd +|= @max(1, (@as(u32, c.mss) * c.mss) / @max(c.cwnd, 1)); // congestion avoidance
             }
+            if (rack_lost and c.mayRecover(ack)) c.enterRecovery(env);
         }
         // No point growing past what the buffer can ever have in flight.
         const cwnd_cap = len32(c.snd.cap()) +| 2 * @as(u32, c.mss);
@@ -811,8 +839,13 @@ pub const Conn = struct {
     /// recently changed first (RFC 2018 4: the first block holds the
     /// segment that triggered the ACK), at most `wire.max_sack_blocks`.
     fn sackToSend(c: *const Conn) ?wire.Sack {
-        if (!c.sack_ok or c.ooo_len == 0) return null;
+        if (!c.sack_ok or (c.ooo_len == 0 and c.dsack_out == null)) return null;
         var s: wire.Sack = .{};
+        // RFC 2883: a D-SACK block goes first, then the usual blocks.
+        if (c.dsack_out) |d| {
+            s.blocks[0] = .{ .start = d.start, .end = d.end };
+            s.len = 1;
+        }
         var used: [max_ooo_ranges]bool = @splat(false);
         while (s.len < wire.max_sack_blocks) {
             var best: ?usize = null;
@@ -841,9 +874,15 @@ pub const Conn = struct {
     /// once the scoreboard is full is dropped and recovery falls back to
     /// NewReno until the scoreboard empties. Returns true when new data
     /// was SACKed.
-    fn takeSack(c: *Conn, env: *const Env, sack: *const wire.Sack) bool {
+    fn takeSack(c: *Conn, env: *const Env, sack: *const wire.Sack, ack: u32) bool {
         var grew = false;
-        for (sack.slice()) |b| {
+        const blocks = sack.slice();
+        var first: usize = 0;
+        if (blocks.len > 0 and c.isDsack(blocks, ack)) {
+            c.onDsack(env, blocks[0]);
+            first = 1;
+        }
+        for (blocks[first..]) |b| {
             var start = b.start;
             const end = b.end;
             if (!seqLt(start, end) or !seqLt(c.snd_una, end) or seqLt(c.snd_max, end) or
@@ -915,62 +954,105 @@ pub const Conn = struct {
         return n;
     }
 
-    /// RFC 6675 IsLost for a hole starting at `seq`, given the SACKed
-    /// bytes above it: more than (DupThresh - 1) * SMSS.
-    fn lostWith(c: *const Conn, sacked_above: u32) bool {
-        return sacked_above > 2 * @as(u32, c.mss);
-    }
 
     fn usingSack(c: *const Conn) bool {
         return c.sack_ok and !c.sack_degraded;
     }
 
-    /// RFC 6675 SetPipe over ranges: unSACKed bytes in flight, minus holes
-    /// deemed lost, plus the part of lost holes already retransmitted.
+    /// RFC 6675 SetPipe with RACK deciding what is lost: bytes in flight
+    /// that are neither SACKed nor lost (a retransmitted record is in
+    /// flight again).
     fn pipe(c: *const Conn) u32 {
-        var total_sacked = c.sackedBytes();
-        var p: u32 = 0;
-        var pos = c.snd_una;
-        for (c.sacked[0..c.sacked_len]) |r| {
-            p +%= c.holePipe(pos, r.start, total_sacked);
-            total_sacked -%= r.end -% r.start;
-            pos = r.end;
-        }
-        // Above the highest SACK: nothing SACKed above, never "lost".
-        if (seqLt(pos, c.snd_nxt)) p +%= c.snd_nxt -% pos;
-        return p;
+        return c.rack.pipe();
     }
 
-    fn holePipe(c: *const Conn, a: u32, b: u32, sacked_above: u32) u32 {
-        if (!seqLt(a, b)) return 0;
-        if (!c.lostWith(sacked_above)) return b -% a;
-        // Lost: only what was retransmitted (below high_rxt) is in flight.
-        if (!seqLt(a, c.high_rxt)) return 0;
-        const e = if (seqLt(c.high_rxt, b)) c.high_rxt else b;
-        return e -% a;
+    /// RFC 6675 NextSeg rule 1, with RACK's loss marks.
+    fn nextLost(c: *const Conn) ?rack_mod.Hole {
+        return c.rack.nextLost(c.sendMss());
     }
 
-    /// RFC 6675 NextSeg rule 1: the first lost, not yet retransmitted
-    /// byte range below the highest SACKed sequence number.
-    fn nextLost(c: *const Conn) ?struct { seq: u32, len: u32 } {
-        var total_sacked = c.sackedBytes();
-        var pos = c.snd_una;
-        for (c.sacked[0..c.sacked_len]) |r| {
-            if (!c.lostWith(total_sacked)) return null; // holes above are not lost either
-            const start = if (seqLt(pos, c.high_rxt)) c.high_rxt else pos;
-            if (seqLt(start, r.start)) return .{ .seq = start, .len = @min(r.start -% start, c.mss) };
-            total_sacked -%= r.end -% r.start;
-            pos = r.end;
+    /// RACK loss detection with the current reorder window.
+    fn rackDetect(c: *Conn, env: *const Env) u32 {
+        const sacked_segments = c.sackedBytes() / @max(@as(u32, c.mss), 1);
+        const reo = c.rack.reoWnd(c.srtt, c.in_recovery, sacked_segments);
+        const n = c.rack.detect(env.now, reo);
+        env.stats.rack_losses += n;
+        return n;
+    }
+
+    // ---- D-SACK (RFC 2883) -------------------------------------------------
+
+    /// Receiver: remember a duplicate for the next ACK's first block.
+    fn noteDuplicate(c: *Conn, start: u32, end: u32) void {
+        if (!c.sack_ok or !seqLt(start, end)) return;
+        c.dsack_out = .{ .start = start, .end = end };
+    }
+
+    /// Sender: the first block is a D-SACK when it lies below the
+    /// cumulative ACK this segment carries (not the one before it), or
+    /// inside the second block (RFC 2883 4).
+    fn isDsack(c: *const Conn, blocks: []const wire.SackBlock, ack: u32) bool {
+        _ = c;
+        const b0 = blocks[0];
+        if (!seqLt(b0.start, b0.end)) return false;
+        if (seqLe(b0.end, ack)) return true;
+        if (blocks.len > 1) {
+            const b1 = blocks[1];
+            if (seqLt(b1.start, b1.end) and seqLe(b1.start, b0.start) and seqLe(b0.end, b1.end)) return true;
         }
-        return null;
+        return false;
+    }
+
+    /// Validated strictly: a non-empty range of at most 64 KiB, inside the
+    /// last send buffer's worth below snd_una up to snd_max. Grows RACK's
+    /// reorder window (once per round trip, capped) and counts toward
+    /// undoing a spurious recovery.
+    fn onDsack(c: *Conn, env: *const Env, b: wire.SackBlock) void {
+        const len = b.end -% b.start;
+        const floor = c.snd_una -% len32(c.snd.cap());
+        if (len == 0 or len > 0xffff or seqLt(b.start, floor) or seqLt(c.snd_max, b.end)) {
+            env.stats.sack_blocks_ignored += 1;
+            return;
+        }
+        env.stats.dsacks_received += 1;
+        c.rack.onDsack(c.snd_una, c.snd_max);
+        if (c.undo_armed and c.undo_retrans > 0 and seqLe(c.undo_lo, b.start) and seqLe(b.end, c.undo_hi)) {
+            c.undo_retrans -= 1;
+            c.undo_dsacks +|= 1;
+            c.maybeUndo(env);
+        }
+    }
+
+    /// RFC 3708 / RFC 2883 4.3: when every retransmission of the last
+    /// recovery came back D-SACKed (the originals had arrived), the window
+    /// cut was spurious: restore the window from before it. Once per
+    /// episode, at most every `undo_min_interval_ns`, never above the
+    /// prior values.
+    fn maybeUndo(c: *Conn, env: *const Env) void {
+        if (!c.undo_armed or c.in_recovery or c.undo_retrans != 0 or c.undo_dsacks == 0) return;
+        if (c.last_undo_at) |t| if (env.now - t < undo_min_interval_ns) return;
+        c.undo_armed = false;
+        c.cwnd = @max(c.cwnd, c.prior_cwnd);
+        c.ssthresh = @max(c.ssthresh, c.prior_ssthresh);
+        c.last_undo_at = env.now;
+        env.stats.spurious_undos += 1;
     }
 
     fn enterRecovery(c: *Conn, env: *const Env) void {
+        c.prior_cwnd = c.cwnd;
+        c.prior_ssthresh = c.ssthresh;
+        c.undo_armed = true;
+        c.undo_retrans = 0;
+        c.undo_dsacks = 0;
+        c.undo_lo = c.snd_una;
+        c.undo_hi = c.snd_max;
         const fl = c.snd_max -% c.snd_una;
         c.ssthresh = @max(fl / 2, 2 * @as(u32, c.mss));
         c.recover = c.snd_max;
         c.in_recovery = true;
-        c.retransmit_one = true;
+        // With RACK's loss marks NextSeg picks the holes; otherwise (no
+        // SACK, or none received yet) resend the segment at snd_una.
+        c.retransmit_one = !c.usingSack() or !c.rack.anyLost();
         c.rtt_seq = null; // Karn
         env.stats.fast_retransmits += 1;
         if (c.usingSack()) {
@@ -1020,7 +1102,12 @@ pub const Conn = struct {
             // (the duplicate ACK drives the sender's fast retransmit).
             c.ack_now = true;
             if (c.dup_acks_owed < max_dup_acks_owed) c.dup_acks_owed += 1;
-            if (!c.addRange(env, seq, seq +% len32(data.len))) {
+            const end = seq +% len32(data.len);
+            for (c.ooo[0..c.ooo_len]) |r| if (seqLe(r.start, seq) and seqLe(end, r.end)) {
+                c.noteDuplicate(seq, end);
+                break;
+            };
+            if (!c.addRange(env, seq, end)) {
                 env.stats.dropped_ooo += 1;
                 return;
             }
@@ -1098,6 +1185,7 @@ pub const Conn = struct {
         c.timewait_at = null;
         c.tlp_at = null;
         c.tlp_now = false;
+        c.rack.timer_at = null;
         c.ack_now = false;
         c.send_syn = false;
         c.probe_now = false;
@@ -1108,7 +1196,7 @@ pub const Conn = struct {
 
     pub fn nextDeadline(c: *const Conn) ?i64 {
         var d: ?i64 = null;
-        for ([_]?i64{ c.rto_at, c.delack_at, c.persist_at, c.keepalive_at, c.timewait_at, c.tlp_at }) |t| {
+        for ([_]?i64{ c.rto_at, c.delack_at, c.persist_at, c.keepalive_at, c.timewait_at, c.tlp_at, c.rack.timer_at }) |t| {
             if (t) |v| d = if (d) |x| @min(x, v) else v;
         }
         return d;
@@ -1127,6 +1215,14 @@ pub const Conn = struct {
             c.delack_at = null;
             c.ack_now = true;
             out.output = true;
+        };
+        if (c.rack.timer_at) |t| if (now >= t) {
+            // RACK reorder timer: candidates whose reorder window passed.
+            c.rack.timer_at = null;
+            if (c.usingSack() and c.rackDetect(env) > 0) {
+                if (!c.in_recovery and c.mayRecover(c.snd_una)) c.enterRecovery(env);
+                out.output = true;
+            }
         };
         if (c.tlp_at) |t| if (now >= t) {
             c.tlp_at = null;
@@ -1168,6 +1264,8 @@ pub const Conn = struct {
             c.high_rxt = c.snd_una;
             c.tlp_at = null;
             c.tlp_now = false;
+            c.rack.onRto();
+            c.undo_armed = false; // no undo across a timeout
             c.rto = @min(c.rto * 2, max_rto_ns);
             c.backoff +|= 1;
             if (c.state == .syn_sent or c.state == .syn_received) c.send_syn = true;
@@ -1341,8 +1439,12 @@ pub const Conn = struct {
         if (n == 0 and !flags.fin) return null;
         const end = seq +% n +% @intFromBool(flags.fin);
         // Anything below snd_max was sent before (go-back-N or fast retransmit).
-        if (retransmit or seqLt(seq, c.snd_max)) env.stats.retransmits += 1;
+        if (retransmit or seqLt(seq, c.snd_max)) {
+            env.stats.retransmits += 1;
+            if (c.in_recovery) c.undo_retrans +|= 1;
+        }
         if (retransmit and seqLt(c.high_rxt, end)) c.high_rxt = end;
+        c.rack.sent(seq, end, env.now);
         if (!retransmit) {
             // Karn: time only segments never sent before.
             if (c.rtt_seq == null and c.backoff == 0 and seqLe(c.snd_max, seq)) {
@@ -1397,6 +1499,10 @@ pub const Conn = struct {
         // Never shrink the advertised right edge (RFC 9293 3.8.6.2.2).
         if (seqLt(c.rcv_adv, edge)) c.rcv_adv = edge;
         const opts = c.ackOptions();
+        if (c.dsack_out != null) {
+            c.dsack_out = null; // reported once
+            env.stats.dsacks_sent += 1;
+        }
         c.ack_now = false;
         c.delack_at = null;
         c.unacked_segs = 0;
