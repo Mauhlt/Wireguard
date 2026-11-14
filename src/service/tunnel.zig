@@ -145,7 +145,10 @@ fn runTunnel(paths: ?*const store.Paths) state.Exit {
     defer c.deinit();
     locked(state.Machine.starting, .{});
 
-    // Endpoints first: a DNS failure should not leave an adapter behind.
+    // Endpoint names: one that does not resolve yet (at boot the network
+    // may not be up) is looked up again by the device, with backoff, rather
+    // than failing the service; so is one whose peer stops answering
+    // (dynamic DNS).
     const peers = gpa.alloc(device.device.PeerConfig, c.peers.len) catch return .device_failed;
     defer {
         std.crypto.secureZero(u8, std.mem.sliceAsBytes(peers)); // preshared keys
@@ -157,9 +160,10 @@ fn runTunnel(paths: ?*const store.Paths) state.Exit {
             .preshared_key = cp.preshared_key,
             .allowed_ips = cp.allowed_ips,
             .persistent_keepalive = cp.persistent_keepalive,
-            .endpoint = if (cp.endpoint) |e| resolveEndpoint(g.io, e) catch |err| {
-                log.print("cannot resolve endpoint {f}: {s}", .{ e, @errorName(err) });
-                return .endpoint_unresolved;
+            .endpoint_name = endpointName(cp.endpoint),
+            .endpoint = if (cp.endpoint) |e| e.literal() orelse device.device.resolver.systemLookup(null, g.io, e.host, e.port) catch |err| blk: {
+                log.print("cannot resolve endpoint {f} yet: {s}; retrying in the background", .{ e, @errorName(err) });
+                break :blk null;
             } else null,
         };
     }
@@ -224,24 +228,9 @@ fn toTunCidr(c: device.ip.Cidr) tun.Cidr {
     };
 }
 
-/// IP literal, or a DNS lookup (IPv4 preferred), as `zwg up` does.
-fn resolveEndpoint(io: std.Io, e: config.Endpoint) !std.Io.net.IpAddress {
-    if (e.literal()) |a| return a;
-    const host = try std.Io.net.HostName.init(e.host);
-    var buf: [32]std.Io.net.HostName.LookupResult = undefined;
-    var q: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buf);
-    try host.lookup(io, &q, .{ .port = e.port });
-    var got: [32]std.Io.net.HostName.LookupResult = undefined;
-    const n = q.get(io, &got, 0) catch 0;
-    var v6: ?std.Io.net.IpAddress = null;
-    for (got[0..n]) |r| switch (r) {
-        .address => |a| switch (a) {
-            .ip4 => return a,
-            .ip6 => if (v6 == null) {
-                v6 = a;
-            },
-        },
-        else => {},
-    };
-    return v6 orelse error.UnknownHostName;
+/// The endpoint's DNS name (null for an IP literal or none), as `zwg up`.
+fn endpointName(endpoint: ?config.Endpoint) ?device.device.EndpointName {
+    const e = endpoint orelse return null;
+    if (e.literal() != null) return null;
+    return .{ .host = e.host, .port = e.port };
 }

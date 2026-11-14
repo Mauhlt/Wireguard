@@ -9,6 +9,7 @@ pub const os = @import("os.zig");
 pub const index_table = @import("index_table.zig");
 pub const ratelimit = @import("ratelimit.zig");
 pub const show = @import("show.zig");
+pub const resolver = @import("resolver.zig");
 pub const device = @import("device.zig");
 pub const Device = device.Device;
 
