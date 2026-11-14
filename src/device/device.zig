@@ -1091,6 +1091,12 @@ pub const Device = struct {
             return;
         };
         const p = d.peers.items[id];
+        // The replay check (strictly newer timestamp) only knows what this
+        // process has accepted. Until then a recorded initiation replayed
+        // by an on-path observer passes it, so the first one must not move
+        // a known endpoint: the reply still goes to `from`, and the
+        // endpoint follows once a transport packet authenticates.
+        const timestamp_known = !crypto.isZero(crypto.tai64n_len, &p.hs.latest_timestamp);
         p.hs.consumeInitiation(&start, now) catch {
             d.stats.dropped_invalid += 1;
             return;
@@ -1112,7 +1118,7 @@ pub const Device = struct {
         if (p.handshake_index) |old| d.indices.remove(old);
         p.handshake_index = null;
         d.retire(p.sess.responderSession(&seed, now));
-        p.endpoint = from;
+        if (timestamp_known or p.endpoint == null) p.endpoint = from;
         p.last_authenticated = now;
         d.sendUdp(from, resp.asBytes());
         p.rx_bytes += msg.len;

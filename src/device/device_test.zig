@@ -292,6 +292,46 @@ test "bind: an IPv6 port already held by another socket fails the device" {
     try testing.expect(d.udp4 != null and d.udp6 != null);
 }
 
+test "first initiation since start does not move a known endpoint (replay after restart)" {
+    const gpa = testing.allocator;
+    var clock: dev.Clock = .{ .io = testing.io };
+    const noise = @import("../noise/root.zig");
+    var priv: crypto.PrivateKey = undefined;
+    testing.io.random(&priv);
+    var peer_priv: crypto.PrivateKey = undefined;
+    testing.io.random(&peer_priv);
+    var peer_local = noise.Local.init(peer_priv);
+    defer peer_local.wipe();
+    const known: std.Io.net.IpAddress = .{ .ip4 = .loopback(9) };
+    const elsewhere: std.Io.net.IpAddress = .{ .ip4 = .loopback(10) };
+    var fake: tun.FakeTun = try .init(gpa, .{});
+    defer fake.deinit();
+    const d = try Device.create(gpa, &clock, fake.tun(), .{
+        .private_key = priv,
+        .peers = &.{.{ .public_key = peer_local.public, .endpoint = known }},
+    });
+    defer d.destroy();
+    const p = d.peerByKey(peer_local.public).?;
+
+    var hs = noise.Handshake.init(&peer_local, d.local.public, @splat(0));
+    defer hs.wipe();
+    var prng = std.Random.DefaultPrng.init(5);
+    const now = clock.now();
+    // A valid initiation (as an observer could have recorded it before a
+    // restart) from another address: answered, but the endpoint stays.
+    const m1 = try hs.createInitiation(&peer_local, clock.wall(), now, 91, prng.random());
+    var b1 = m1.asBytes().*;
+    d.handleDatagram(&b1, elsewhere, now);
+    try testing.expect(!crypto.isZero(crypto.tai64n_len, &p.hs.latest_timestamp));
+    try testing.expect(p.endpoint.?.eql(&known));
+    // With a timestamp on record, a newer initiation roams as usual.
+    const later = now + std.time.ns_per_s;
+    const m2 = try hs.createInitiation(&peer_local, clock.wall() + std.time.ns_per_s, later, 92, prng.random());
+    var b2 = m2.asBytes().*;
+    d.handleDatagram(&b2, elsewhere, later);
+    try testing.expect(p.endpoint.?.eql(&elsewhere));
+}
+
 test "run returns when the external stop handle (zwg down) is signaled" {
     const gpa = testing.allocator;
     var clock: dev.Clock = .{ .io = testing.io };
