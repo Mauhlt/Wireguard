@@ -217,7 +217,10 @@ test "mac1: any modification invalidates; wrong responder key invalidates" {
         buf = m1.asBytes().*;
         buf[i] ^= 0x01;
         try testing.expectEqual(noise.Verdict.invalid, pair.cr.check(&buf, &src, 0, false, noRng()));
+        try testing.expect(!pair.cr.checkMac1(&buf));
     }
+    try testing.expect(pair.cr.checkMac1(m1.asBytes()));
+    try testing.expect(!pair.cr.checkMac1(m1.asBytes()[0..147]));
     // mac2 is not covered by mac1.
     buf = m1.asBytes().*;
     buf[140] ^= 1;

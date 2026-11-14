@@ -77,13 +77,30 @@ pub const CookieChecker = struct {
     /// `msg`: a whole initiation (148 B) or response (92 B). `src`: the
     /// sender's address as bytes; must be the same encoding for `check` and
     /// `createReply` (recommended, as the kernel: IP address bytes || BE16 port).
+    /// Same as `checkMac1` followed (if under load) by `checkMac2`. A device
+    /// that measures load should call the two halves itself and count a
+    /// message only after `checkMac1` passed, so that unauthenticated junk
+    /// cannot put it under load.
     pub fn check(self: *CookieChecker, msg: []const u8, src: []const u8, now: i64, under_load: bool, rng: std.Random) Verdict {
-        if (msg.len != messages.Initiation.size and msg.len != messages.Response.size) return .invalid;
-        const m1 = messages.mac1Offset(msg.len);
-        const m2 = messages.mac2Offset(msg.len);
-        const want1 = crypto.mac(&self.mac1_key, &.{msg[0..m1]});
-        if (!crypto.eql(16, &want1, msg[m1..][0..16])) return .invalid;
+        if (!self.checkMac1(msg)) return .invalid;
         if (!under_load) return .ok;
+        return self.checkMac2(msg, src, now, rng);
+    }
+
+    /// True when `msg` has the size of an initiation or response and a
+    /// correct mac1 (proof the sender knows our public key). Stateless.
+    pub fn checkMac1(self: *const CookieChecker, msg: []const u8) bool {
+        if (msg.len != messages.Initiation.size and msg.len != messages.Response.size) return false;
+        const m1 = messages.mac1Offset(msg.len);
+        const want1 = crypto.mac(&self.mac1_key, &.{msg[0..m1]});
+        return crypto.eql(16, &want1, msg[m1..][0..16]);
+    }
+
+    /// mac2 check for a message that already passed `checkMac1`: `.ok` when
+    /// mac2 is the cookie for `src`, else `.need_cookie`.
+    pub fn checkMac2(self: *CookieChecker, msg: []const u8, src: []const u8, now: i64, rng: std.Random) Verdict {
+        std.debug.assert(msg.len == messages.Initiation.size or msg.len == messages.Response.size);
+        const m2 = messages.mac2Offset(msg.len);
         var cookie = self.makeCookie(src, now, rng);
         defer crypto.wipe(&cookie);
         const want2 = crypto.mac(&cookie, &.{msg[0..m2]});

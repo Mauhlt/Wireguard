@@ -227,6 +227,49 @@ test "under load: handshakes without a cookie get a cookie reply" {
     try testing.expect(d.stats.cookie_replies_sent >= 5);
 }
 
+test "load: datagrams with a wrong mac1 are dropped and never count towards load" {
+    const gpa = testing.allocator;
+    var clock: dev.Clock = .{ .io = testing.io };
+    var priv: crypto.PrivateKey = undefined;
+    testing.io.random(&priv);
+    var fake: tun.FakeTun = try .init(gpa, .{});
+    defer fake.deinit();
+    const d = try Device.create(gpa, &clock, fake.tun(), .{ .private_key = priv });
+    defer d.destroy();
+
+    // Initiation- and response-sized junk with the right type byte, from a
+    // stranger who does not know our public key: far above the threshold.
+    const noise = @import("../noise/root.zig");
+    var init_junk: [noise.Initiation.size]u8 = undefined;
+    var resp_junk: [noise.Response.size]u8 = undefined;
+    const from: std.Io.net.IpAddress = .{ .ip4 = .loopback(9) };
+    const now = clock.now();
+    for (0..d.load.threshold * 4) |i| {
+        testing.io.random(&init_junk);
+        testing.io.random(&resp_junk);
+        init_junk[0..4].* = .{ 1, 0, 0, 0 };
+        resp_junk[0..4].* = .{ 2, 0, 0, 0 };
+        d.handleDatagram(if (i % 2 == 0) &init_junk else &resp_junk, from, now);
+    }
+    try testing.expect(!d.load.underLoad(now));
+    try testing.expectEqual(@as(u64, 0), d.stats.cookie_replies_sent);
+    try testing.expectEqual(@as(u64, d.load.threshold * 4), d.stats.dropped_invalid);
+
+    // A sender that knows our key (valid mac1) still gets an answer without
+    // a cookie round trip: the junk did not put the device under load.
+    var other: crypto.PrivateKey = undefined;
+    testing.io.random(&other);
+    var local_other = noise.Local.init(other);
+    defer local_other.wipe();
+    var hs = noise.Handshake.init(&local_other, d.local.public, @splat(0));
+    defer hs.wipe();
+    var prng = std.Random.DefaultPrng.init(4);
+    const msg = try hs.createInitiation(&local_other, clock.wall(), clock.now(), 78, prng.random());
+    var bytes = msg.asBytes().*;
+    d.handleDatagram(&bytes, from, now);
+    try testing.expectEqual(@as(u64, 0), d.stats.cookie_replies_sent);
+}
+
 test "run returns when the external stop handle (zwg down) is signaled" {
     const gpa = testing.allocator;
     var clock: dev.Clock = .{ .io = testing.io };

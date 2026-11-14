@@ -1025,14 +1025,19 @@ pub const Device = struct {
         };
         switch (kind) {
             .initiation, .response => {
+                // mac1 first: only messages from senders that know our
+                // public key count towards load, so random datagrams cannot
+                // force cookie round trips on legitimate peers.
+                if (!d.checker.checkMac1(msg)) {
+                    d.stats.dropped_invalid += 1;
+                    return;
+                }
                 const under_load = d.load.record(now);
                 var sbuf: [18]u8 = undefined;
                 const src = cookieSource(from, &sbuf);
-                switch (d.checker.check(msg, src, now, under_load, d.rng)) {
-                    .invalid => {
-                        d.stats.dropped_invalid += 1;
-                        return;
-                    },
+                const verdict: noise.Verdict = if (under_load) d.checker.checkMac2(msg, src, now, d.rng) else .ok;
+                switch (verdict) {
+                    .invalid => unreachable,
                     .need_cookie => {
                         const reply = d.checker.createReply(msg, src, now, d.rng);
                         d.sendUdp(from, reply.asBytes());
