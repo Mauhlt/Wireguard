@@ -76,7 +76,6 @@ pub const Stack = struct {
     clock: *root.Clock,
     io: std.Io,
     options: Options,
-    mss: u16,
 
     mutex: std.Io.Mutex = .init,
     slots: []Slot,
@@ -156,7 +155,6 @@ pub const Stack = struct {
             .clock = clock,
             .io = clock.io,
             .options = options,
-            .mss = wire.mssForMtu(options.mtu),
             .slots = slots,
             .listeners = listeners,
             .inbound = inbound,
@@ -275,7 +273,7 @@ pub const Stack = struct {
             .now = now,
             .gpa = s.gpa,
             .limits = &s.options.limits,
-            .mss = s.mss,
+            .mtu = s.options.mtu,
             .keepalive_idle_ns = s.options.keepalive_idle_ns,
             .stats = &s.st,
         };

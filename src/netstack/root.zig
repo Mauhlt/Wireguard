@@ -147,6 +147,9 @@ pub const Stats = struct {
     fast_retransmits: u64 = 0,
     /// Retransmission timer expirations (each a go-back-N restart).
     rto_expirations: u64 = 0,
+    /// SACK blocks rejected (outside [snd_una, snd_max], malformed) or
+    /// dropped because the scoreboard was full.
+    sack_blocks_ignored: u64 = 0,
     timeouts: u64 = 0,
     icmp_echo_replies: u64 = 0,
     connections: u16 = 0,
