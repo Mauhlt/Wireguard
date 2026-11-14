@@ -76,6 +76,16 @@ pub fn IndexTable(comptime PeerId: type) type {
             }
         }
 
+        /// The peer table was replaced: `moved[old id]` is each peer's new
+        /// id, null for a removed peer (whose indices go).
+        pub fn remap(t: *Self, moved: []const ?PeerId) void {
+            var it = t.map.iterator();
+            // Removing marks a tombstone; the iteration stays valid.
+            while (it.next()) |e| {
+                if (moved[e.value_ptr.peer]) |id| e.value_ptr.peer = id else t.map.removeByPtr(e.key_ptr);
+            }
+        }
+
         pub fn count(t: *const Self) usize {
             return t.map.count();
         }
@@ -123,4 +133,20 @@ test "limit" {
     try std.testing.expectError(error.TableFull, t.insert(gpa, prng.random(), .{ .peer = 0, .kind = .keypair }));
     t.removePeer(0);
     try std.testing.expectEqual(@as(usize, 0), t.count());
+}
+
+test "remap renumbers peers and drops removed ones" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(2);
+    var t = IndexTable(u8).init(100);
+    defer t.deinit(gpa);
+    var idx: [6]u32 = undefined;
+    for (&idx, 0..) |*x, i| x.* = try t.insert(gpa, prng.random(), .{ .peer = @intCast(i % 3), .kind = .keypair });
+    // Peer 0 removed, 1 -> 0, 2 -> 1.
+    t.remap(&.{ null, 0, 1 });
+    try std.testing.expectEqual(@as(usize, 4), t.count());
+    for (idx, 0..) |x, i| switch (i % 3) {
+        0 => try std.testing.expectEqual(@as(?IndexTable(u8).Entry, null), t.get(x)),
+        else => try std.testing.expectEqual(@as(u8, @intCast(i % 3 - 1)), t.get(x).?.peer),
+    };
 }

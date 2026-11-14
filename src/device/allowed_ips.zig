@@ -101,6 +101,23 @@ pub fn AllowedIps(comptime V: type) type {
             slot.* = leaf;
         }
 
+        /// The value of exactly `cidr` (host bits ignored), if it is in
+        /// the table.
+        pub fn exact(t: *const Self, cidr: ip.Cidr) ?V {
+            const m = cidr.masked();
+            const key = toKey(m.addr);
+            var n = switch (m.addr) {
+                .v4 => t.root4,
+                .v6 => t.root6,
+            };
+            while (n) |node| {
+                if (node.cidr > m.prefix or ip.commonPrefix(&node.key, &key, node.cidr) < node.cidr) return null;
+                if (node.cidr == m.prefix) return node.value;
+                n = node.child[ip.bitAt(&key, node.cidr)];
+            }
+            return null;
+        }
+
         /// The value of the longest prefix containing `addr`.
         pub fn lookup(t: *const Self, addr: ip.Addr) ?V {
             const key = toKey(addr);
@@ -361,6 +378,24 @@ test "overlapping prefixes against a brute-force reference" {
     }
     // Node count stays within 2 per prefix.
     try testing.expect(t.nodeCount() <= 2 * ref.items.len);
+}
+
+test "exact finds only the very prefix" {
+    var t = Table.init(testing.allocator);
+    defer t.deinit();
+    try testing.expectEqual(@as(?u32, null), t.exact(cidrOf("10.8.0.0/24")));
+    try t.insert(cidrOf("10.8.0.0/24"), 1);
+    try t.insert(cidrOf("10.8.0.2/32"), 2);
+    try t.insert(cidrOf("10.8.4.0/24"), 3); // a branch node at /21
+    try t.insert(cidrOf("fd00::/64"), 4);
+    try testing.expectEqual(@as(?u32, 1), t.exact(cidrOf("10.8.0.77/24")));
+    try testing.expectEqual(@as(?u32, 2), t.exact(cidrOf("10.8.0.2/32")));
+    try testing.expectEqual(@as(?u32, null), t.exact(cidrOf("10.8.0.3/32")));
+    try testing.expectEqual(@as(?u32, null), t.exact(cidrOf("10.8.0.0/23")));
+    try testing.expectEqual(@as(?u32, null), t.exact(cidrOf("10.8.0.0/21"))); // branch only
+    try testing.expectEqual(@as(?u32, null), t.exact(cidrOf("10.0.0.0/8")));
+    try testing.expectEqual(@as(?u32, 4), t.exact(cidrOf("fd00::1/64")));
+    try testing.expectEqual(@as(?u32, null), t.exact(cidrOf("fd00::/63")));
 }
 
 test "forEach lists entries" {

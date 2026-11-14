@@ -183,6 +183,31 @@ pub const ParseError = error{ InvalidConfig, OutOfMemory };
 
 /// Largest config accepted; real ones are a few hundred bytes per peer.
 pub const max_config_bytes = 1 << 20;
+
+/// Read and parse a .conf file for the CLI (`zwg show / up`, and
+/// `installtunnel`'s check before the UAC prompt). The text, which holds
+/// the private key, is wiped. Problems and warnings go to `errw` as
+/// "zwg: <path>: ..."; null when the file cannot be read or is invalid.
+pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, errw: *std.Io.Writer) !?Config {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch |err| {
+        try errw.print("zwg: cannot read {s}: {s}\n", .{ path, @errorName(err) });
+        return null;
+    };
+    defer {
+        std.crypto.secureZero(u8, text);
+        gpa.free(text);
+    }
+    var diag: Diagnostic = .{};
+    const c = parse(gpa, text, &diag) catch |err| switch (err) {
+        error.InvalidConfig => {
+            try errw.print("zwg: {s}: {f}\n", .{ path, diag });
+            return null;
+        },
+        else => return err,
+    };
+    for (c.warnings) |w| try errw.print("zwg: {s}: line {d}: warning: {s}\n", .{ path, w.line, w.message });
+    return c;
+}
 pub const max_peers = 4096;
 pub const max_list_entries = 4096;
 
@@ -521,13 +546,13 @@ fn expectInvalid(text: []const u8, line: u32, needle: []const u8) !void {
     }
 }
 
-/// Wraps testing.allocator and remembers whether any block given back
+/// Test helper: wraps testing.allocator and remembers whether any block given back
 /// still contained one of `needles` (key bytes).
-const FreeSpy = struct {
+pub const FreeSpy = struct {
     needles: []const []const u8,
     leaked: bool = false,
 
-    fn allocator(s: *FreeSpy) std.mem.Allocator {
+    pub fn allocator(s: *FreeSpy) std.mem.Allocator {
         return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
     fn alloc(_: *anyopaque, len: usize, al: std.mem.Alignment, ret: usize) ?[*]u8 {

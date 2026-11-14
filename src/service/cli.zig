@@ -144,7 +144,10 @@ fn installTunnel(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8, auto
     const name = names.fromPath(conf_path);
     if (!names.isValid(name)) return fail(errw, .invalid_name);
     // Validate before any UAC prompt: typos are reported right here.
-    if (!try validateFile(gpa, io, conf_path, errw)) return 1;
+    {
+        var c = (try config.load(gpa, io, conf_path, errw)) orelse return 1;
+        c.deinit();
+    }
 
     var in_w: [600]u16 = undefined;
     var abs_w: [600]u16 = undefined;
@@ -193,27 +196,6 @@ fn fail(errw: *std.Io.Writer, r: Result) !u8 {
     return 1;
 }
 
-fn validateFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, errw: *std.Io.Writer) !bool {
-    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(config.max_config_bytes)) catch |err| {
-        try errw.print("zwg: cannot read {s}: {s}\n", .{ path, @errorName(err) });
-        return false;
-    };
-    defer {
-        std.crypto.secureZero(u8, text);
-        gpa.free(text);
-    }
-    var diag: config.Diagnostic = .{};
-    var c = config.parse(gpa, text, &diag) catch |err| switch (err) {
-        error.InvalidConfig => {
-            try errw.print("zwg: {s}: {f}\n", .{ path, diag });
-            return false;
-        },
-        else => return err,
-    };
-    defer c.deinit();
-    for (c.warnings) |w| try errw.print("zwg: {s}: line {d}: warning: {s}\n", .{ path, w.line, w.message });
-    return true;
-}
 
 /// Re-launch this executable elevated ("runas": the UAC prompt) with
 /// `params`, wait for it (blocking on its process handle) and return its

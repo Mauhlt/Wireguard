@@ -441,3 +441,364 @@ test "endpoint name moved (dynamic DNS): unanswered handshakes look it up again"
     try testing.expectEqual(@as(u64, 1), a.device.stats.endpoint_updates);
     try testing.expectEqual(b.device.listen_port, a.device.peerByKey(kb.public).?.endpoint.?.getPort());
 }
+
+// ---- setPeers: the peer table replaced while the tunnel runs -------------
+
+const config = @import("config.zig");
+
+fn cidrOf(s: []const u8) ip.Cidr {
+    return ip.Cidr.parse(s) catch unreachable;
+}
+
+fn addrOf(s: []const u8) ip.Addr {
+    return ip.Addr.parse(s) catch unreachable;
+}
+
+/// A (10.8.0.2, endpoint = B) and B (10.8.0.1, the hub), both running on
+/// loopback; B starts with `b_peers` and allocates from `b_gpa`.
+const Pair = struct {
+    ka: @TypeOf(keyPair()),
+    kb: @TypeOf(keyPair()),
+    psk: ?crypto.PresharedKey = null,
+    a: Node = undefined,
+    b: Node = undefined,
+
+    fn init(p: *Pair, b_gpa: std.mem.Allocator, clock: *dev.Clock, b_peers: []const dev.PeerConfig) !void {
+        const gpa = testing.allocator;
+        p.b = .{ .fake = try .init(gpa, .{}), .device = undefined };
+        errdefer p.b.fake.deinit();
+        p.b.device = try Device.create(b_gpa, clock, p.b.fake.tun(), .{ .private_key = p.kb.priv, .loopback_only = true, .peers = b_peers });
+        errdefer p.b.device.destroy();
+        p.a = .{ .fake = try .init(gpa, .{}), .device = undefined };
+        errdefer p.a.fake.deinit();
+        p.a.device = try Device.create(gpa, clock, p.a.fake.tun(), .{
+            .private_key = p.ka.priv,
+            .loopback_only = true,
+            .peers = &.{.{
+                .public_key = p.kb.public,
+                .preshared_key = p.psk,
+                .endpoint = .{ .ip4 = .loopback(p.b.device.listen_port) },
+                .allowed_ips = &.{cidrOf("10.8.0.0/16")},
+            }},
+        });
+        errdefer p.a.device.destroy();
+        try p.a.start();
+        try p.b.start();
+    }
+
+    fn deinit(p: *Pair) void {
+        p.a.halt();
+        p.b.halt();
+        p.a.device.destroy();
+        p.a.fake.deinit();
+        p.b.device.destroy();
+        p.b.fake.deinit();
+    }
+
+    fn aToB(p: *Pair, payload: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        const pkt = ipv4Packet(&buf, .{ 10, 8, 0, 2 }, .{ 10, 8, 0, 1 }, payload);
+        try p.a.fake.inject(pkt);
+        try expectDelivered(&p.b, pkt);
+    }
+
+    fn bToA(p: *Pair, dst: [4]u8, payload: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        const pkt = ipv4Packet(&buf, .{ 10, 8, 0, 1 }, dst, payload);
+        try p.b.fake.inject(pkt);
+        try expectDelivered(&p.a, pkt);
+    }
+
+    /// A's packet to B does not come out of B's TUN.
+    fn aToBRefused(p: *Pair, payload: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        try p.a.fake.inject(ipv4Packet(&buf, .{ 10, 8, 0, 2 }, .{ 10, 8, 0, 1 }, payload));
+        var r: [256]u8 = undefined;
+        try testing.expectEqual(@as(?[]u8, null), try p.b.fake.takeWait(&r, 300));
+    }
+};
+
+test "setPeers: a peer added to a running device can handshake" {
+    var clock: dev.Clock = .{ .io = testing.io };
+    var p: Pair = .{ .ka = keyPair(), .kb = keyPair() };
+    try p.init(testing.allocator, &clock, &.{}); // B knows nobody yet
+    defer p.deinit();
+
+    // Unknown to B: A's initiation is dropped, its packet waits on A.
+    try p.aToBRefused("before the peer was added");
+    const a_ips = [_]ip.Cidr{cidrOf("10.8.0.2/32")};
+    try p.b.device.setPeers(&.{.{ .public_key = p.ka.public, .allowed_ips = &a_ips }});
+
+    // A's retransmission (REKEY_TIMEOUT, simulated) now completes and the
+    // packet that waited is delivered, then traffic flows both ways.
+    clock.advance(6 * std.time.ns_per_s);
+    p.a.device.kick();
+    var buf: [256]u8 = undefined;
+    try expectDelivered(&p.b, ipv4Packet(&buf, .{ 10, 8, 0, 2 }, .{ 10, 8, 0, 1 }, "before the peer was added"));
+    try p.aToB("after");
+    try p.bToA(.{ 10, 8, 0, 2 }, "and back");
+    p.b.halt();
+    try testing.expectEqual(@as(usize, 1), p.b.device.peers.items.len);
+    try testing.expect(p.b.device.stats.dropped_invalid >= 1);
+    try testing.expect(p.b.device.peerByKey(p.ka.public).?.sess.keypairs.current != null);
+}
+
+test "setPeers: a removed peer's packets are refused and its key material is wiped" {
+    var clock: dev.Clock = .{ .io = testing.io };
+    var psk: crypto.PresharedKey = undefined;
+    testing.io.random(&psk);
+    var spy: config.FreeSpy = .{ .needles = &.{} };
+    var p: Pair = .{ .ka = keyPair(), .kb = keyPair(), .psk = psk };
+    const a_ips = [_]ip.Cidr{cidrOf("10.8.0.2/32")};
+    try p.init(spy.allocator(), &clock, &.{.{ .public_key = p.ka.public, .preshared_key = psk, .allowed_ips = &a_ips }});
+    defer p.deinit();
+    try p.aToB("hello");
+    try p.bToA(.{ 10, 8, 0, 2 }, "hello back");
+
+    // The secrets B holds for A: session keys, the PSK, the static DH.
+    p.b.halt();
+    const peer = p.b.device.peerByKey(p.ka.public).?;
+    const kp = peer.sess.keypairs.current.?;
+    const send = kp.send_key;
+    const recv = kp.recv_key;
+    const ss = peer.hs.precomputed_static_static;
+    const needles = [_][]const u8{ &send, &recv, &psk, &ss };
+    spy.needles = &needles;
+    try p.b.start();
+
+    try p.b.device.setPeers(&.{});
+    try testing.expect(!spy.leaked);
+    try p.aToBRefused("after the peer was removed");
+    p.b.halt();
+    try testing.expectEqual(@as(usize, 0), p.b.device.peers.items.len);
+    try testing.expectEqual(@as(?*dev.Peer, null), p.b.device.peerByKey(p.ka.public));
+    try testing.expectEqual(@as(usize, 0), p.b.device.indices.count());
+    try testing.expectEqual(@as(?u32, null), p.b.device.routes.lookup(addrOf("10.8.0.2")));
+}
+
+test "setPeers: an unchanged peer keeps its session (no new handshake), ids shift" {
+    var clock: dev.Clock = .{ .io = testing.io };
+    var p: Pair = .{ .ka = keyPair(), .kb = keyPair() };
+    const a_ips = [_]ip.Cidr{cidrOf("10.8.0.2/32")};
+    try p.init(testing.allocator, &clock, &.{.{ .public_key = p.ka.public, .allowed_ips = &a_ips }});
+    defer p.deinit();
+    try p.aToB("one");
+    try p.bToA(.{ 10, 8, 0, 2 }, "two");
+    p.a.halt();
+    p.b.halt();
+    const on_b = p.b.device.peerByKey(p.ka.public).?;
+    const on_a = p.a.device.peerByKey(p.kb.public).?;
+    const b_index = on_b.sess.keypairs.current.?.local_index;
+    const a_index = on_a.sess.keypairs.current.?.local_index;
+    const a_handshake = on_a.last_handshake_wall_ns;
+    const rx = on_b.rx_bytes;
+    try p.a.start();
+    try p.b.start();
+
+    // A new peer in front (A's id becomes 1) and one more prefix for A.
+    const c = keyPair();
+    const c_ips = [_]ip.Cidr{cidrOf("10.8.5.0/24")};
+    const a_ips2 = [_]ip.Cidr{ cidrOf("10.8.0.2/32"), cidrOf("10.8.1.0/24") };
+    try p.b.device.setPeers(&.{
+        .{ .public_key = c.public, .allowed_ips = &c_ips },
+        .{ .public_key = p.ka.public, .allowed_ips = &a_ips2 },
+    });
+    try p.aToB("three");
+    try p.bToA(.{ 10, 8, 0, 2 }, "four");
+    try p.bToA(.{ 10, 8, 1, 5 }, "to the new prefix");
+    p.a.halt();
+    p.b.halt();
+    try testing.expectEqual(on_b, p.b.device.peerByKey(p.ka.public).?);
+    try testing.expectEqual(@as(dev.PeerId, 1), on_b.id);
+    try testing.expectEqual(b_index, on_b.sess.keypairs.current.?.local_index);
+    try testing.expectEqual(a_index, on_a.sess.keypairs.current.?.local_index);
+    try testing.expectEqual(a_handshake, on_a.last_handshake_wall_ns);
+    try testing.expect(on_b.rx_bytes > rx);
+    try testing.expectEqual(@as(?u32, 1), p.b.device.indices.get(b_index).?.peer);
+}
+
+test "setPeers: an invalid set changes nothing" {
+    const gpa = testing.allocator;
+    var clock: dev.Clock = .{ .io = testing.io };
+    var p: Pair = .{ .ka = keyPair(), .kb = keyPair() };
+    const a_ips = [_]ip.Cidr{cidrOf("10.8.0.2/32")};
+    const a_cfg: dev.PeerConfig = .{ .public_key = p.ka.public, .allowed_ips = &a_ips };
+    try p.init(gpa, &clock, &.{a_cfg});
+    defer p.deinit();
+    try p.aToB("before");
+    p.b.halt();
+    const on_b = p.b.device.peerByKey(p.ka.public).?;
+    const b_index = on_b.sess.keypairs.current.?.local_index;
+    try p.b.start();
+
+    const c = keyPair();
+    const e = keyPair();
+    const d = p.b.device;
+    const c_net = [_]ip.Cidr{cidrOf("10.8.0.0/24")};
+    const e_net = [_]ip.Cidr{cidrOf("10.8.0.9/24")}; // the same prefix once masked
+    const bad_prefix = [_]ip.Cidr{.{ .addr = .{ .v4 = .{ 10, 8, 0, 0 } }, .prefix = 33 }};
+    const many_ips = try gpa.alloc(ip.Cidr, config.max_list_entries + 1);
+    defer gpa.free(many_ips);
+    for (many_ips, 0..) |*x, i| x.* = .{ .addr = .{ .v4 = .{ 10, 9, @intCast(i >> 8), @truncate(i) } }, .prefix = 32 };
+    const many_peers = try gpa.alloc(dev.PeerConfig, config.max_peers + 1);
+    defer gpa.free(many_peers);
+    for (many_peers, 0..) |*x, i| {
+        x.* = .{ .public_key = @splat(0) };
+        std.mem.writeInt(u32, x.public_key[0..4], @intCast(i + 1), .little);
+    }
+    const long_host: [@import("resolver.zig").max_host + 1]u8 = @splat('a');
+
+    // Each would remove A if it were applied.
+    try testing.expectError(error.DuplicatePeer, d.setPeers(&.{ .{ .public_key = c.public }, .{ .public_key = c.public } }));
+    try testing.expectError(error.OverlappingAllowedIps, d.setPeers(&.{ .{ .public_key = c.public, .allowed_ips = &c_net }, .{ .public_key = e.public, .allowed_ips = &e_net } }));
+    try testing.expectError(error.OverlappingAllowedIps, d.setPeers(&.{ a_cfg, .{ .public_key = c.public, .allowed_ips = &a_ips } }));
+    try testing.expectError(error.InvalidPeer, d.setPeers(&.{ .{ .public_key = c.public }, .{ .public_key = p.kb.public } }));
+    try testing.expectError(error.InvalidPeer, d.setPeers(&.{.{ .public_key = c.public, .allowed_ips = &bad_prefix }}));
+    try testing.expectError(error.TooManyAllowedIps, d.setPeers(&.{.{ .public_key = c.public, .allowed_ips = many_ips }}));
+    try testing.expectError(error.TooManyPeers, d.setPeers(many_peers));
+    try testing.expectError(error.InvalidHost, d.setPeers(&.{.{ .public_key = c.public, .endpoint_name = .{ .host = "", .port = 1 } }}));
+    try testing.expectError(error.InvalidHost, d.setPeers(&.{.{ .public_key = c.public, .endpoint_name = .{ .host = &long_host, .port = 1 } }}));
+
+    p.b.halt();
+    try testing.expectEqual(@as(usize, 1), d.peers.items.len);
+    try testing.expectEqual(on_b, d.peers.items[0]);
+    try testing.expectEqual(@as(dev.PeerId, 0), on_b.id);
+    try testing.expectEqual(@as(?dev.PeerId, 0), d.peerByKey(p.ka.public).?.id);
+    try testing.expectEqual(@as(?dev.PeerId, null), if (d.peerByKey(c.public)) |x| x.id else null);
+    try testing.expectEqual(@as(?u32, 0), d.routes.lookup(addrOf("10.8.0.2")));
+    try testing.expectEqual(@as(?u32, null), d.routes.lookup(addrOf("10.8.0.9")));
+    try testing.expectEqual(@as(?*@import("resolver.zig").Shared, null), d.resolver);
+    try p.b.start();
+    try p.aToB("after");
+    try p.bToA(.{ 10, 8, 0, 2 }, "and back");
+    p.b.halt();
+    try testing.expectEqual(b_index, on_b.sess.keypairs.current.?.local_index);
+}
+
+test "setPeers: concurrent calls from other threads while traffic flows" {
+    var clock: dev.Clock = .{ .io = testing.io };
+    var p: Pair = .{ .ka = keyPair(), .kb = keyPair() };
+    const a_ips = [_]ip.Cidr{cidrOf("10.8.0.2/32")};
+    const a_cfg: dev.PeerConfig = .{ .public_key = p.ka.public, .allowed_ips = &a_ips };
+    try p.init(testing.allocator, &clock, &.{a_cfg});
+    defer p.deinit();
+    try p.aToB("warm up");
+    p.b.halt();
+    const on_b = p.b.device.peerByKey(p.ka.public).?;
+    const b_index = on_b.sess.keypairs.current.?.local_index;
+    try p.b.start();
+
+    const c = keyPair();
+    const e = keyPair();
+    const c_ips = [_]ip.Cidr{cidrOf("10.8.7.0/24")};
+    const e_ips = [_]ip.Cidr{cidrOf("fd00::7/128")};
+    const small = [_]dev.PeerConfig{a_cfg};
+    const large = [_]dev.PeerConfig{ .{ .public_key = c.public, .allowed_ips = &c_ips }, a_cfg, .{ .public_key = e.public, .allowed_ips = &e_ips } };
+
+    const Setter = struct {
+        fn run(d: *Device, first: []const dev.PeerConfig, second: []const dev.PeerConfig, failures: *std.atomic.Value(u32)) void {
+            for (0..60) |i| d.setPeers(if (i % 2 == 0) first else second) catch {
+                _ = failures.fetchAdd(1, .monotonic);
+            };
+        }
+    };
+    var failures: std.atomic.Value(u32) = .init(0);
+    const t1 = try std.Thread.spawn(.{}, Setter.run, .{ p.b.device, @as([]const dev.PeerConfig, &large), @as([]const dev.PeerConfig, &small), &failures });
+    const t2 = try std.Thread.spawn(.{}, Setter.run, .{ p.b.device, @as([]const dev.PeerConfig, &small), @as([]const dev.PeerConfig, &large), &failures });
+    for (0..30) |i| {
+        try p.aToB(&.{ @intCast(i), 1 });
+        try p.bToA(.{ 10, 8, 0, 2 }, &.{ @intCast(i), 2 });
+    }
+    t1.join();
+    t2.join();
+    try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
+    try p.b.device.setPeers(&large);
+    try p.aToB("after the storm");
+    p.b.halt();
+    try testing.expectEqual(on_b, p.b.device.peerByKey(p.ka.public).?);
+    try testing.expectEqual(@as(dev.PeerId, 1), on_b.id);
+    try testing.expectEqual(b_index, on_b.sess.keypairs.current.?.local_index);
+    try testing.expectEqual(@as(usize, 3), p.b.device.peers.items.len);
+}
+
+var dns_sweep: FakeDns = .{};
+
+test "setPeers and create: every allocation failure leaves the device unchanged (FailingAllocator sweep)" {
+    var clock: dev.Clock = .{ .io = testing.io };
+    var fake: tun.FakeTun = try .init(testing.allocator, .{});
+    defer fake.deinit();
+    const k0 = keyPair();
+    const k1 = keyPair();
+    const k2 = keyPair();
+    const k3 = keyPair();
+    const k4 = keyPair();
+    const ips1 = [_]ip.Cidr{cidrOf("10.8.0.2/32")};
+    const ips2 = [_]ip.Cidr{cidrOf("10.8.0.3/32")};
+    const ips2b = [_]ip.Cidr{ cidrOf("10.8.0.3/32"), cidrOf("10.8.3.0/24") };
+    const ips3 = [_]ip.Cidr{ cidrOf("10.8.0.4/32"), cidrOf("fd00::4/128") };
+    const ips4 = [_]ip.Cidr{cidrOf("10.8.0.5/32")};
+    const first = [_]dev.PeerConfig{
+        .{ .public_key = k1.public, .allowed_ips = &ips1, .endpoint_name = .{ .host = "one.example", .port = 1 } },
+        .{ .public_key = k2.public, .allowed_ips = &ips2 },
+    };
+    const second = [_]dev.PeerConfig{
+        .{ .public_key = k2.public, .allowed_ips = &ips2b, .persistent_keepalive = 25 },
+        .{ .public_key = k3.public, .allowed_ips = &ips3, .endpoint_name = .{ .host = "three.example", .port = 3 } },
+        .{ .public_key = k4.public, .allowed_ips = &ips4 },
+    };
+    const options: dev.Options = .{
+        .private_key = k0.priv,
+        .loopback_only = true,
+        .peers = &first,
+        .lookup = .{ .ctx = &dns_sweep, .func = FakeDns.lookup },
+    };
+
+    // The startup path: fails cleanly at every allocation (no leaks).
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        if (Device.create(fa.allocator(), &clock, fake.tun(), options)) |d| {
+            d.destroy();
+            break;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    try testing.expect(i > 5);
+
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const d = try Device.create(fa.allocator(), &clock, fake.tun(), options);
+    defer d.destroy();
+    const p1 = d.peerByKey(k1.public).?;
+    const p2 = d.peerByKey(k2.public).?;
+    const names = d.resolver.?;
+    i = 0;
+    while (true) : (i += 1) {
+        fa.fail_index = fa.alloc_index + i;
+        if (d.setPeers(&second)) |_| break else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(@as(usize, 2), d.peers.items.len);
+            try testing.expectEqual(p1, d.peers.items[0]);
+            try testing.expectEqual(p2, d.peers.items[1]);
+            try testing.expectEqual(@as(dev.PeerId, 1), p2.id);
+            try testing.expectEqual(@as(?u32, 0), d.routes.lookup(addrOf("10.8.0.2")));
+            try testing.expectEqual(@as(?u32, null), d.routes.lookup(addrOf("10.8.3.1")));
+            try testing.expectEqual(@as(?u32, null), d.routes.lookup(addrOf("10.8.0.4")));
+            try testing.expectEqual(names, d.resolver.?);
+            try testing.expectEqual(@as(u32, 0), p1.resolve.?.slot);
+            try testing.expectEqual(@as(u16, 0), p2.persistent_keepalive);
+            try testing.expectEqual(@as(usize, 2), d.by_key.count());
+        }
+    }
+    try testing.expect(i > 5);
+    fa.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(usize, 3), d.peers.items.len);
+    try testing.expectEqual(p2, d.peers.items[0]);
+    try testing.expectEqual(@as(dev.PeerId, 0), p2.id);
+    try testing.expectEqual(@as(u16, 25), p2.persistent_keepalive);
+    try testing.expectEqual(@as(?*dev.Peer, null), d.peerByKey(k1.public));
+    try testing.expectEqual(@as(?u32, 0), d.routes.lookup(addrOf("10.8.3.1")));
+    try testing.expectEqual(@as(?u32, 1), d.routes.lookup(addrOf("fd00::4")));
+    try testing.expectEqual(@as(?u32, null), d.routes.lookup(addrOf("10.8.0.2")));
+    try testing.expectEqual(@as(usize, 1), d.resolver.?.slots.len);
+    try testing.expectEqual(@as(u32, 0), d.peers.items[1].resolve.?.slot);
+    try testing.expect(d.peers.items[0].resolve == null);
+}

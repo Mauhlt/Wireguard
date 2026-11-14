@@ -104,7 +104,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.I
         return 0;
     }
     if (std.mem.eql(u8, cmd, "show") and args.len == 2) {
-        var c = (try loadConfig(gpa, io, args[1], errw)) orelse return 1;
+        var c = (try config.load(gpa, io, args[1], errw)) orelse return 1;
         defer c.deinit();
         try dev.show.write(out, interfaceName(args[1]), &c, null, null, 0);
         return 0;
@@ -114,7 +114,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.I
             try errw.writeAll("zwg: --tun expects udp:<port>\n");
             return 1;
         } else null;
-        var c = (try loadConfig(gpa, io, args[1], errw)) orelse return 1;
+        var c = (try config.load(gpa, io, args[1], errw)) orelse return 1;
         defer c.deinit();
         return up(gpa, io, interfaceName(args[1]), &c, test_tun, out, errw);
     }
@@ -140,26 +140,6 @@ fn interfaceName(path: []const u8) []const u8 {
     return if (std.ascii.endsWithIgnoreCase(base, ".conf")) base[0 .. base.len - 5] else base;
 }
 
-fn loadConfig(gpa: std.mem.Allocator, io: std.Io, path: []const u8, errw: *std.Io.Writer) !?config.Config {
-    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(config.max_config_bytes)) catch |err| {
-        try errw.print("zwg: cannot read {s}: {s}\n", .{ path, @errorName(err) });
-        return null;
-    };
-    defer {
-        std.crypto.secureZero(u8, text); // the file holds the private key
-        gpa.free(text);
-    }
-    var diag: config.Diagnostic = .{};
-    const c = config.parse(gpa, text, &diag) catch |err| switch (err) {
-        error.InvalidConfig => {
-            try errw.print("zwg: {s}: {f}\n", .{ path, diag });
-            return null;
-        },
-        else => return err,
-    };
-    for (c.warnings) |w| try errw.print("zwg: {s}: line {d}: warning: {s}\n", .{ path, w.line, w.message });
-    return c;
-}
 
 fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Config, test_tun_arg: ?u16, out: *std.Io.Writer, errw: *std.Io.Writer) !u8 {
     // Comptime-known null without -Dtest-tun: the UdpTun path is not compiled in.
@@ -189,17 +169,9 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
         gpa.free(peers);
     }
     for (c.peers, peers) |*p, *pc| {
-        pc.* = .{
-            .public_key = p.public_key,
-            .preshared_key = p.preshared_key,
-            .allowed_ips = p.allowed_ips,
-            .persistent_keepalive = p.persistent_keepalive,
-            .endpoint_name = endpointName(p.endpoint),
-            .endpoint = if (p.endpoint) |e| e.literal() orelse dev.device.resolver.systemLookup(null, io, e.host, e.port) catch |err| blk: {
-                try errw.print("zwg: warning: cannot resolve endpoint {f} yet ({s}); retrying in the background\n", .{ e, @errorName(err) });
-                break :blk null;
-            } else null,
-        };
+        const r = dev.device.PeerConfig.fromConfig(io, p);
+        pc.* = r.peer;
+        if (r.unresolved) |err| try errw.print("zwg: warning: cannot resolve endpoint {f} yet ({s}); retrying in the background\n", .{ p.endpoint.?, @errorName(err) });
     }
 
     const mtu = c.interface.mtu orelse tun.default_mtu;
@@ -238,8 +210,8 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
         tun_open = true;
         break :blk native.tun();
     };
-    for (c.interface.addresses) |a| try t.setAddress(toTunCidr(a));
-    for (c.peers) |*p| for (p.allowed_ips) |a| t.addRoute(toTunCidr(a)) catch |err| {
+    for (c.interface.addresses) |a| try t.setAddress(a.toTun());
+    for (c.peers) |*p| for (p.allowed_ips) |a| t.addRoute(a.toTun()) catch |err| {
         try errw.print("zwg: warning: route {f}: {s}\n", .{ a, @errorName(err) });
     };
     if (c.interface.dns.len + c.interface.dns_search.len != 0)
@@ -275,17 +247,4 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
     return 0;
 }
 
-fn toTunCidr(c: dev.ip.Cidr) wg.tun.Cidr {
-    return switch (c.addr) {
-        .v4 => |b| wg.tun.Cidr.ip4(b, c.prefix),
-        .v6 => |b| wg.tun.Cidr.ip6(b, c.prefix),
-    };
-}
 
-/// The endpoint's DNS name, to look up again while the peer is silent
-/// (null for an IP literal or no endpoint).
-fn endpointName(endpoint: ?config.Endpoint) ?dev.device.EndpointName {
-    const e = endpoint orelse return null;
-    if (e.literal() != null) return null;
-    return .{ .host = e.host, .port = e.port };
-}
