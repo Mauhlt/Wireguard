@@ -1,0 +1,378 @@
+//! In-process end to end: two zwg Devices talking real UDP over
+//! 127.0.0.1, each with a netstack as its Tun (behind a seeded
+//! ImpairedTun). Built as its own test binary in ReleaseSafe (`zig build
+//! test` runs it), because 100 MiB through Debug-mode crypto is slow.
+//!
+//!   * 50 MiB each way at once with loss / reordering / duplication,
+//!     SHA-256 checked on both ends; prints throughput and loss counts.
+//!   * Interactive latency under a saturating bulk stream, without loss
+//!     and with 1% loss on the bulk stream only.
+//!   * TLS 1.3 handshake + data over a netstack stream (std.crypto.tls
+//!     client against a minimal in-test TLS server is not available in
+//!     std, so the TLS smoke test is not here; see the report).
+//!
+//! Everything waits on real events (blocking stream calls with
+//! timeouts); nothing sleeps or polls. Sockets bind 127.0.0.1 only.
+const std = @import("std");
+const wg = @import("WireGuard");
+const ns = wg.netstack;
+const dev = wg.device;
+const t = std.testing;
+
+const server_addr: ns.Addr = .{ .v4 = .{ 10, 8, 0, 1 } };
+const client_addr: ns.Addr = .{ .v4 = .{ 10, 8, 0, 2 } };
+const port_main: u16 = 8420;
+const port_bulk: u16 = 8421;
+const io_timeout_ns: u64 = 60 * std.time.ns_per_s;
+
+const Side = struct {
+    stack: *ns.Stack,
+    imp: ns.testing.ImpairedTun,
+    device: *dev.Device,
+    thread: ?std.Thread = null,
+
+    fn create(gpa: std.mem.Allocator, clock: *dev.device.Clock, addr: ns.Addr, priv: wg.crypto.PrivateKey, peer: dev.device.PeerConfig, seed: u64, imp_in: ns.testing.Impairment, imp_out: ns.testing.Impairment) !*Side {
+        const s = try gpa.create(Side);
+        errdefer gpa.destroy(s);
+        s.stack = try ns.Stack.create(gpa, clock, .{ .address = addr });
+        errdefer s.stack.destroy();
+        s.imp = .init(s.stack.tun(), seed, imp_in, imp_out);
+        s.device = try dev.Device.create(gpa, clock, s.imp.tun(), .{
+            .private_key = priv,
+            .loopback_only = true,
+            .peers = &.{peer},
+        });
+        s.thread = null;
+        return s;
+    }
+
+    fn start(s: *Side) !void {
+        try s.stack.start();
+        s.thread = try std.Thread.spawn(.{}, runDevice, .{s.device});
+    }
+
+    fn runDevice(d: *dev.Device) void {
+        d.run() catch |err| std.debug.print("device loop ended: {s}\n", .{@errorName(err)});
+    }
+
+    fn destroy(s: *Side, gpa: std.mem.Allocator) void {
+        s.stack.abortAll();
+        if (s.thread) |th| {
+            s.device.stop();
+            th.join();
+        }
+        s.stack.stop();
+        s.device.destroy();
+        s.stack.destroy();
+        gpa.destroy(s);
+    }
+};
+
+const Pair = struct {
+    clock: dev.device.Clock,
+    server: *Side,
+    client: *Side,
+
+    fn create(gpa: std.mem.Allocator, imp_in: ns.testing.Impairment, imp_out: ns.testing.Impairment) !*Pair {
+        const p = try gpa.create(Pair);
+        errdefer gpa.destroy(p);
+        p.clock = .{ .io = t.io };
+        var ks: wg.crypto.PrivateKey = undefined;
+        var kc: wg.crypto.PrivateKey = undefined;
+        t.io.random(&ks);
+        t.io.random(&kc);
+        wg.crypto.clampPrivateKey(&ks);
+        wg.crypto.clampPrivateKey(&kc);
+        defer wg.crypto.wipe(&ks);
+        defer wg.crypto.wipe(&kc);
+        const server_cidr = [_]dev.ip.Cidr{try dev.ip.Cidr.parse("10.8.0.1/32")};
+        const client_cidr = [_]dev.ip.Cidr{try dev.ip.Cidr.parse("10.8.0.2/32")};
+        p.server = try Side.create(gpa, &p.clock, server_addr, ks, .{
+            .public_key = wg.crypto.publicKey(kc),
+            .allowed_ips = &client_cidr,
+        }, 0x5e5e, imp_in, imp_out);
+        errdefer p.server.destroy(gpa);
+        p.client = try Side.create(gpa, &p.clock, client_addr, kc, .{
+            .public_key = wg.crypto.publicKey(ks),
+            .allowed_ips = &server_cidr,
+            .endpoint = .{ .ip4 = .loopback(p.server.device.listen_port) },
+        }, 0xc1c1, imp_in, imp_out);
+        errdefer p.client.destroy(gpa);
+        try p.server.start();
+        try p.client.start();
+        return p;
+    }
+
+    fn destroy(p: *Pair, gpa: std.mem.Allocator) void {
+        p.client.destroy(gpa);
+        p.server.destroy(gpa);
+        gpa.destroy(p);
+    }
+};
+
+/// Deterministic byte stream: seeded PRNG, hashed as written / read.
+const Pump = struct {
+    stream: ns.Stream,
+    total: usize,
+    seed: u64,
+    digest: [32]u8 = undefined,
+    bytes: usize = 0,
+    err: ?anyerror = null,
+
+    fn send(p: *Pump) void {
+        p.sendInner() catch |e| {
+            p.err = e;
+        };
+    }
+
+    fn sendInner(p: *Pump) !void {
+        var prng = std.Random.DefaultPrng.init(p.seed);
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        var chunk: [32 * 1024]u8 = undefined;
+        while (p.bytes < p.total) {
+            const n = @min(chunk.len, p.total - p.bytes);
+            prng.random().bytes(chunk[0..n]);
+            h.update(chunk[0..n]);
+            try p.stream.writeAll(chunk[0..n], io_timeout_ns);
+            p.bytes += n;
+        }
+        p.stream.shutdown();
+        h.final(&p.digest);
+    }
+
+    fn recv(p: *Pump) void {
+        p.recvInner() catch |e| {
+            p.err = e;
+        };
+    }
+
+    fn recvInner(p: *Pump) !void {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        var buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = try p.stream.readWait(&buf, io_timeout_ns);
+            if (n == 0) break;
+            h.update(buf[0..n]);
+            p.bytes += n;
+        }
+        h.final(&p.digest);
+    }
+};
+
+fn transfer(gpa: std.mem.Allocator, size: usize, loss_ppm: u32, reorder_ppm: u32, dup_ppm: u32) !void {
+    const imp: ns.testing.Impairment = .{ .loss_ppm = loss_ppm, .reorder_ppm = reorder_ppm, .duplicate_ppm = dup_ppm };
+    const p = try Pair.create(gpa, imp, imp);
+    defer p.destroy(gpa);
+
+    const l = try p.server.stack.listen(port_main);
+    const c = try p.client.stack.dialWait(.{ .addr = server_addr, .port = port_main }, 20 * std.time.ns_per_s);
+    const s = try l.acceptWait(5 * std.time.ns_per_s);
+
+    const t0 = p.clock.now();
+    var c_out: Pump = .{ .stream = c, .total = size, .seed = 1 };
+    var s_in: Pump = .{ .stream = s, .total = size, .seed = 0 };
+    var s_out: Pump = .{ .stream = s, .total = size, .seed = 2 };
+    var c_in: Pump = .{ .stream = c, .total = size, .seed = 0 };
+    const threads = [_]std.Thread{
+        try std.Thread.spawn(.{}, Pump.send, .{&c_out}),
+        try std.Thread.spawn(.{}, Pump.recv, .{&s_in}),
+        try std.Thread.spawn(.{}, Pump.send, .{&s_out}),
+        try std.Thread.spawn(.{}, Pump.recv, .{&c_in}),
+    };
+    for (threads) |th| th.join();
+    const elapsed = p.clock.now() - t0;
+
+    for ([_]*Pump{ &c_out, &s_in, &s_out, &c_in }, [_][]const u8{ "client send", "server recv", "server send", "client recv" }) |pp, name| if (pp.err) |e| {
+        std.debug.print("pump {s} failed: {s} after {d} bytes, now={d}\n  client stats {any}\n  server stats {any}\n", .{
+            name, @errorName(e), pp.bytes, p.clock.now(), p.client.stack.stats(), p.server.stack.stats(),
+        });
+        ns.testing.dumpStream("client", c);
+        ns.testing.dumpStream("server", s);
+        std.debug.print("  device client {any}\n  device server {any}\n  imp client {any}\n  imp server {any}\n", .{ p.client.device.stats, p.server.device.stats, p.client.imp.counts, p.server.imp.counts });
+        return e;
+    };
+    try t.expectEqual(size, s_in.bytes);
+    try t.expectEqual(size, c_in.bytes);
+    try t.expectEqualSlices(u8, &c_out.digest, &s_in.digest);
+    try t.expectEqualSlices(u8, &s_out.digest, &c_in.digest);
+
+    c.close();
+    s.close();
+    l.close();
+
+    const secs = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_s;
+    const mib = @as(f64, @floatFromInt(2 * size)) / (1024 * 1024);
+    const ss = p.server.stack.stats();
+    const cs = p.client.stack.stats();
+    const sc = p.server.imp.counts;
+    const cc = p.client.imp.counts;
+    std.debug.print(
+        \\
+        \\netstack e2e: {d} MiB each way, loss {d} ppm, reorder {d} ppm, dup {d} ppm per direction per side
+        \\  {d:.2} s, {d:.1} MiB/s aggregate ({d:.1} MiB/s each way)
+        \\  impaired: dropped {d}, reordered {d}, duplicated {d}, passed {d}
+        \\  server: tx {d} rx {d} retransmits {d} fast {d} ooo-drop {d} ring-drop {d}
+        \\  client: tx {d} rx {d} retransmits {d} fast {d} ooo-drop {d} ring-drop {d}
+        \\
+    , .{
+        size / (1024 * 1024),                  loss_ppm,           reorder_ppm,     dup_ppm,
+        secs,                                  mib / secs,         mib / 2 / secs,  sc.dropped + cc.dropped,
+        sc.reordered + cc.reordered,           sc.duplicated + cc.duplicated, sc.passed + cc.passed, ss.tx_packets,
+        ss.rx_packets,                         ss.retransmits,     ss.fast_retransmits, ss.dropped_ooo,
+        ss.dropped_ring_full,                  cs.tx_packets,      cs.rx_packets,   cs.retransmits,
+        cs.fast_retransmits,                   cs.dropped_ooo,     cs.dropped_ring_full,
+    });
+}
+
+test "e2e: 50 MiB both ways, 1% loss + reordering + duplication, SHA-256 checked" {
+    // 0.5% per impairment point; a packet crosses two (sender's outbound,
+    // receiver's inbound), so about 1% end to end, both directions.
+    try transfer(t.allocator, 50 * 1024 * 1024, 5_000, 5_000, 1_000);
+}
+
+test "e2e: 50 MiB both ways, clean path" {
+    try transfer(t.allocator, 50 * 1024 * 1024, 0, 0, 0);
+}
+
+// ---- interactive latency under bulk -----------------------------------------
+
+const Bulk = struct {
+    stream: ns.Stream,
+    stop: std.atomic.Value(bool) = .init(false),
+    bytes: std.atomic.Value(usize) = .init(0),
+    err: ?anyerror = null,
+
+    fn send(b: *Bulk) void {
+        var chunk: [64 * 1024]u8 = @splat(0xb0);
+        while (!b.stop.load(.acquire)) {
+            b.stream.writeAll(&chunk, io_timeout_ns) catch |e| {
+                b.err = e;
+                return;
+            };
+            _ = b.bytes.fetchAdd(chunk.len, .monotonic);
+        }
+        b.stream.shutdown();
+    }
+
+    fn drain(b: *Bulk) void {
+        var buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = b.stream.readWait(&buf, io_timeout_ns) catch |e| {
+                b.err = e;
+                return;
+            };
+            if (n == 0) return;
+            _ = b.bytes.fetchAdd(n, .monotonic);
+        }
+    }
+};
+
+const Echo = struct {
+    stream: ns.Stream,
+    clock: *dev.device.Clock,
+    max_ns: i64 = 0,
+    sum_ns: i64 = 0,
+    count: usize = 0,
+    err: ?anyerror = null,
+
+    /// Server side: every 8-byte message carries the sender's clock; the
+    /// one-way latency is now - that (same process, same clock).
+    fn serve(e: *Echo) void {
+        var buf: [8]u8 = undefined;
+        while (true) {
+            var got: usize = 0;
+            while (got < buf.len) {
+                const n = e.stream.readWait(buf[got..], io_timeout_ns) catch |err| {
+                    e.err = err;
+                    return;
+                };
+                if (n == 0) return;
+                got += n;
+            }
+            const sent = std.mem.readInt(i64, &buf, .little);
+            const lat = e.clock.now() - sent;
+            e.max_ns = @max(e.max_ns, lat);
+            e.sum_ns += lat;
+            e.count += 1;
+            e.stream.writeAll(&buf, io_timeout_ns) catch |err| {
+                e.err = err;
+                return;
+            };
+        }
+    }
+};
+
+fn latencyUnderBulk(gpa: std.mem.Allocator, bulk_loss_ppm: u32, bound_ns: i64) !void {
+    const imp: ns.testing.Impairment = .{ .loss_ppm = bulk_loss_ppm, .only_port = port_bulk };
+    const p = try Pair.create(gpa, imp, imp);
+    defer p.destroy(gpa);
+
+    const lb = try p.server.stack.listen(port_bulk);
+    const li = try p.server.stack.listen(port_main);
+    const cb = try p.client.stack.dialWith(.{ .addr = server_addr, .port = port_bulk }, .bulk);
+    try cb.waitConnected(20 * std.time.ns_per_s);
+    const sb = try lb.acceptWait(5 * std.time.ns_per_s);
+    sb.setPriority(.bulk);
+    const ci = try p.client.stack.dialWait(.{ .addr = server_addr, .port = port_main }, 5 * std.time.ns_per_s);
+    const si = try li.acceptWait(5 * std.time.ns_per_s);
+
+    // Bulk: server -> client, saturating; the client drains it.
+    var bulk_tx: Bulk = .{ .stream = sb };
+    var bulk_rx: Bulk = .{ .stream = cb };
+    const tx = try std.Thread.spawn(.{}, Bulk.send, .{&bulk_tx});
+    const rx = try std.Thread.spawn(.{}, Bulk.drain, .{&bulk_rx});
+    var echo: Echo = .{ .stream = si, .clock = &p.clock };
+    const eth = try std.Thread.spawn(.{}, Echo.serve, .{&echo});
+
+    // Ping-pong until at least `samples` round trips AND the bulk stream
+    // has moved `bulk_target` bytes meanwhile (the counter is observed
+    // between blocking round trips; nothing sleeps).
+    var rounds: usize = 0;
+    var rtt_max: i64 = 0;
+    const samples = 300;
+    const bulk_target = 16 * 1024 * 1024;
+    var buf: [8]u8 = undefined;
+    while (rounds < samples or bulk_rx.bytes.load(.monotonic) < bulk_target) : (rounds += 1) {
+        const sent = p.clock.now();
+        std.mem.writeInt(i64, &buf, sent, .little);
+        try ci.writeAll(&buf, io_timeout_ns);
+        var got: usize = 0;
+        while (got < buf.len) {
+            const n = try ci.readWait(buf[got..], io_timeout_ns);
+            if (n == 0) return error.EchoClosed;
+            got += n;
+        }
+        rtt_max = @max(rtt_max, p.clock.now() - sent);
+    }
+    bulk_tx.stop.store(true, .release);
+    ci.shutdown();
+    tx.join();
+    rx.join();
+    eth.join();
+    if (bulk_tx.err) |e| return e;
+    if (bulk_rx.err) |e| return e;
+    if (echo.err) |e| return e;
+    const bulk_bytes_during = bulk_rx.bytes.load(.monotonic);
+
+    const avg = @divTrunc(echo.sum_ns, @as(i64, @intCast(@max(echo.count, 1))));
+    std.debug.print(
+        \\
+        \\netstack latency under bulk (bulk loss {d} ppm on the bulk stream): {d} samples, one-way avg {d} us, max {d} us, echo RTT max {d} us; bulk moved {d} MiB meanwhile
+        \\
+    , .{ bulk_loss_ppm, echo.count, @divTrunc(avg, 1000), @divTrunc(echo.max_ns, 1000), @divTrunc(rtt_max, 1000), bulk_bytes_during / (1024 * 1024) });
+    try t.expectEqual(rounds, echo.count);
+    try t.expect(bulk_bytes_during >= bulk_target);
+    try t.expect(echo.max_ns < bound_ns);
+    ci.close();
+    si.close();
+    cb.close();
+    sb.close();
+}
+
+test "e2e: interactive latency stays low under a saturating bulk stream (no loss)" {
+    try latencyUnderBulk(t.allocator, 0, 20 * std.time.ns_per_ms);
+}
+
+test "e2e: interactive latency under 1 RTO with 1% loss on the bulk stream" {
+    try latencyUnderBulk(t.allocator, 5_000, 200 * std.time.ns_per_ms);
+}

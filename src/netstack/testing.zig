@@ -58,6 +58,21 @@ pub const Peer = struct {
     }
 };
 
+/// Prints a stream's TCP state (diagnostics for failing tests).
+pub fn dumpStream(name: []const u8, s: root.Stream) void {
+    const k = s.debugConn() orelse {
+        std.debug.print("  {s}: (stale handle)\n", .{name});
+        return;
+    };
+    std.debug.print("  {s}: {t} una={d} nxt={d} max={d} base={d} wnd={d} cwnd={d} ssthresh={d} recovery={} dupacks={d}\n" ++
+        "      rcv_nxt={d} rcv_len={d} ooo={d} fin_seq={?d} eof={} unsent={d} snd_len={d} fin_queued={}\n" ++
+        "      rto_at={?d} persist_at={?d} delack_at={?d} rto={d} backoff={d} ack_now={} probe={} err={?}\n", .{
+        name,      k.state,     k.snd_una,  k.snd_nxt,   k.snd_max,    k.snd_base, k.snd_wnd, k.cwnd, k.ssthresh, k.in_recovery, k.dupacks,
+        k.rcv_nxt, k.rcv.len,   k.ooo_len,  k.fin_seq,   k.eof,        k.unsent(), k.snd.len, k.fin_queued,
+        k.rto_at,  k.persist_at, k.delack_at, k.rto,     k.backoff,    k.ack_now,  k.probe_now, k.err,
+    });
+}
+
 /// Seeded per-direction impairment, in parts per million.
 pub const Impairment = struct {
     loss_ppm: u32 = 0,

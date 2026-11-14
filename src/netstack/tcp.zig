@@ -910,13 +910,13 @@ pub const Conn = struct {
             .syn_sent => return if (c.send_syn) c.emitSyn(env, buf, ip_id, false) else null,
             .syn_received => {
                 if (c.send_syn) return c.emitSyn(env, buf, ip_id, true);
-                if (c.ack_now) return c.emit(env, buf, ip_id, c.snd_nxt, .{}, &.{});
+                if (c.ack_now) return c.pureAck(env, buf, ip_id);
                 return null;
             },
             .time_wait, .fin_wait_2 => {
                 if (c.ack_now or c.probe_now) {
                     c.probe_now = false;
-                    return c.emit(env, buf, ip_id, c.snd_nxt, .{}, &.{});
+                    return c.pureAck(env, buf, ip_id);
                 }
                 return null;
             },
@@ -945,8 +945,18 @@ pub const Conn = struct {
             c.probe_now = false;
             return c.emit(env, buf, ip_id, c.snd_una -% 1, .{}, &.{});
         }
-        if (c.ack_now) return c.emit(env, buf, ip_id, c.snd_nxt, .{}, &.{});
+        if (c.ack_now) return c.pureAck(env, buf, ip_id);
         return null;
+    }
+
+    /// An ACK without data. Its sequence number is snd_max, not snd_nxt
+    /// (BSD tcp_output does the same): after a retransmission timeout
+    /// snd_nxt is rolled back to snd_una, and the peer, which may already
+    /// hold everything up to snd_max, would find a pure ACK at snd_nxt
+    /// "unacceptable" and drop it unprocessed. With both ends in that
+    /// state the connection would never recover.
+    fn pureAck(c: *Conn, env: *const Env, buf: []u8, ip_id: u16) ?[]u8 {
+        return c.emit(env, buf, ip_id, c.snd_max, .{}, &.{});
     }
 
     /// New (or go-back-N) data within min(snd_wnd, cwnd), or a FIN.

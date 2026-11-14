@@ -295,8 +295,10 @@ pub const Stack = struct {
             }
             busy = n == inbound_batch;
             const now = s.clock.now();
-            const deadline = s.timersLocked(now);
+            _ = s.timersLocked(now);
             s.flushLocked();
+            // After the flush: sending arms retransmission timers.
+            const deadline = s.earliestDeadline();
             s.unlock();
 
             var handles: [3]os.WaitHandle = undefined;
@@ -331,12 +333,12 @@ pub const Stack = struct {
         while (true) {
             const occupancy = ring.tail.raw -% ring.head.load(.acquire);
             if (occupancy >= cap) {
-                s.out_stalled.store(true, .release);
+                if (s.stallRecheck(cap)) continue;
                 return;
             }
             const bulk_ok = occupancy < bulkRingShare(cap);
             const p = s.nextPacket(s.out_buf, bulk_ok) orelse {
-                if (!bulk_ok) s.out_stalled.store(true, .release);
+                if (!bulk_ok and s.stallRecheck(cap)) continue;
                 return;
             };
             s.outbound.send(p) catch {
@@ -344,6 +346,20 @@ pub const Stack = struct {
                 return;
             };
         }
+    }
+
+    /// Marks the ring stalled (the device's read kicks us once it has
+    /// drained to a quarter), then re-checks: if the device drained it
+    /// before seeing the mark, nobody would wake us. True = go on now.
+    fn stallRecheck(s: *Stack, cap: u32) bool {
+        s.out_stalled.store(true, .seq_cst);
+        const ring = &s.outbound.ring;
+        const occupancy = ring.tail.raw -% ring.head.load(.seq_cst);
+        if (occupancy <= cap / 4) {
+            s.out_stalled.store(false, .seq_cst);
+            return true;
+        }
+        return false;
     }
 
     /// The most packets bulk data may have in the outbound ring.
@@ -566,6 +582,15 @@ pub const Stack = struct {
 
     // ---- timers -----------------------------------------------------------------
 
+    fn earliestDeadline(s: *Stack) ?i64 {
+        var earliest: ?i64 = null;
+        for (s.slots) |*sl| {
+            if (!sl.used) continue;
+            if (sl.conn.nextDeadline()) |d| earliest = if (earliest) |x| @min(x, d) else d;
+        }
+        return earliest;
+    }
+
     fn timersLocked(s: *Stack, now: i64) ?i64 {
         var e = s.env(now);
         var earliest: ?i64 = null;
@@ -755,10 +780,10 @@ pub const Stack = struct {
     fn tunRead(ptr: *anyopaque, buf: []u8) wg_tun.ReadError!?[]u8 {
         const s = fromPtr(ptr);
         const p = s.outbound.recv(buf) catch return error.BufferTooSmall;
-        if (s.out_stalled.load(.acquire)) {
+        if (s.out_stalled.load(.seq_cst)) {
             const ring = &s.outbound.ring;
-            const occupancy = ring.tail.load(.acquire) -% ring.head.raw;
-            if (occupancy <= ring.capacity() / 4 and s.out_stalled.swap(false, .acq_rel)) s.kick.signal();
+            const occupancy = ring.tail.load(.seq_cst) -% ring.head.raw;
+            if (occupancy <= ring.capacity() / 4 and s.out_stalled.swap(false, .seq_cst)) s.kick.signal();
         }
         return p;
     }
@@ -1043,6 +1068,15 @@ pub const Stream = struct {
             .read_available = c.rcv.len,
             .write_available = c.writeRoom(&s.options.limits),
         };
+    }
+
+    /// A snapshot of the connection's TCP state (tests and diagnostics).
+    pub fn debugConn(st: Stream) ?tcp.Conn {
+        const s = st.stack;
+        s.lock();
+        defer s.unlock();
+        const sl = s.slotOf(st.id) orelse return null;
+        return sl.conn;
     }
 
     pub fn local(st: Stream) Endpoint {
