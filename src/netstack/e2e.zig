@@ -211,16 +211,16 @@ fn transfer(gpa: std.mem.Allocator, size: usize, loss_ppm: u32, reorder_ppm: u32
         \\netstack e2e: {d} MiB each way, loss {d} ppm, reorder {d} ppm, dup {d} ppm per direction per side
         \\  {d:.2} s, {d:.1} MiB/s aggregate ({d:.1} MiB/s each way)
         \\  impaired: dropped {d}, reordered {d}, duplicated {d}, passed {d}
-        \\  server: tx {d} rx {d} retransmits {d} fast {d} ooo-drop {d} ring-drop {d}
-        \\  client: tx {d} rx {d} retransmits {d} fast {d} ooo-drop {d} ring-drop {d}
+        \\  server: tx {d} rx {d} retransmits {d} fast {d} rto {d} ooo-drop {d} ring-drop {d}
+        \\  client: tx {d} rx {d} retransmits {d} fast {d} rto {d} ooo-drop {d} ring-drop {d}
         \\
     , .{
         size / (1024 * 1024),                  loss_ppm,           reorder_ppm,     dup_ppm,
         secs,                                  mib / secs,         mib / 2 / secs,  sc.dropped + cc.dropped,
         sc.reordered + cc.reordered,           sc.duplicated + cc.duplicated, sc.passed + cc.passed, ss.tx_packets,
-        ss.rx_packets,                         ss.retransmits,     ss.fast_retransmits, ss.dropped_ooo,
+        ss.rx_packets,                         ss.retransmits,     ss.fast_retransmits, ss.rto_expirations, ss.dropped_ooo,
         ss.dropped_ring_full,                  cs.tx_packets,      cs.rx_packets,   cs.retransmits,
-        cs.fast_retransmits,                   cs.dropped_ooo,     cs.dropped_ring_full,
+        cs.fast_retransmits, cs.rto_expirations, cs.dropped_ooo,     cs.dropped_ring_full,
     });
 }
 

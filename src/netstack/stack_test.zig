@@ -664,6 +664,8 @@ fn lossyTransfer(seed: u64, loss_ppm: u32, reorder_ppm: u32, size: usize) !void 
         return e;
     };
     try t.expectEqualSlices(u8, data, x.got.items);
+    const st = l.a.stats();
+    std.debug.print("lossy link seed {d} loss {d} reorder {d}: {d} KiB in {d} ms simulated, rto {d} fast {d} retrans {d} dropped {d}\n", .{ seed, loss_ppm, reorder_ppm, size / 1024, @divTrunc(l.clock.offset_ns.load(.monotonic), std.time.ns_per_ms), st.rto_expirations, st.fast_retransmits, st.retransmits, l.dropped });
 }
 
 test "two stacks over a lossy, reordering link: data intact" {
