@@ -16,6 +16,7 @@ the Linux kernel / wireguard-go behaviour and say so in a comment.
 ```
 src/root.zig          re-exports the modules below
 src/crypto.zig        shared primitives (owned by the noise agent; others only import)
+src/ip.zig            IP addresses and prefixes (Addr, Cidr): the one type for device and tun
 src/noise/            handshake: messages 1/2, cookie reply, MAC1/MAC2, state machine  (agent: noise)
 src/session/          keypairs, transport data, counters + replay window, timers           (agent: session)
 src/device/           peers, allowed-IPs trie, config (.conf), UDP, packet routing, CLI    (agent: device)
@@ -25,6 +26,7 @@ src/service/          Windows tunnel service (zwg installtunnel), control pipe, 
 ```
 
 Dependencies point one way: device → session → noise → crypto; device → tun;
+device, tun → ip (ip depends only on std; tun never imports device code);
 service → device, tun (design: tests/interop/README.md, "Elevation design").
 No module reaches into another's internals; only the public API below.
 
@@ -141,7 +143,8 @@ wiped, a new preshared key drops that peer's sessions.
 ## tun (src/tun)
 
 `Tun` interface: `open(name, mtu)`, `readable event handle` (for the device's
-wait), `read(buf) ?[]u8`, `write(packet)`, `setAddress(cidr)`, `mtu`, `close`.
+wait), `read(buf) ?[]u8`, `write(packet)`, `setAddress(cidr)`, `addRoute(cidr)`, `mtu`, `close`
+(`cidr` is the shared `ip.Cidr`, src/ip.zig).
 Backends: Windows (Wintun — a signed kernel driver; load wintun.dll at
 runtime by full path after checking its Authenticode signer is WireGuard
 LLC, do NOT ship it; document the exception: a userspace TUN on Windows
