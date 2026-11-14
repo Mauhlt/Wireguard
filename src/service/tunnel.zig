@@ -155,17 +155,9 @@ fn runTunnel(paths: ?*const store.Paths) state.Exit {
         gpa.free(peers);
     }
     for (c.peers, peers) |*cp, *pc| {
-        pc.* = .{
-            .public_key = cp.public_key,
-            .preshared_key = cp.preshared_key,
-            .allowed_ips = cp.allowed_ips,
-            .persistent_keepalive = cp.persistent_keepalive,
-            .endpoint_name = endpointName(cp.endpoint),
-            .endpoint = if (cp.endpoint) |e| e.literal() orelse device.device.resolver.systemLookup(null, g.io, e.host, e.port) catch |err| blk: {
-                log.print("cannot resolve endpoint {f} yet: {s}; retrying in the background", .{ e, @errorName(err) });
-                break :blk null;
-            } else null,
-        };
+        const r = device.device.PeerConfig.fromConfig(g.io, cp);
+        pc.* = r.peer;
+        if (r.unresolved) |err| log.print("cannot resolve endpoint {f} yet: {s}; retrying in the background", .{ cp.endpoint.?, @errorName(err) });
     }
     locked(state.Machine.starting, .{});
 
@@ -176,11 +168,11 @@ fn runTunnel(paths: ?*const store.Paths) state.Exit {
     };
     defer native.close();
     const t = native.tun();
-    for (c.interface.addresses) |a| t.setAddress(toTunCidr(a)) catch |err| {
+    for (c.interface.addresses) |a| t.setAddress(a.toTun()) catch |err| {
         log.print("cannot set address {f}: {s}", .{ a, @errorName(err) });
         return .address_failed;
     };
-    for (c.peers) |*cp| for (cp.allowed_ips) |a| t.addRoute(toTunCidr(a)) catch |err| {
+    for (c.peers) |*cp| for (cp.allowed_ips) |a| t.addRoute(a.toTun()) catch |err| {
         log.print("warning: route {f}: {s}", .{ a, @errorName(err) });
     };
     if (c.interface.dns.len + c.interface.dns_search.len != 0)
@@ -221,16 +213,3 @@ fn runTunnel(paths: ?*const store.Paths) state.Exit {
     return .ok;
 }
 
-fn toTunCidr(c: device.ip.Cidr) tun.Cidr {
-    return switch (c.addr) {
-        .v4 => |b| tun.Cidr.ip4(b, c.prefix),
-        .v6 => |b| tun.Cidr.ip6(b, c.prefix),
-    };
-}
-
-/// The endpoint's DNS name (null for an IP literal or none), as `zwg up`.
-fn endpointName(endpoint: ?config.Endpoint) ?device.device.EndpointName {
-    const e = endpoint orelse return null;
-    if (e.literal() != null) return null;
-    return .{ .host = e.host, .port = e.port };
-}

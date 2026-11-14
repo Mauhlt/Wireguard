@@ -38,11 +38,11 @@ pub const max_backoff: i64 = 120 * ns_per_s;
 /// Longest host name kept (RFC 1035: 253 characters).
 pub const max_host = 253;
 
-/// IP literal or DNS name -> one address. IPv4 is preferred (the device
-/// always has an IPv4 socket; IPv6 only when the host supports it).
+/// DNS name -> one address (IP literals never get here:
+/// `config.Endpoint.literal`). IPv4 is preferred (the device always has an
+/// IPv4 socket; IPv6 only when the host supports it).
 pub fn systemLookup(ctx: ?*anyopaque, io: std.Io, host: []const u8, port: u16) anyerror!net.IpAddress {
     _ = ctx;
-    if (net.IpAddress.parse(host, port)) |a| return a else |_| {}
     const h = try net.HostName.init(host);
     var buf: [32]net.HostName.LookupResult = undefined;
     var q: std.Io.Queue(net.HostName.LookupResult) = .init(&buf);
@@ -326,10 +326,3 @@ test "shared slots: host names are bounded" {
     try testing.expectError(error.InvalidHost, Shared.create(testing.io, .{}, &.{""}, &.{1}));
 }
 
-test "system lookup: literals need no DNS, IPv4 preferred" {
-    const a = try systemLookup(null, testing.io, "192.0.2.7", 51820);
-    try testing.expectEqual(@as(u16, 51820), a.getPort());
-    try testing.expect(a == .ip4);
-    const b = try systemLookup(null, testing.io, "2001:db8::1", 9);
-    try testing.expect(b == .ip6);
-}

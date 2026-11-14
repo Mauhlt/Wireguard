@@ -41,6 +41,7 @@ const AllowedIps = @import("allowed_ips.zig").AllowedIps;
 const IndexTable = @import("index_table.zig").IndexTable;
 const ratelimit = @import("ratelimit.zig");
 const show = @import("show.zig");
+const config = @import("config.zig");
 pub const resolver = @import("resolver.zig");
 
 const log = std.log.scoped(.zwg);
@@ -87,11 +88,6 @@ pub const Clock = struct {
     }
 };
 
-pub const EndpointName = struct {
-    host: []const u8,
-    port: u16,
-};
-
 pub const PeerConfig = struct {
     public_key: crypto.PublicKey,
     preshared_key: ?crypto.PresharedKey = null,
@@ -99,9 +95,39 @@ pub const PeerConfig = struct {
     /// The configured endpoint when it is a DNS name (`endpoint` is what it
     /// resolved to at start, or null if that failed): looked up again while
     /// the peer does not answer (resolver.zig). null for an IP literal.
-    endpoint_name: ?EndpointName = null,
+    endpoint_name: ?config.Endpoint = null,
     allowed_ips: []const ip.Cidr = &.{},
     persistent_keepalive: u16 = 0,
+
+    pub const FromConfig = struct {
+        peer: PeerConfig,
+        /// Why the endpoint name did not resolve now (`peer.endpoint` is
+        /// then null; the device keeps looking it up).
+        unresolved: ?anyerror = null,
+    };
+
+    /// The device's view of a parsed `[Peer]` (slices shared with `p`).
+    /// An endpoint name is looked up now (blocking); `zwg up` and the
+    /// tunnel service both start from here.
+    pub fn fromConfig(io: std.Io, p: *const config.Peer) FromConfig {
+        var r: FromConfig = .{ .peer = .{
+            .public_key = p.public_key,
+            .preshared_key = p.preshared_key,
+            .allowed_ips = p.allowed_ips,
+            .persistent_keepalive = p.persistent_keepalive,
+        } };
+        const e = p.endpoint orelse return r;
+        if (e.literal()) |a| {
+            r.peer.endpoint = a;
+            return r;
+        }
+        r.peer.endpoint_name = e;
+        r.peer.endpoint = resolver.systemLookup(null, io, e.host, e.port) catch |err| {
+            r.unresolved = err;
+            return r;
+        };
+        return r;
+    }
 };
 
 pub const Options = struct {
@@ -860,6 +886,27 @@ pub const Device = struct {
         return d.peers.items[id];
     }
 };
+
+test "peer config from a parsed [Peer]: literal endpoints need no lookup and no name" {
+    var allowed = [_]ip.Cidr{try ip.Cidr.parse("10.8.0.1/32")};
+    var p: config.Peer = .{
+        .public_key = @splat(7),
+        .allowed_ips = &allowed,
+        .persistent_keepalive = 25,
+        .endpoint = try config.Endpoint.parse("[2001:db8::1]:51820"),
+    };
+    const r = PeerConfig.fromConfig(std.testing.io, &p);
+    try std.testing.expectEqual(@as(?anyerror, null), r.unresolved);
+    try std.testing.expect(r.peer.endpoint.? == .ip6);
+    try std.testing.expectEqual(@as(u16, 51820), r.peer.endpoint.?.getPort());
+    try std.testing.expectEqual(@as(?config.Endpoint, null), r.peer.endpoint_name);
+    try std.testing.expectEqual(@as(u16, 25), r.peer.persistent_keepalive);
+    try std.testing.expectEqual(@as(usize, 1), r.peer.allowed_ips.len);
+    p.endpoint = null;
+    const n = PeerConfig.fromConfig(std.testing.io, &p);
+    try std.testing.expectEqual(@as(?net.IpAddress, null), n.peer.endpoint);
+    try std.testing.expectEqual(@as(?config.Endpoint, null), n.peer.endpoint_name);
+}
 
 test "the device clock is the one that counts suspended time (.boot)" {
     try std.testing.expectEqual(std.Io.Clock.boot, monotonic_clock);
