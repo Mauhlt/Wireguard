@@ -186,13 +186,22 @@ pub const Utun = struct {
                 .BADF, .NOTCONN, .IO => return error.Closed,
                 else => return error.Unexpected,
             };
-            if (n <= 4) continue; // empty / malformed frame: skip it
-            const len: usize = @intCast(n - 4);
+            const len = (try frameLen(n)) orelse continue; // malformed frame: skip it
             // A datagram socket truncates silently; a full buffer smaller than
             // the MTU may have lost bytes.
             if (len == buf.len and buf.len < t.mtu_value) return error.BufferTooSmall;
             return buf[0..len];
         }
+    }
+
+    /// The packet length of a utun readv that returned `n` >= 0 bytes
+    /// (4-byte address family header + packet). 0 is end of file: the
+    /// interface is gone (looping on it would spin); 1..4 is a frame
+    /// without a packet, skipped.
+    pub fn frameLen(n: isize) error{Closed}!?usize {
+        if (n == 0) return error.Closed;
+        if (n <= 4) return null;
+        return @intCast(n - 4);
     }
 
     fn write(ptr: *anyopaque, packet: []const u8) root.WriteError!void {
