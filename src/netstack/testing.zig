@@ -64,6 +64,15 @@ pub const Impairment = struct {
     /// Hold a packet back and release it after the next one.
     reorder_ppm: u32 = 0,
     duplicate_ppm: u32 = 0,
+    /// Impair only TCP packets with this source or destination port
+    /// (null: every packet).
+    only_port: ?u16 = null,
+
+    fn applies(i: Impairment, packet: []const u8) bool {
+        const port = i.only_port orelse return true;
+        const p = wire.parseTcp4(packet) catch return false;
+        return p.tcp.src_port == port or p.tcp.dst_port == port;
+    }
 };
 
 /// Wraps a Tun (normally `Stack.tun()`) and impairs both directions:
@@ -129,6 +138,10 @@ pub const ImpairedTun = struct {
 
     fn write(ptr: *anyopaque, packet: []const u8) wg_tun.WriteError!void {
         const t = self(ptr);
+        if (!t.inbound.applies(packet)) {
+            t.counts.passed += 1;
+            return t.inner.write(packet);
+        }
         if (t.hit(t.inbound.loss_ppm)) {
             t.counts.dropped += 1;
             return;
@@ -164,6 +177,10 @@ pub const ImpairedTun = struct {
                 }
                 return null;
             };
+            if (!t.outbound.applies(p)) {
+                t.counts.passed += 1;
+                return p;
+            }
             if (t.hit(t.outbound.loss_ppm)) {
                 t.counts.dropped += 1;
                 continue;

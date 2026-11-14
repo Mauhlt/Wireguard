@@ -188,7 +188,8 @@ ns.Addr = device.ip.Addr                  // .v4 only for now (IPv6 kept in the 
 ns.Endpoint { addr: Addr, port: u16 }
 ns.Limits { max_connections=64, max_listeners=8, send_buffer=256K, recv_buffer=256K,
             syn_backlog=16, accept_backlog=16, max_ooo_segments=32, ring_packets=512,
-            time_wait_ns=2s, user_timeout_ns=60s }
+            time_wait_ns=2s, user_timeout_ns=60s, bulk_unsent_lowat=64K }
+ns.Priority = enum { interactive, bulk }
 ns.Options { address: Addr, mtu=1420, limits, keepalive_idle_ns: ?u64=null, icmp_echo=true }
 
 // Everything in one call (what Portal embeds):
@@ -201,9 +202,12 @@ stack.start() / stack.stop() / stack.destroy()
 stack.input(packet) / stack.output(buf) ?[]u8 / stack.runTimers() ?i64   // manual drive (tests)
 
 stack.listen(port) !Listener              // bound to Options.address only
-stack.dial(Endpoint) !Stream              // returns at once (SYN sent)
+stack.dial(Endpoint) !Stream              // returns at once (SYN sent); .interactive
+stack.dialWith(Endpoint, Priority) !Stream
 stack.dialWait(Endpoint, timeout_ns: ?u64) !Stream
 stack.readyHandle() WaitHandle; stack.clearReady()   // event-loop hosts
+stack.setReadyCallback(ctx, ?*const fn (?*anyopaque) void) // called when readyHandle is signalled
+stack.abortAll()                          // RST everything, wake every blocked call
 stack.stats() Stats
 
 listener.accept() !Stream (WouldBlock) | acceptWait(timeout_ns) !Stream | close() | port()
@@ -215,11 +219,27 @@ stream.waitConnected(timeout_ns) !void
 stream.shutdown()              // FIN after buffered data
 stream.close()                 // graceful, releases the handle (RST if unread data)
 stream.abort()                 // RST, releases the handle
+stream.setPriority(.interactive | .bulk)  // default .interactive
 stream.status() Status { state, readable, writable, read_available, write_available }
 stream.local() / remote() Endpoint
 stream.reader(buf, timeout_ns) Stream.Reader   // .interface: std.Io.Reader, .err
 stream.writer(buf, timeout_ns) Stream.Writer   // .interface: std.Io.Writer, .err
 ```
+
+Interactive vs bulk (a large transfer must never delay a keystroke; bytes in
+one stream are ordered, so Portal uses separate connections). Output
+scheduler, per packet: control replies (RST, ICMP), then interactive
+streams (any segment: data, retransmissions, ACKs), then bulk streams'
+control-only segments (pure ACKs, window updates, SYN, bare FIN), then
+bulk data; round-robin inside each class. Bulk data may occupy at most
+half of the stack -> device ring, so an interactive packet always finds
+room. A bulk stream accepts writes only while it has fewer than
+`bulk_unsent_lowat` unsent bytes (like TCP_NOTSENT_LOWAT), so its backlog
+stays in the application. No Nagle, no delayed sends for anything.
+
+The ready callback runs on the stack thread (or on a host thread whose
+call changed state, e.g. close), after the stack lock is released; it
+must be quick, must not block and must not call back into the stack.
 
 Errors: WouldBlock, Timeout (the call's own timeout; stream still usable),
 Closed (handle closed / stale / stack gone), ConnectionRefused,
