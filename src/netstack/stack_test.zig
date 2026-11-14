@@ -30,19 +30,8 @@ fn otherHost(a: root.Addr, last: u8) root.Addr {
     return x;
 }
 
-/// An ICMP (IPv4) or ICMPv6 message of type `kind` from `src` to `dst`,
-/// identifier 0x1234, sequence 1, then `data`; checksums valid.
-fn icmpPacket(buf: []u8, src: root.Addr, dst: root.Addr, kind: u8, data: []const u8) []u8 {
-    const v6 = src == .v6;
-    const hl = wire.ipHeaderLen(src);
-    const msg = buf[hl..][0 .. 8 + data.len];
-    msg[0..8].* = .{ kind, 0, 0, 0, 0x12, 0x34, 0, 1 };
-    @memcpy(msg[8..], data);
-    const sum = if (v6) wire.icmp6Checksum(src, dst, msg) else wire.checksum(msg);
-    std.mem.writeInt(u16, msg[2..4], sum, .big);
-    _ = wire.writeIpHeader(buf, src, dst, if (v6) wire.proto_icmp6 else wire.proto_icmp, 1, msg.len) catch @panic("icmpPacket");
-    return buf[0 .. hl + msg.len];
-}
+const icmpPacket = root.testing.icmpPacket;
+const withExtHeaders = root.testing.withExtHeaders6;
 
 fn echoRequestKind(a: root.Addr) u8 {
     return if (a == .v6) wire.icmp6_echo_request else wire.icmp_echo_request;
@@ -1113,4 +1102,247 @@ test "SACK: a flood of random blocks costs bounded work and output per ACK" {
     // Each ACK releases at most a handful of segments (pipe-limited), not
     // a burst proportional to the junk it carried.
     try t.expect(max_out_per_ack <= 12);
+}
+// ---- IPv6 ------------------------------------------------------------------
+// Handshakes both ways, data, FIN / RST, retransmission, user timeout,
+// ICMP echo and the two-stack transfers run over both families above
+// (`families`); what follows is IPv6-specific.
+
+
+test "IPv6: MSS 1360 at MTU 1420 (SYN-ACK, our SYN, full-size segments fill the MTU)" {
+    var r: Rig = undefined;
+    try r.initFor(fam6, .{});
+    defer r.deinit();
+    try t.expectEqual(@as(u16, 1420), r.stack.options.mtu);
+    const l = try r.stack.listen(8420);
+    // The peer offers more than fits: segments are capped at 1360.
+    r.send(.{ .seq = 1000, .flags = .{ .syn = true }, .options = .{ .mss = 1440 } });
+    const sa = try r.recv();
+    try t.expectEqual(@as(?u16, 1360), sa.options.mss);
+    r.send(.{ .seq = 1001, .ack = sa.seq +% 1, .flags = .{ .ack = true }, .window = 0xffff });
+    const st = try l.accept();
+    try t.expectEqual(@as(u16, 1360), st.debugConn().?.mss);
+    var data: [3000]u8 = @splat('6');
+    _ = try st.write(&data);
+    const p = r.stack.output(&r.out).?;
+    try t.expectEqual(@as(usize, 1420), p.len); // 40 + 20 + 1360
+    try t.expectEqual(@as(usize, 1360), (try r.peer.expect(p)).payload.len);
+    while (r.stack.output(&r.out)) |_| {}
+    // Our own SYN offers 1360 too.
+    _ = try r.stack.dial(.{ .addr = peer_addr6, .port = 9000 });
+    r.peer.peer.port = 9000;
+    const syn = try r.peer.expectAnyPort(r.stack.output(&r.out).?);
+    try t.expect(syn.flags.syn);
+    try t.expectEqual(@as(?u16, 1360), syn.options.mss);
+}
+
+test "IPv6: extension headers: padding options walked, fragments and the rest dropped" {
+    var r: Rig = undefined;
+    try r.initFor(fam6, .{});
+    defer r.deinit();
+    _ = try r.stack.listen(8420);
+    var ext: [2048]u8 = undefined;
+    // hop-by-hop + destination options in front of a SYN: answered.
+    r.stack.input(withExtHeaders(&ext, r.peer.packet(&r.buf, .{ .seq = 1, .flags = .{ .syn = true } }), &.{ 0, 60 }));
+    const sa = try r.recv();
+    try t.expect(sa.flags.syn and sa.flags.ack);
+    try t.expectEqual(@as(u32, 2), sa.ack);
+    // Up to four headers are walked.
+    r.peer.peer.port = 40001;
+    r.stack.input(withExtHeaders(&ext, r.peer.packet(&r.buf, .{ .seq = 1, .flags = .{ .syn = true } }), &.{ 0, 60, 60, 60 }));
+    try t.expect((try r.recv()).flags.syn);
+    const before = r.stack.stats().dropped_malformed;
+    r.peer.peer.port = 40002;
+    const rejected = [_][]const u8{
+        &.{ 0, 60, 60, 60, 60 }, // five: too many
+        &.{44}, // fragment, even an atomic one
+        &.{ 60, 44 }, // fragment after a padding header
+        &.{43}, // routing
+        &.{51}, // AH
+        &.{50}, // ESP
+        &.{59}, // no next header
+        &.{ 60, 0 }, // hop-by-hop not first
+    };
+    for (rejected) |kinds| {
+        r.stack.input(withExtHeaders(&ext, r.peer.packet(&r.buf, .{ .seq = 1, .flags = .{ .syn = true } }), kinds));
+        try r.expectSilent(); // no SYN-ACK, and no RST either
+    }
+    try t.expectEqual(before + rejected.len, r.stack.stats().dropped_malformed);
+    try t.expectEqual(@as(u16, 2), r.stack.stats().connections);
+    // A SYN to a closed port behind a padding header gets a plain RST.
+    r.peer.stack.port = 9999;
+    r.stack.input(withExtHeaders(&ext, r.peer.packet(&r.buf, .{ .seq = 5, .flags = .{ .syn = true } }), &.{60}));
+    const rst = try r.recv();
+    try t.expect(rst.flags.rst and rst.flags.ack);
+    try t.expectEqual(@as(u32, 6), rst.ack);
+}
+
+test "IPv6: ICMPv6 echo behind a header, pseudo-header checksum required, other ICMPv6 ignored" {
+    var r: Rig = undefined;
+    try r.initFor(fam6, .{});
+    defer r.deinit();
+    var ext: [2048]u8 = undefined;
+    // Odd-length data behind a destination-options header: the reply
+    // carries no extension header.
+    r.stack.input(withExtHeaders(&ext, icmpPacket(&r.buf, peer_addr6, stack_addr6, wire.icmp6_echo_request, "odd"), &.{60}));
+    const reply = r.stack.output(&r.out).?;
+    try t.expectEqual(@as(usize, 40 + 8 + 3), reply.len);
+    const ip = try wire.parseIp(reply);
+    try t.expectEqual(wire.icmp6_echo_reply, try wire.icmp6Type(ip.src, ip.dst, ip.payload));
+    try t.expectEqualStrings("odd", ip.payload[8..]);
+
+    const malformed = r.stack.stats().dropped_malformed;
+    // An ICMPv4-style checksum (no pseudo-header) is wrong for ICMPv6.
+    const req = icmpPacket(&r.buf, peer_addr6, stack_addr6, wire.icmp6_echo_request, "ping");
+    const msg = req[wire.ip6_header_len..];
+    @memset(msg[2..4], 0);
+    std.mem.writeInt(u16, msg[2..4], wire.checksum(msg), .big);
+    r.stack.input(req);
+    try r.expectSilent();
+    // Truncated (under 8 bytes).
+    const short = icmpPacket(&r.buf, peer_addr6, stack_addr6, wire.icmp6_echo_request, "");
+    std.mem.writeInt(u16, short[4..6], 4, .big);
+    r.stack.input(short[0 .. wire.ip6_header_len + 4]);
+    try r.expectSilent();
+    try t.expectEqual(malformed + 2, r.stack.stats().dropped_malformed);
+
+    const not_ours = r.stack.stats().dropped_not_for_us;
+    // Neighbor solicitation, echo reply: valid, ignored (no NDP here).
+    r.stack.input(icmpPacket(&r.buf, peer_addr6, stack_addr6, 135, "nd"));
+    r.stack.input(icmpPacket(&r.buf, peer_addr6, stack_addr6, wire.icmp6_echo_reply, "x"));
+    try r.expectSilent();
+    // ICMPv4 inside IPv6; an echo to another address; one from multicast.
+    var v4in6 = icmpPacket(&r.buf, peer_addr6, stack_addr6, wire.icmp6_echo_request, "four");
+    v4in6[6] = wire.proto_icmp;
+    r.stack.input(v4in6);
+    r.stack.input(icmpPacket(&r.buf, peer_addr6, otherHost(stack_addr6, 9), wire.icmp6_echo_request, "x"));
+    const all_nodes: root.Addr = .{ .v6 = .{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    r.stack.input(icmpPacket(&r.buf, all_nodes, stack_addr6, wire.icmp6_echo_request, "x"));
+    try r.expectSilent();
+    try t.expectEqual(not_ours + 3, r.stack.stats().dropped_not_for_us);
+    try t.expectEqual(@as(u64, 1), r.stack.stats().icmp_echo_replies);
+
+    // icmp_echo = false: no reply.
+    var q: Rig = undefined;
+    try q.initWith(.{ .address = stack_addr6, .icmp_echo = false }, fam6);
+    defer q.deinit();
+    q.stack.input(icmpPacket(&q.buf, peer_addr6, stack_addr6, wire.icmp6_echo_request, "x"));
+    try q.expectSilent();
+}
+
+test "IPv6: v4-mapped addresses rejected; unusable sources dropped without a reply" {
+    const v6 = struct {
+        fn a(b: [16]u8) root.Addr {
+            return .{ .v6 = b };
+        }
+    }.a;
+    const mapped_self = v6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 8, 0, 1 });
+    const mapped_peer = v6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 8, 0, 2 });
+    const all_nodes = v6(.{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+    const unspecified = v6(@splat(0));
+    const loopback = v6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+
+    var clock: root.Clock = .{ .io = t.io };
+    for ([_]root.Options{
+        .{ .address = mapped_self },
+        .{ .address = stack_addr, .address6 = mapped_self },
+        .{ .address = stack_addr6, .address6 = otherHost(stack_addr6, 7) }, // two IPv6
+        .{ .address = stack_addr, .address6 = stack_addr }, // IPv4 as address6
+    }) |o| try t.expectError(error.AddressFamilyUnsupported, root.Stack.create(t.allocator, &clock, o));
+
+    var r: Rig = undefined;
+    try r.initWith(.{ .address = stack_addr, .address6 = stack_addr6 }, fam6);
+    defer r.deinit();
+    _ = try r.stack.listen(8420);
+    for ([_]root.Addr{ mapped_peer, all_nodes, unspecified, loopback, stack_addr6, stack_addr }) |a|
+        try t.expectError(error.AddressFamilyUnsupported, r.stack.dial(.{ .addr = a, .port = 9000 }));
+
+    const before = r.stack.stats().dropped_not_for_us;
+    const sources = [_]root.Addr{ mapped_peer, all_nodes, unspecified, loopback, stack_addr6 };
+    for (sources) |src| {
+        r.peer.peer.addr = src;
+        r.peer.stack.port = 8420; // listening: no SYN-ACK
+        r.send(.{ .seq = 1, .flags = .{ .syn = true } });
+        r.peer.stack.port = 9999; // closed: no RST
+        r.send(.{ .seq = 1, .flags = .{ .syn = true } });
+        r.stack.input(icmpPacket(&r.buf, src, stack_addr6, wire.icmp6_echo_request, "x"));
+        try r.expectSilent();
+    }
+    try t.expectEqual(before + 3 * sources.len, r.stack.stats().dropped_not_for_us);
+    try t.expectEqual(@as(u16, 0), r.stack.stats().connections);
+}
+
+test "IPv6: dual-stack listener: one port on both addresses, each family its own MSS" {
+    var r: Rig = undefined;
+    try r.initWith(.{ .address = stack_addr, .address6 = stack_addr6 }, fam4);
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e4 = try r.established(l);
+    // Same peer port over IPv6: a separate connection on the same listener.
+    r.peer = .{ .peer = .{ .addr = peer_addr6, .port = 40000 }, .stack = .{ .addr = stack_addr6, .port = 8420 } };
+    const e6 = try r.established(l);
+    try t.expectEqual(stack_addr, e4.st.local().addr);
+    try t.expectEqual(stack_addr6, e6.st.local().addr);
+    try t.expectEqual(peer_addr6, e6.st.remote().addr);
+    try t.expectEqual(@as(u16, 1380), e4.st.debugConn().?.mss);
+    try t.expectEqual(@as(u16, 1360), e6.st.debugConn().?.mss);
+    try t.expectEqual(@as(u16, 2), r.stack.stats().connections);
+
+    // Data and an exact RST on the IPv6 connection leave the IPv4 one alone.
+    r.send(.{ .seq = e6.rcv, .ack = e6.snd, .flags = .{ .ack = true, .psh = true }, .window = 2048, .payload = "six" });
+    var buf: [8]u8 = undefined;
+    try t.expectEqual(@as(usize, 3), try e6.st.read(&buf));
+    try t.expectEqualStrings("six", buf[0..3]);
+    try t.expectError(error.WouldBlock, e4.st.read(&buf));
+    try t.expectEqual(e6.rcv + 3, (try r.recv()).ack); // an IPv6 ACK
+    r.send(.{ .seq = e6.rcv + 3, .flags = .{ .rst = true } });
+    try t.expectError(error.ConnectionReset, e6.st.read(&buf));
+    try t.expectEqual(root.State.established, e4.st.status().state);
+    e6.st.close();
+
+    // Another IPv6 address is not ours.
+    const nfu = r.stack.stats().dropped_not_for_us;
+    r.peer.stack.addr = otherHost(stack_addr6, 9);
+    r.send(.{ .seq = 1, .flags = .{ .syn = true } });
+    try r.expectSilent();
+    try t.expectEqual(nfu + 1, r.stack.stats().dropped_not_for_us);
+
+    // Dial picks our address by the destination's family.
+    const d6 = try r.stack.dial(.{ .addr = peer_addr6, .port = 9000 });
+    const d4 = try r.stack.dial(.{ .addr = peer_addr, .port = 9000 });
+    try t.expectEqual(stack_addr6, d6.local().addr);
+    try t.expectEqual(stack_addr, d4.local().addr);
+    var seen6 = false;
+    var seen4 = false;
+    while (r.stack.output(&r.out)) |p| {
+        const sg = try wire.parseTcp(p);
+        if (!sg.tcp.flags.syn) continue;
+        if (sg.ip.src.eql(stack_addr6) and sg.ip.dst.eql(peer_addr6)) seen6 = true;
+        if (sg.ip.src.eql(stack_addr) and sg.ip.dst.eql(peer_addr)) seen4 = true;
+    }
+    try t.expect(seen6 and seen4);
+}
+
+test "IPv6: a single-family stack refuses and ignores the other family" {
+    // IPv4 only.
+    var r4: Rig = undefined;
+    try r4.initFor(fam4, .{});
+    defer r4.deinit();
+    _ = try r4.stack.listen(8420);
+    try t.expectError(error.AddressFamilyUnsupported, r4.stack.dial(.{ .addr = peer_addr6, .port = 9000 }));
+    r4.peer = .{ .peer = .{ .addr = peer_addr6, .port = 40000 }, .stack = .{ .addr = stack_addr6, .port = 8420 } };
+    r4.send(.{ .seq = 1, .flags = .{ .syn = true } });
+    try r4.expectSilent();
+    try t.expectEqual(@as(u64, 1), r4.stack.stats().dropped_not_for_us);
+    // IPv6 only.
+    var r6: Rig = undefined;
+    try r6.initFor(fam6, .{});
+    defer r6.deinit();
+    _ = try r6.stack.listen(8420);
+    try t.expectError(error.AddressFamilyUnsupported, r6.stack.dial(.{ .addr = peer_addr, .port = 9000 }));
+    r6.peer = .{ .peer = .{ .addr = peer_addr, .port = 40000 }, .stack = .{ .addr = stack_addr, .port = 8420 } };
+    r6.send(.{ .seq = 1, .flags = .{ .syn = true } });
+    r6.stack.input(icmpPacket(&r6.buf, peer_addr, stack_addr, wire.icmp_echo_request, "x"));
+    try r6.expectSilent();
+    try t.expectEqual(@as(u64, 2), r6.stack.stats().dropped_not_for_us);
 }

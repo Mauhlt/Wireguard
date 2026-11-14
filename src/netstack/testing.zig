@@ -65,6 +65,47 @@ pub const Peer = struct {
     }
 };
 
+/// An ICMPv4 or ICMPv6 message (by `src`'s family) of type `kind` from
+/// `src` to `dst` in `buf`: identifier 0x1234, sequence 1, then `data`;
+/// IP header and checksum valid (ICMPv6 over the pseudo-header).
+pub fn icmpPacket(buf: []u8, src: root.Addr, dst: root.Addr, kind: u8, data: []const u8) []u8 {
+    const v6 = src == .v6;
+    const hl = wire.ipHeaderLen(src);
+    const msg = buf[hl..][0 .. 8 + data.len];
+    msg[0..8].* = .{ kind, 0, 0, 0, 0x12, 0x34, 0, 1 };
+    @memcpy(msg[8..], data);
+    const sum = if (v6) wire.icmp6Checksum(src, dst, msg) else wire.checksum(msg);
+    std.mem.writeInt(u16, msg[2..4], sum, .big);
+    _ = wire.writeIpHeader(buf, src, dst, if (v6) wire.proto_icmp6 else wire.proto_icmp, 1, msg.len) catch
+        @panic("testing.icmpPacket: buffer too small or mixed address families");
+    return buf[0 .. hl + msg.len];
+}
+
+/// Rebuilds the IPv6 packet `pkt` (40-byte header, no extension headers)
+/// in `out` with one 8-byte extension header per entry of `kinds` (at
+/// least one) in front of its upper layer: hop-by-hop (0) and destination
+/// options (60) hold one PadN; any other kind is zero-filled (a fragment
+/// header is then an atomic fragment). `out` must hold the result.
+pub fn withExtHeaders6(out: []u8, pkt: []const u8, kinds: []const u8) []u8 {
+    const hl = wire.ip6_header_len;
+    const upper = pkt[hl..];
+    const ext = 8 * kinds.len;
+    @memcpy(out[0..hl], pkt[0..hl]);
+    std.mem.writeInt(u16, out[4..6], @intCast(ext + upper.len), .big);
+    out[6] = kinds[0];
+    for (kinds, 0..) |k, i| {
+        const h = out[hl + 8 * i ..][0..8];
+        @memset(h, 0);
+        h[0] = if (i + 1 < kinds.len) kinds[i + 1] else pkt[6];
+        if (k == 0 or k == 60) {
+            h[2] = 1; // PadN covering the remaining 6 bytes
+            h[3] = 4;
+        }
+    }
+    @memcpy(out[hl + ext ..][0..upper.len], upper);
+    return out[0 .. hl + ext + upper.len];
+}
+
 /// Prints a stream's TCP state (diagnostics for failing tests).
 pub fn dumpStream(name: []const u8, s: root.Stream) void {
     const k = s.debugConn() orelse {
