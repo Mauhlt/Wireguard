@@ -1,4 +1,4 @@
-//! netstack: a minimal userspace TCP/IPv4 stack that plugs into a zwg
+//! netstack: a minimal userspace TCP/IP stack (IPv4 and IPv6) that plugs into a zwg
 //! `Device` as its Tun, so a process can run WireGuard in-process (no
 //! Wintun adapter, no driver, no admin, no service) and still accept and
 //! dial TCP connections inside the tunnel. Contract: DESIGN.md,
@@ -28,7 +28,6 @@ pub const testing = @import("testing.zig");
 const stack_impl = @import("stack.zig");
 
 /// Interface addresses are the device's own type (raw network-order bytes).
-/// Only `.v4` is implemented; `.v6` is rejected with AddressFamilyUnsupported.
 pub const Addr = dev.ip.Addr;
 pub const Clock = dev.device.Clock;
 pub const WaitHandle = wg_tun.WaitHandle;
@@ -88,15 +87,21 @@ pub const Limits = struct {
 pub const Priority = enum { interactive, bulk };
 
 pub const Options = struct {
-    /// The stack's own tunnel address (e.g. 10.8.0.1). Listeners bind to
-    /// it only; packets to any other destination are dropped.
+    /// The stack's own tunnel address (e.g. 10.8.0.1, or an IPv6 address
+    /// for a v6-only stack). Listeners bind to the configured addresses
+    /// only; packets to any other destination are dropped.
     address: Addr,
-    /// Tunnel MTU (the device's). MSS = mtu - 40 (1420 -> 1380).
+    /// Optional IPv6 address next to an IPv4 `address` (e.g. fd0a:8::1):
+    /// listeners then accept on both, dial picks by the destination's
+    /// family. No v4-mapped IPv6: each family uses its own address.
+    address6: ?Addr = null,
+    /// Tunnel MTU (the device's). MSS = mtu - 40 for IPv4 (1420 -> 1380),
+    /// mtu - 60 for IPv6 (1420 -> 1360).
     mtu: u16 = wg_tun.default_mtu,
     limits: Limits = .{},
     /// Send TCP keepalives after this much idle time (null: never).
     keepalive_idle_ns: ?u64 = null,
-    /// Answer ICMP echo requests to `address` ("ping 10.8.0.1").
+    /// Answer ICMP / ICMPv6 echo requests to our addresses ("ping 10.8.0.1").
     icmp_echo: bool = true,
 };
 
@@ -151,6 +156,7 @@ pub const Stats = struct {
     /// dropped because the scoreboard was full.
     sack_blocks_ignored: u64 = 0,
     timeouts: u64 = 0,
+    /// ICMP and ICMPv6 echo replies sent.
     icmp_echo_replies: u64 = 0,
     connections: u16 = 0,
 };

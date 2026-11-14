@@ -61,6 +61,14 @@ const ListenSlot = struct {
     cond: std.Io.Condition = .init,
 };
 
+/// ::ffff:0:0/96 (IPv4-mapped IPv6): never used, each family has its own.
+fn isV4Mapped(a: Addr) bool {
+    return switch (a) {
+        .v4 => false,
+        .v6 => |b| std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff,
+    };
+}
+
 fn handleId(index: usize, gen: u16) u32 {
     return (@as(u32, gen) << 16) | @as(u32, @intCast(index));
 }
@@ -115,7 +123,13 @@ pub const Stack = struct {
     // ---- lifecycle -------------------------------------------------------
 
     pub fn create(gpa: std.mem.Allocator, clock: *root.Clock, options: Options) root.CreateError!*Stack {
-        if (options.address != .v4) return error.AddressFamilyUnsupported;
+        // At most one address per family: `address` (either), `address6`
+        // (IPv6, only next to an IPv4 `address`). No v4-mapped addresses.
+        if (options.address6) |a6| {
+            if (a6 != .v6 or options.address != .v4) return error.AddressFamilyUnsupported;
+            if (isV4Mapped(a6)) return error.AddressFamilyUnsupported;
+        }
+        if (isV4Mapped(options.address)) return error.AddressFamilyUnsupported;
         if (options.mtu < min_mtu) return error.InvalidMtu;
         const l = options.limits;
         if (l.max_connections == 0 or l.send_buffer == 0 or l.recv_buffer == 0 or
@@ -226,7 +240,7 @@ pub const Stack = struct {
         for (s.slots, 0..) |*sl, i| {
             if (!sl.used) continue;
             const c = &sl.conn;
-            if (c.state != .closed and c.state != .syn_sent) s.sendRst(c.local.port, c.remote, .{ .seq = c.snd_max, .ack = null });
+            if (c.state != .closed and c.state != .syn_sent) s.sendRst(c.local, c.remote, .{ .seq = c.snd_max, .ack = null });
             if (c.state != .closed) c.fail(error.ConnectionReset);
             sl.queued = false;
             sl.listener = null;
@@ -266,6 +280,18 @@ pub const Stack = struct {
     /// The stack thread has output to produce (host side changed state).
     fn kickThread(s: *Stack) void {
         if (s.thread != null) s.kick.signal();
+    }
+
+    /// Our address for `family_of`'s family, if configured.
+    fn localFor(s: *const Stack, family_of: Addr) ?Addr {
+        if (std.meta.activeTag(s.options.address) == std.meta.activeTag(family_of)) return s.options.address;
+        if (s.options.address6) |a6| if (family_of == .v6) return a6;
+        return null;
+    }
+
+    fn isOurs(s: *const Stack, a: Addr) bool {
+        const mine = s.localFor(a) orelse return false;
+        return mine.eql(a);
     }
 
     fn env(s: *Stack, now: i64) tcp.Env {
@@ -389,49 +415,60 @@ pub const Stack = struct {
 
     fn inputLocked(s: *Stack, pkt: []const u8) void {
         s.st.rx_packets += 1;
-        const ip = wire.Ip4.parse(pkt) catch {
+        const ip = wire.parseIp(pkt) catch {
             s.st.dropped_malformed += 1;
             return;
         };
-        if (!std.mem.eql(u8, &ip.header.dst, &s.options.address.v4)) {
+        if (!s.isOurs(ip.dst)) {
             s.st.dropped_not_for_us += 1;
             return;
         }
-        switch (ip.header.protocol) {
+        switch (ip.protocol) {
             wire.proto_tcp => {
-                const seg = wire.Tcp.parse(.{ .v4 = ip.header.src }, .{ .v4 = ip.header.dst }, ip.payload) catch {
+                const seg = wire.Tcp.parse(ip.src, ip.dst, ip.payload) catch {
                     s.st.dropped_malformed += 1;
                     return;
                 };
-                s.handleTcp(.{ .addr = .{ .v4 = ip.header.src }, .port = seg.src_port }, seg);
+                s.handleTcp(.{ .addr = ip.dst, .port = seg.dst_port }, .{ .addr = ip.src, .port = seg.src_port }, seg);
             },
-            wire.proto_icmp => s.handleIcmp(ip.header.src, ip.payload),
+            wire.proto_icmp => if (ip.src == .v4) s.handleIcmp(ip.src, ip.dst, ip.payload) else {
+                s.st.dropped_not_for_us += 1;
+            },
+            wire.proto_icmp6 => if (ip.src == .v6) s.handleIcmp(ip.src, ip.dst, ip.payload) else {
+                s.st.dropped_not_for_us += 1;
+            },
             else => s.st.dropped_not_for_us += 1,
         }
     }
 
-    fn handleIcmp(s: *Stack, src: [4]u8, msg: []const u8) void {
-        const kind = wire.icmp4Type(msg) catch {
+    /// Echo request -> echo reply, ICMPv4 or ICMPv6 (same layout: type,
+    /// code, checksum, identifier, sequence, data). Anything else is
+    /// ignored (no NDP: a point-to-point tunnel with configured addresses).
+    fn handleIcmp(s: *Stack, src: Addr, dst: Addr, msg: []const u8) void {
+        const v6 = src == .v6;
+        const kind = (if (v6) wire.icmp6Type(src, dst, msg) else wire.icmp4Type(msg)) catch {
             s.st.dropped_malformed += 1;
             return;
         };
-        if (kind != wire.icmp_echo_request or !s.options.icmp_echo) return;
-        if (wire.ip4_header_len + msg.len > s.scratch.len) return;
-        const reply = s.scratch[wire.ip4_header_len..][0..msg.len];
+        if (kind != (if (v6) wire.icmp6_echo_request else wire.icmp_echo_request) or !s.options.icmp_echo) return;
+        const hl = wire.ipHeaderLen(src);
+        if (hl + msg.len > s.scratch.len) return;
+        const reply = s.scratch[hl..][0..msg.len];
         @memcpy(reply, msg);
-        reply[0] = wire.icmp_echo_reply;
+        reply[0] = if (v6) wire.icmp6_echo_reply else wire.icmp_echo_reply;
         @memset(reply[2..4], 0);
-        std.mem.writeInt(u16, reply[2..4], wire.checksum(reply), .big);
+        const sum = if (v6) wire.icmp6Checksum(dst, src, reply) else wire.checksum(reply);
+        std.mem.writeInt(u16, reply[2..4], sum, .big);
         s.ip_id +%= 1;
-        (wire.Ip4{ .protocol = wire.proto_icmp, .id = s.ip_id, .src = s.options.address.v4, .dst = src }).write(s.scratch, msg.len) catch return;
-        s.ctl.push(s.scratch[0 .. wire.ip4_header_len + msg.len]) catch return;
+        _ = wire.writeIpHeader(s.scratch, dst, src, if (v6) wire.proto_icmp6 else wire.proto_icmp, s.ip_id, msg.len) catch return;
+        s.ctl.push(s.scratch[0 .. hl + msg.len]) catch return;
         s.st.icmp_echo_replies += 1;
     }
 
-    fn handleTcp(s: *Stack, remote: Endpoint, seg: wire.Tcp) void {
+    fn handleTcp(s: *Stack, local: Endpoint, remote: Endpoint, seg: wire.Tcp) void {
         const now = s.clock.now();
         var e = s.env(now);
-        if (s.findConn(seg.dst_port, remote)) |i| {
+        if (s.findConn(local, remote)) |i| {
             const out = s.slots[i].conn.input(&e, seg);
             s.afterOutcome(i, out);
             return;
@@ -451,17 +488,17 @@ pub const Stack = struct {
                 };
                 const sl = &s.slots[i];
                 sl.listener = li;
-                sl.conn = .{ .local = .{ .addr = s.options.address, .port = seg.dst_port }, .remote = remote };
-                sl.conn.acceptSyn(&e, seg, s.isn(seg.dst_port, remote, now));
+                sl.conn = .{ .local = local, .remote = remote };
+                sl.conn.acceptSyn(&e, seg, s.isn(local, remote, now));
                 return;
             }
         }
-        s.sendRst(seg.dst_port, remote, tcp.rstFor(seg));
+        s.sendRst(local, remote, tcp.rstFor(seg));
     }
 
     fn afterOutcome(s: *Stack, i: usize, out: tcp.Outcome) void {
         const sl = &s.slots[i];
-        if (out.rst) |r| s.sendRst(sl.conn.local.port, sl.conn.remote, r);
+        if (out.rst) |r| s.sendRst(sl.conn.local, sl.conn.remote, r);
         if (out.established) {
             if (sl.listener) |li| {
                 sl.queued = true;
@@ -480,7 +517,7 @@ pub const Stack = struct {
         const c = &sl.conn;
         switch (c.state) {
             .closed, .syn_sent => {},
-            else => s.sendRst(c.local.port, c.remote, .{ .seq = c.snd_max, .ack = null }),
+            else => s.sendRst(c.local, c.remote, .{ .seq = c.snd_max, .ack = null }),
         }
         if (c.state != .closed) c.fail(error.ConnectionReset);
     }
@@ -495,15 +532,10 @@ pub const Stack = struct {
         s.st.connections -|= 1;
     }
 
-    fn sendRst(s: *Stack, local_port: u16, remote: Endpoint, r: tcp.Rst) void {
+    fn sendRst(s: *Stack, local: Endpoint, remote: Endpoint, r: tcp.Rst) void {
         s.ip_id +%= 1;
-        const p = wire.buildTcp4(s.scratch, .{
-            .protocol = wire.proto_tcp,
-            .id = s.ip_id,
-            .src = s.options.address.v4,
-            .dst = remote.addr.v4,
-        }, .{
-            .src_port = local_port,
+        const p = wire.buildTcp(s.scratch, local.addr, remote.addr, s.ip_id, .{
+            .src_port = local.port,
             .dst_port = remote.port,
             .seq = r.seq,
             .ack = r.ack orelse 0,
@@ -515,24 +547,28 @@ pub const Stack = struct {
     }
 
     /// RFC 6528: ISN = M + F(4-tuple, secret), M a 4 microsecond clock.
-    fn isn(s: *Stack, local_port: u16, remote: Endpoint, now: i64) u32 {
-        var msg: [12]u8 = undefined;
-        msg[0..4].* = s.options.address.v4;
-        std.mem.writeInt(u16, msg[4..6], local_port, .big);
-        msg[6..10].* = remote.addr.v4;
-        std.mem.writeInt(u16, msg[10..12], remote.port, .big);
-        const f: u32 = @truncate(SipHash.toInt(&msg, &s.isn_key));
+    fn isn(s: *Stack, local: Endpoint, remote: Endpoint, now: i64) u32 {
+        var h = SipHash.init(&s.isn_key);
+        var port: [2]u8 = undefined;
+        h.update(local.addr.bytes());
+        std.mem.writeInt(u16, &port, local.port, .big);
+        h.update(&port);
+        h.update(remote.addr.bytes());
+        std.mem.writeInt(u16, &port, remote.port, .big);
+        h.update(&port);
+        const f: u32 = @truncate(h.finalInt());
         const m: u32 = @truncate(@as(u64, @bitCast(now)) / 4000);
         return f +% m;
     }
 
     // ---- table lookups (linear: max_connections is small) ---------------------
 
-    fn findConn(s: *Stack, local_port: u16, remote: Endpoint) ?usize {
+    fn findConn(s: *Stack, local: Endpoint, remote: Endpoint) ?usize {
         for (s.slots, 0..) |*sl, i| {
             if (!sl.used or sl.conn.state == .closed) continue;
             const c = &sl.conn;
-            if (c.local.port == local_port and c.remote.port == remote.port and c.remote.addr.eql(remote.addr)) return i;
+            if (c.local.port == local.port and c.remote.port == remote.port and
+                c.remote.addr.eql(remote.addr) and c.local.addr.eql(local.addr)) return i;
         }
         return null;
     }
@@ -659,17 +695,19 @@ pub const Stack = struct {
 
     /// dial with a priority from the first byte on.
     pub fn dialWith(s: *Stack, to: Endpoint, priority: root.Priority) root.DialError!Stream {
-        if (to.addr != .v4) return error.AddressFamilyUnsupported;
-        if (to.port == 0) return error.AddressFamilyUnsupported;
+        // The destination's family picks our address; no v4-mapped IPv6.
+        const local_addr = s.localFor(to.addr) orelse return error.AddressFamilyUnsupported;
+        if (to.port == 0 or isV4Mapped(to.addr)) return error.AddressFamilyUnsupported;
         s.lock();
         defer s.unlock();
         const port = s.pickPort() orelse return error.NoPortsAvailable;
         const i = s.allocSlot() orelse return error.TooManyConnections;
         const sl = &s.slots[i];
-        sl.conn = .{ .local = .{ .addr = s.options.address, .port = port }, .remote = to, .priority = priority };
+        const local: Endpoint = .{ .addr = local_addr, .port = port };
+        sl.conn = .{ .local = local, .remote = to, .priority = priority };
         const now = s.clock.now();
         const e = s.env(now);
-        sl.conn.connect(&e, s.isn(port, to, now)) catch {
+        sl.conn.connect(&e, s.isn(local, to, now)) catch {
             sl.conn.state = .closed;
             s.maybeRelease(i);
             return error.TooManyConnections; // buffer allocation failed
@@ -872,7 +910,7 @@ pub const Listener = struct {
         for (s.slots, 0..) |*sl, i| {
             if (!sl.used or sl.listener != li) continue;
             const c = &sl.conn;
-            s.sendRst(c.local.port, c.remote, .{ .seq = c.snd_max, .ack = c.rcv_nxt });
+            s.sendRst(c.local, c.remote, .{ .seq = c.snd_max, .ack = c.rcv_nxt });
             c.fail(error.ConnectionReset);
             sl.queued = false;
             sl.listener = null;
