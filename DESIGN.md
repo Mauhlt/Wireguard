@@ -62,9 +62,7 @@ pub fn tai64nAfter(a: *const Tai64n, b: *const Tai64n) bool;          // constan
 pub fn eql(comptime n: usize, a: *const [n]u8, b: *const [n]u8) bool; // constant time
 pub fn isZero(comptime n: usize, a: *const [n]u8) bool;               // constant time
 pub fn wipe(ptr: anytype) void;                                       // *T or []T; secureZero is an alias
-pub const key_b64_len = 44;
-pub fn keyToBase64(key: *const [32]u8) [44]u8;                        // wg / .conf format
-pub fn keyFromBase64(s: []const u8) error{InvalidKey}![32]u8;          // strict, canonical only
+// Key text (base64, 44 chars): device/keys.zig encode / decode, constant time.
 pub fn hexTo(comptime n: usize, comptime s: []const u8) [n]u8;        // test-vector helper
 ```
 

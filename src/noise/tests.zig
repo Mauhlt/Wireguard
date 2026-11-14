@@ -8,6 +8,14 @@
 const std = @import("std");
 const testing = std.testing;
 const crypto = @import("../crypto.zig");
+
+/// Test vectors only (public test keys): std.base64. Production key text
+/// goes through device/keys.zig, which decodes in constant time.
+fn keyFromB64(s: []const u8) ![32]u8 {
+    var out: [32]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&out, s);
+    return out;
+}
 const noise = @import("root.zig");
 const hexTo = crypto.hexTo;
 
@@ -75,8 +83,8 @@ const Pair = struct {
     cr: noise.CookieChecker,
 
     fn init(p: [32]u8) !Pair {
-        const li = noise.Local.init(try crypto.keyFromBase64(s_i_priv));
-        const lr = noise.Local.init(try crypto.keyFromBase64(s_r_priv));
+        const li = noise.Local.init(try keyFromB64(s_i_priv));
+        const lr = noise.Local.init(try keyFromB64(s_r_priv));
         return .{
             .li = li,
             .lr = lr,
@@ -302,7 +310,7 @@ test "wrong static: initiation for another responder, or from another peer" {
     var pair = try Pair.init(psk);
     const m1 = try pair.initiate(e_i, wall, 0);
     // A third party's identity cannot open the static.
-    var other = noise.Local.init(try crypto.keyFromBase64("mOgFQxhFVe3FMZ37X5wAB5jBzHz9ckVAynAjYHXU5kw="));
+    var other = noise.Local.init(try keyFromB64("mOgFQxhFVe3FMZ37X5wAB5jBzHz9ckVAynAjYHXU5kw="));
     try testing.expectError(error.AuthenticationFailed, noise.consumeInitiationStatic(&other, &m1));
     // Responder found the static but hands it to the wrong peer's handshake.
     var start = try noise.consumeInitiationStatic(&pair.lr, &m1);
@@ -361,7 +369,7 @@ fn noiseWriteIndex(dst: *[4]u8, v: u32) void {
 }
 
 test "low-order keys are refused" {
-    const li = noise.Local.init(try crypto.keyFromBase64(s_i_priv));
+    const li = noise.Local.init(try keyFromB64(s_i_priv));
     var h = noise.Handshake.init(&li, @splat(0), psk);
     var r: FixedRandom = .{ .data = &e_i };
     try testing.expectError(error.InvalidPublicKey, h.createInitiation(&li, wall, 0, 1, r.random()));
@@ -507,8 +515,8 @@ fn exercise(ctx: FuzzCtx, bytes: []const u8) !void {
 
 test "fuzz message parsers and consumers" {
     const ctx: FuzzCtx = .{
-        .local = noise.Local.init(try crypto.keyFromBase64(s_r_priv)),
-        .peer = noise.Local.init(try crypto.keyFromBase64(s_i_priv)),
+        .local = noise.Local.init(try keyFromB64(s_r_priv)),
+        .peer = noise.Local.init(try keyFromB64(s_i_priv)),
     };
     try testing.fuzz(ctx, fuzzOne, .{ .corpus = &.{
         sliceInput(&golden_psk.initiation),
@@ -521,8 +529,8 @@ test "fuzz message parsers and consumers" {
 
 test "mutation fuzz (deterministic; std.testing.fuzz is not available on Windows)" {
     const ctx: FuzzCtx = .{
-        .local = noise.Local.init(try crypto.keyFromBase64(s_r_priv)),
-        .peer = noise.Local.init(try crypto.keyFromBase64(s_i_priv)),
+        .local = noise.Local.init(try keyFromB64(s_r_priv)),
+        .peer = noise.Local.init(try keyFromB64(s_i_priv)),
     };
     const corpus = [_][]const u8{
         &golden_psk.initiation,     &golden_psk.response, &golden_cookie.reply,
