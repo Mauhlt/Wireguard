@@ -37,7 +37,12 @@ pub const Udp = struct {
         var kind: u32 = posix.SOCK.DGRAM;
         if (is_linux) kind |= posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
         const rc = sys.socket(@intCast(af), @intCast(kind), 0);
-        if (posix.errno(rc) != .SUCCESS) return error.SystemResources;
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            // No IPv6 on this host (the device then runs IPv4-only).
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            else => return error.SystemResources,
+        }
         const fd: posix.fd_t = @intCast(rc);
         errdefer _ = sys.close(fd);
         if (!setNonBlockCloexec(fd)) return error.Unexpected;

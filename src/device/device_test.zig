@@ -270,6 +270,28 @@ test "load: datagrams with a wrong mac1 are dropped and never count towards load
     try testing.expectEqual(@as(u64, 0), d.stats.cookie_replies_sent);
 }
 
+test "bind: an IPv6 port already held by another socket fails the device" {
+    const gpa = testing.allocator;
+    var clock: dev.Clock = .{ .io = testing.io };
+    var priv: crypto.PrivateKey = undefined;
+    testing.io.random(&priv);
+    var fake: tun.FakeTun = try .init(gpa, .{});
+    defer fake.deinit();
+    // A host without IPv6 loopback cannot run this check.
+    var squatter = os.Udp.open(.v6, 0) catch |err| switch (err) {
+        error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer squatter.close();
+    const port = squatter.localPort();
+    try testing.expectError(error.AddressInUse, Device.create(gpa, &clock, fake.tun(), .{ .private_key = priv, .listen_port = port }));
+
+    // With an ephemeral port the device just picks another pair.
+    const d = try Device.create(gpa, &clock, fake.tun(), .{ .private_key = priv });
+    defer d.destroy();
+    try testing.expect(d.udp4 != null and d.udp6 != null);
+}
+
 test "run returns when the external stop handle (zwg down) is signaled" {
     const gpa = testing.allocator;
     var clock: dev.Clock = .{ .io = testing.io };

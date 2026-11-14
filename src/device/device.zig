@@ -373,13 +373,31 @@ pub const Device = struct {
     }
 
     fn bind(d: *Device, port: u16) InitError!void {
-        d.udp4 = try os.Udp.openScoped(.v4, port, d.scope);
-        d.listen_port = d.udp4.?.localPort();
-        // Same port for IPv6; a host without IPv6 just runs IPv4-only.
-        d.udp6 = os.Udp.openScoped(.v6, d.listen_port, d.scope) catch |err| blk: {
-            log.info("IPv6 UDP socket unavailable ({s}); IPv4 only", .{@errorName(err)});
-            break :blk null;
-        };
+        // An ephemeral IPv4 port may be taken on IPv6 by an unrelated
+        // socket: then pick another pair rather than fail.
+        var attempts: u8 = if (port == 0) 8 else 1;
+        while (true) {
+            d.udp4 = try os.Udp.openScoped(.v4, port, d.scope);
+            d.listen_port = d.udp4.?.localPort();
+            // Same port for IPv6. Only a host without IPv6 runs IPv4-only:
+            // any other failure (above all a port someone else already
+            // holds on IPv6, which would let a local process receive the
+            // tunnel's IPv6 traffic) fails like IPv4 does.
+            d.udp6 = os.Udp.openScoped(.v6, d.listen_port, d.scope) catch |err| switch (err) {
+                error.AddressFamilyUnsupported => blk: {
+                    log.info("IPv6 UDP socket unavailable ({s}); IPv4 only", .{@errorName(err)});
+                    break :blk null;
+                },
+                else => {
+                    d.udp4.?.close();
+                    d.udp4 = null;
+                    attempts -= 1;
+                    if (err == error.AddressInUse and attempts > 0) continue;
+                    return err;
+                },
+            };
+            return;
+        }
     }
 
     /// Closes the UDP sockets and binds new ones (network change; tests use
