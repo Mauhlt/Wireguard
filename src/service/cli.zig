@@ -70,6 +70,14 @@ pub const Result = enum(u8) {
     service_exit_base = 32,
     _,
 
+    /// The elevated child's process exit code. Anything that does not fit
+    /// a u8 (a crash's NTSTATUS such as 0xC0000005, or 256, whose low byte
+    /// is 0 = ok) is a failure, never truncated into another result.
+    pub fn fromExitCode(code: u32) Result {
+        if (code > std.math.maxInt(u8)) return .failed;
+        return @enumFromInt(@as(u8, @intCast(code)));
+    }
+
     fn fromExit(e: state.Exit) Result {
         return @enumFromInt(32 + @as(u8, @intCast(@intFromEnum(e))));
     }
@@ -229,7 +237,7 @@ fn runElevated(params: []const u8) !Result {
     if (win.WaitForSingleObject(h, win.INFINITE) != win.WAIT_OBJECT_0) return .failed;
     var code: u32 = 1;
     if (win.GetExitCodeProcess(h, &code) == 0) return .failed;
-    return @enumFromInt(@as(u8, @truncate(code)));
+    return .fromExitCode(code);
 }
 
 // ---- the elevated steps --------------------------------------------------------
@@ -598,6 +606,17 @@ test "down / up when the state change cannot be watched" {
     w = .fixed(&buf);
     try writeWaitFailed(&w, "home", .start, error.Timeout, 0);
     try std.testing.expectEqualStrings("zwg: home: waiting for the service to start: Timeout\n", w.buffered());
+}
+
+test "elevated child exit codes: never truncated into success" {
+    try std.testing.expectEqual(Result.ok, Result.fromExitCode(0));
+    try std.testing.expectEqual(Result.already_installed, Result.fromExitCode(7));
+    try std.testing.expectEqual(Result.fromExit(.wintun_missing), Result.fromExitCode(32 + 4));
+    for ([_]u32{ 256, 257, 0x1_0000, 0xC000_0005, 0xC000_0409, 0xFFFF_FFFF }) |c| {
+        try std.testing.expectEqual(Result.failed, Result.fromExitCode(c));
+    }
+    // An unknown code that fits is kept (and reads as a failure).
+    try std.testing.expectEqualStrings("failed", Result.fromExitCode(200).message());
 }
 
 test "result messages" {
