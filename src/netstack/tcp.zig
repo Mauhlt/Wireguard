@@ -227,6 +227,13 @@ pub const Conn = struct {
     tlp_now: bool = false,
     /// One probe per tail: set when sent, cleared by an ACK of new data.
     tlp_sent: bool = false,
+    /// RACK-TLP episode (RFC 8985 7.4): the probe's range while its fate
+    /// is open (repaired a loss, or was a needless duplicate).
+    tlp_probe: ?Range = null,
+    /// A recovery started during the episode and already reduced cwnd.
+    tlp_recovered: bool = false,
+    /// A valid D-SACK in the ACK being processed (for the TLP decision).
+    dsack_in_ack: ?Range = null,
 
     // timers (device clock ns; null = off)
     rto_at: ?i64 = null,
@@ -720,6 +727,7 @@ pub const Conn = struct {
             }
         }
         // SACK blocks first: on duplicate ACKs is where they matter.
+        c.dsack_in_ack = null;
         var sacked_more = false;
         if (c.sack_ok) if (seg.options.sack) |*s| {
             sacked_more = c.takeSack(env, s, ack);
@@ -743,6 +751,7 @@ pub const Conn = struct {
                 c.cwnd +|= c.mss; // NewReno inflation
             }
             if (c.sack_recovery and c.sack_degraded) c.sack_recovery = false; // fall back to NewReno
+            c.tlpEpisode(env, ack);
             return c.snd_wnd > old_wnd or sacked_more;
         }
 
@@ -792,9 +801,31 @@ pub const Conn = struct {
         if (c.cwnd > cwnd_cap) c.cwnd = cwnd_cap;
 
         c.rto_at = if (c.snd_una == c.snd_max) null else env.now + c.rto;
+        c.tlpEpisode(env, ack);
         c.tlp_sent = false;
         c.armTlp(env);
         return true;
+    }
+
+    /// RFC 8985 7.4: decides a probe's fate. A D-SACK covering it means the
+    /// original had arrived: no congestion response. Cumulatively ACKed
+    /// without one means the probe repaired a lost tail segment: the same
+    /// response as a fast recovery (ssthresh = cwnd = cwnd / 2), unless a
+    /// recovery during the episode already made it (no double reduction).
+    /// Once per episode; runs after this ACK's own recovery decisions.
+    fn tlpEpisode(c: *Conn, env: *const Env, ack: u32) void {
+        const probe = c.tlp_probe orelse return;
+        if (c.dsack_in_ack) |d| if (seqLt(d.start, probe.end) and seqLt(probe.start, d.end)) {
+            c.tlp_probe = null;
+            env.stats.tlp_unneeded += 1;
+            return;
+        };
+        if (!seqLe(probe.end, ack)) return; // still open
+        c.tlp_probe = null;
+        if (c.tlp_recovered or c.in_recovery) return;
+        c.ssthresh = @max(c.cwnd / 2, 2 * @as(u32, c.mss));
+        c.cwnd = c.ssthresh;
+        env.stats.tlp_loss_repairs += 1;
     }
 
     /// RFC 8985 7.2: arm the probe timeout when an interactive stream has
@@ -1015,6 +1046,7 @@ pub const Conn = struct {
             return;
         }
         env.stats.dsacks_received += 1;
+        c.dsack_in_ack = .{ .start = b.start, .end = b.end };
         c.rack.onDsack(c.snd_una, c.snd_max);
         if (c.undo_armed and c.undo_retrans > 0 and seqLe(c.undo_lo, b.start) and seqLe(b.end, c.undo_hi)) {
             c.undo_retrans -= 1;
@@ -1039,6 +1071,7 @@ pub const Conn = struct {
     }
 
     fn enterRecovery(c: *Conn, env: *const Env) void {
+        if (c.tlp_probe != null) c.tlp_recovered = true; // this is the episode's one reduction
         c.prior_cwnd = c.cwnd;
         c.prior_ssthresh = c.ssthresh;
         c.undo_armed = true;
@@ -1266,6 +1299,7 @@ pub const Conn = struct {
             c.tlp_now = false;
             c.rack.onRto();
             c.undo_armed = false; // no undo across a timeout
+            c.tlp_probe = null; // the RTO's own response replaces the episode's
             c.rto = @min(c.rto * 2, max_rto_ns);
             c.backoff +|= 1;
             if (c.state == .syn_sent or c.state == .syn_received) c.send_syn = true;
@@ -1330,7 +1364,12 @@ pub const Conn = struct {
             if (c.tlp_now) {
                 c.tlp_now = false;
                 if (c.snd_una != c.snd_max) {
-                    if (c.segmentAt(env, buf, ip_id, c.tlpSeq(), c.mss, true)) |p| return p;
+                    const seq = c.tlpSeq();
+                    if (c.segmentAt(env, buf, ip_id, seq, c.mss, true)) |p| {
+                        c.tlp_probe = .{ .start = seq, .end = c.snd_max };
+                        c.tlp_recovered = c.in_recovery;
+                        return p;
+                    }
                 }
             }
             // Fast / partial-ACK retransmission of the first unacked segment.

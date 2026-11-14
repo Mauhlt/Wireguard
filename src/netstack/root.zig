@@ -161,6 +161,10 @@ pub const Stats = struct {
     sack_blocks_ignored: u64 = 0,
     /// Tail loss probes sent (interactive streams, RFC 8985).
     tail_loss_probes: u64 = 0,
+    /// Probes that repaired a real tail loss (cwnd reduced, RFC 8985 7.4)
+    /// and probes a D-SACK showed were not needed (no reduction).
+    tlp_loss_repairs: u64 = 0,
+    tlp_unneeded: u64 = 0,
     /// Segments RACK (RFC 8985) declared lost, retransmissions included.
     rack_losses: u64 = 0,
     /// D-SACK blocks received (valid) / sent (RFC 2883).

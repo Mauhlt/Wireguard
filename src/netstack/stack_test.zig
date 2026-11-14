@@ -1005,10 +1005,20 @@ test "SACK: the receiver reports out-of-order data, most recent block first" {
 }
 
 // ---- tail loss probe -----------------------------------------------------------
+// TLP, RACK and D-SACK tests run over both families (`families`): the same
+// tcp.zig logic, with the family's MSS (1380 over IPv4, 1360 over IPv6).
+
+fn mssOf(r: *const Rig) u32 {
+    return wire.mssFor(r.peer.stack.addr, r.stack.options.mtu);
+}
 
 test "TLP: a lost keystroke on an interactive stream is re-sent after ~2 SRTT, not an RTO" {
+    for (families) |f| try tlpLostKeystroke(f);
+}
+
+fn tlpLostKeystroke(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try establishedSack(&r, l);
@@ -1040,8 +1050,12 @@ test "TLP: a lost keystroke on an interactive stream is re-sent after ~2 SRTT, n
 }
 
 test "TLP: bulk streams do not probe; an ACK disarms the probe" {
+    for (families) |f| try tlpBulkNoProbe(f);
+}
+
+fn tlpBulkNoProbe(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try establishedSack(&r, l);
@@ -1060,9 +1074,14 @@ test "TLP: bulk streams do not probe; an ACK disarms the probe" {
     try t.expectEqual(@as(?i64, null), r.stack.runTimers());
     try t.expectEqual(@as(u64, 0), r.stack.stats().tail_loss_probes);
 }
+
 test "SACK: a flood of random blocks costs bounded work and output per ACK" {
+    for (families) |f| try sackFlood(f);
+}
+
+fn sackFlood(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try establishedSack(&r, l);
@@ -1085,8 +1104,8 @@ test "SACK: a flood of random blocks costs bounded work and output per ACK" {
         var n: usize = 0;
         while (r.stack.output(&r.out)) |p| {
             const sg = try r.peer.expect(p);
-            // Retransmissions stay within what was sent and within one MSS.
-            try t.expect(sg.payload.len <= 1380);
+            // Retransmissions stay within one MSS.
+            try t.expect(sg.payload.len <= mssOf(&r));
             n += 1;
         }
         max_out_per_ack = @max(max_out_per_ack, n);
@@ -1100,6 +1119,7 @@ test "SACK: a flood of random blocks costs bounded work and output per ACK" {
     // a burst proportional to the junk it carried.
     try t.expect(max_out_per_ack <= 12);
 }
+
 // ---- RACK and D-SACK -----------------------------------------------------------
 
 /// Passive SACK connection with a measured RTT of `rtt_ms`.
@@ -1121,21 +1141,36 @@ fn dataSegs(r: *Rig, out: []wire.Tcp) !void {
     }
 }
 
+/// `n` full segments of filler for the rig's family.
+fn segmentsOf(r: *const Rig, buf: []u8, n: usize, fill: u8) []u8 {
+    const d = buf[0 .. n * mssOf(r)];
+    @memset(d, fill);
+    return d;
+}
+
+fn u32of(n: usize) u32 {
+    return @intCast(n);
+}
+
 test "RACK: a lost retransmission is detected and resent without an RTO" {
+    for (families) |f| try rackLostRetransmission(f);
+}
+
+fn rackLostRetransmission(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try establishedRtt(&r, l, 20);
     e.st.setPriority(.bulk); // no TLP: RACK alone
-    var data: [4 * 1380]u8 = undefined;
-    @memset(&data, 'L');
-    _ = try e.st.write(&data);
+    var buf: [4 * 1380]u8 = undefined;
+    const data = segmentsOf(&r, &buf, 4, 'L');
+    _ = try e.st.write(data);
     var segs: [4]wire.Tcp = undefined;
     try dataSegs(&r, &segs);
     r.clock.advance(20 * std.time.ns_per_ms);
     // Segment 0 lost; 1..3 SACKed: RACK marks 0 lost, it is resent.
-    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[1].seq, e.snd +% @as(u32, data.len) }}) } });
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[1].seq, e.snd +% u32of(data.len) }}) } });
     const re1 = try r.recv();
     try t.expectEqual(segs[0].seq, re1.seq);
     // The retransmission is lost too. New data goes out after it ...
@@ -1165,25 +1200,29 @@ test "RACK: a lost retransmission is detected and resent without an RTO" {
 }
 
 test "RACK: reordering inside the reorder window causes no retransmission" {
+    for (families) |f| try rackReorderTolerance(f);
+}
+
+fn rackReorderTolerance(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try establishedRtt(&r, l, 40); // min_rtt 40 ms: reo_wnd 10 ms
-    var data: [3 * 1380]u8 = undefined;
-    @memset(&data, 'O');
-    _ = try e.st.write(&data);
+    var buf: [3 * 1380]u8 = undefined;
+    const data = segmentsOf(&r, &buf, 3, 'O');
+    _ = try e.st.write(data);
     var segs: [3]wire.Tcp = undefined;
     try dataSegs(&r, &segs);
     r.clock.advance(40 * std.time.ns_per_ms);
     // Segment 0 is merely late: 1..2 SACKed first.
-    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[1].seq, e.snd +% @as(u32, data.len) }}) } });
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[1].seq, e.snd +% u32of(data.len) }}) } });
     while (r.stack.output(&r.out)) |p| try t.expectEqual(@as(usize, 0), (try r.peer.expect(p)).payload.len);
     const k = e.st.debugConn().?;
     try t.expect(k.rack.timer_at != null); // waiting out the reorder window
     // It arrives 5 ms later (inside the 10 ms window): no retransmission.
     r.clock.advance(5 * std.time.ns_per_ms);
-    r.send(.{ .seq = e.rcv, .ack = e.snd +% @as(u32, data.len), .flags = .{ .ack = true }, .window = 0xffff });
+    r.send(.{ .seq = e.rcv, .ack = e.snd +% u32of(data.len), .flags = .{ .ack = true }, .window = 0xffff });
     _ = r.stack.runTimers();
     while (r.stack.output(&r.out)) |p| try t.expectEqual(@as(usize, 0), (try r.peer.expect(p)).payload.len);
     const st = r.stack.stats();
@@ -1192,8 +1231,12 @@ test "RACK: reordering inside the reorder window causes no retransmission" {
 }
 
 test "D-SACK: the receiver reports duplicates as the first block" {
+    for (families) |f| try dsackGeneration(f);
+}
+
+fn dsackGeneration(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try establishedSack(&r, l);
@@ -1229,8 +1272,12 @@ test "D-SACK: the receiver reports duplicates as the first block" {
 }
 
 test "D-SACK: grows RACK's reorder window once per round trip, capped; a flood changes nothing more" {
+    for (families) |f| try dsackReorderWindow(f);
+}
+
+fn dsackReorderWindow(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try establishedRtt(&r, l, 40);
@@ -1251,7 +1298,7 @@ test "D-SACK: grows RACK's reorder window once per round trip, capped; a flood c
     // ... up to the cap, and the window itself never exceeds SRTT.
     try t.expectEqual(@as(u8, @import("rack.zig").max_reo_wnd_mult), k.rack.reo_wnd_mult);
     try t.expect(k.rack.reoWnd(k.srtt, false, 0) <= k.srtt);
-    // Junk D-SACKs (too old, empty, too long) are ignored.
+    // Junk D-SACKs (too old, too long) are ignored.
     const before = r.stack.stats().sack_blocks_ignored;
     r.send(.{ .seq = e.rcv, .ack = una, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ una -% 0x4000_0000, una -% 0x3fff_0000 }}) } });
     r.send(.{ .seq = e.rcv, .ack = una, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ una -% 0x20000, una }}) } });
@@ -1259,35 +1306,138 @@ test "D-SACK: grows RACK's reorder window once per round trip, capped; a flood c
 }
 
 test "D-SACK: a spurious fast retransmit is undone once, rate-limited against fakes" {
+    for (families) |f| try dsackSpuriousUndo(f);
+}
+
+fn dsackSpuriousUndo(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try establishedRtt(&r, l, 20);
     e.st.setPriority(.bulk);
-    var data: [6 * 1380]u8 = undefined;
-    @memset(&data, 'U');
-    _ = try e.st.write(&data);
+    var buf: [6 * 1380]u8 = undefined;
+    const data = segmentsOf(&r, &buf, 6, 'U');
+    _ = try e.st.write(data);
     var segs: [6]wire.Tcp = undefined;
     try dataSegs(&r, &segs);
     const cwnd_before = e.st.debugConn().?.cwnd;
     r.clock.advance(20 * std.time.ns_per_ms);
     // Segment 0 "lost" (really just reordered): SACKs for 1..5.
-    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[1].seq, e.snd +% @as(u32, data.len) }}) } });
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[1].seq, e.snd +% u32of(data.len) }}) } });
     const re = try r.recv();
     try t.expectEqual(segs[0].seq, re.seq);
     try t.expect(e.st.debugConn().?.cwnd < cwnd_before);
     // Everything ACKed, and the retransmission comes back as a D-SACK: it
     // was spurious, the cut is undone.
-    const end = e.snd +% @as(u32, data.len);
-    r.send(.{ .seq = e.rcv, .ack = end, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[0].seq, segs[0].seq +% 1380 }}) } });
+    const end = e.snd +% u32of(data.len);
+    const seg0_end = segs[0].seq +% mssOf(&r);
+    r.send(.{ .seq = e.rcv, .ack = end, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[0].seq, seg0_end }}) } });
     const k = e.st.debugConn().?;
     try t.expect(!k.in_recovery);
     try t.expectEqual(@as(u64, 1), r.stack.stats().spurious_undos);
     try t.expect(k.cwnd >= cwnd_before);
     // More fake D-SACKs for the same episode undo nothing more.
-    for (0..100) |_| r.send(.{ .seq = e.rcv, .ack = end, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[0].seq, segs[0].seq +% 1380 }}) } });
+    for (0..100) |_| r.send(.{ .seq = e.rcv, .ack = end, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[0].seq, seg0_end }}) } });
     try t.expectEqual(@as(u64, 1), r.stack.stats().spurious_undos);
+}
+
+// ---- RACK-TLP congestion response (RFC 8985 7.4) -------------------------------
+
+/// An interactive SACK connection (SRTT 20 ms), a keystroke whose first
+/// transmission is lost, and the tail loss probe that re-sends it.
+fn keystrokeProbed(r: *Rig, l: root.Listener) !struct { e: @typeInfo(@typeInfo(@TypeOf(establishedRtt)).@"fn".return_type.?).error_union.payload, key: wire.Tcp } {
+    const e = try establishedRtt(r, l, 20);
+    _ = try e.st.write("k");
+    const key = try r.recv();
+    try r.fireNext(); // the probe timer
+    const probe = try r.recv();
+    try t.expectEqual(key.seq, probe.seq);
+    try t.expectEqual(@as(u64, 1), r.stack.stats().tail_loss_probes);
+    return .{ .e = e, .key = key };
+}
+
+test "RACK-TLP: a probe that repairs a real tail loss reduces cwnd, once" {
+    for (families) |f| try tlpRepairsLoss(f);
+}
+
+fn tlpRepairsLoss(f: Fam) !void {
+    var r: Rig = undefined;
+    try r.initFor(f, .{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const x = try keystrokeProbed(&r, l);
+    const cwnd_before = x.e.st.debugConn().?.cwnd;
+    // The original was lost, the probe arrived: a plain ACK, no D-SACK.
+    r.send(.{ .seq = x.e.rcv, .ack = x.key.seq +% 1, .flags = .{ .ack = true }, .window = 0xffff });
+    const k = x.e.st.debugConn().?;
+    try t.expectEqual(@as(u64, 1), r.stack.stats().tlp_loss_repairs);
+    // Halved (the ACK's own slow-start growth of one byte comes first).
+    try t.expect(k.cwnd >= cwnd_before / 2 and k.cwnd <= cwnd_before / 2 + k.mss);
+    try t.expectEqual(k.cwnd, k.ssthresh);
+    try t.expect(!k.in_recovery);
+    // The episode is over: a duplicate of that ACK changes nothing more.
+    r.send(.{ .seq = x.e.rcv, .ack = x.key.seq +% 1, .flags = .{ .ack = true }, .window = 0xffff });
+    try t.expectEqual(@as(u64, 1), r.stack.stats().tlp_loss_repairs);
+    try t.expectEqual(k.cwnd, x.e.st.debugConn().?.cwnd);
+}
+
+test "RACK-TLP: an unneeded probe (D-SACKed) causes no reduction" {
+    for (families) |f| try tlpUnneeded(f);
+}
+
+fn tlpUnneeded(f: Fam) !void {
+    var r: Rig = undefined;
+    try r.initFor(f, .{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const x = try keystrokeProbed(&r, l);
+    const cwnd_before = x.e.st.debugConn().?.cwnd;
+    // The original arrived (only its ACK was lost): the probe is a
+    // duplicate, and the receiver says so with a D-SACK.
+    r.send(.{ .seq = x.e.rcv, .ack = x.key.seq +% 1, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ x.key.seq, x.key.seq +% 1 }}) } });
+    const st = r.stack.stats();
+    try t.expectEqual(@as(u64, 0), st.tlp_loss_repairs);
+    try t.expectEqual(@as(u64, 1), st.tlp_unneeded);
+    try t.expect(x.e.st.debugConn().?.cwnd >= cwnd_before); // not reduced
+}
+
+test "RACK-TLP: RACK and TLP seeing the same loss reduce cwnd only once" {
+    for (families) |f| try tlpRackNoDoubleReduction(f);
+}
+
+fn tlpRackNoDoubleReduction(f: Fam) !void {
+    var r: Rig = undefined;
+    try r.initFor(f, .{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try establishedRtt(&r, l, 20);
+    var buf: [3 * 1380]u8 = undefined;
+    const data = segmentsOf(&r, &buf, 3, 'T');
+    _ = try e.st.write(data);
+    var segs: [3]wire.Tcp = undefined;
+    try dataSegs(&r, &segs);
+    // Segments 1 and 2 lost. The probe re-sends the tail (segment 2).
+    try r.fireNext();
+    const probe = try r.recv();
+    try t.expectEqual(segs[2].seq, probe.seq);
+    r.clock.advance(20 * std.time.ns_per_ms);
+    // Segment 0 and the probe arrive: the probe's SACK lets RACK see that
+    // segment 1, sent before it, is lost: recovery (one reduction).
+    r.send(.{ .seq = e.rcv, .ack = segs[1].seq, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&.{.{ segs[2].seq, e.snd +% u32of(data.len) }}) } });
+    const k1 = e.st.debugConn().?;
+    try t.expect(k1.in_recovery);
+    try t.expectEqual(@as(u64, 1), r.stack.stats().fast_retransmits);
+    const re = try r.recv();
+    try t.expectEqual(segs[1].seq, re.seq);
+    // The repair arrives: everything ACKed, no D-SACK. The TLP episode
+    // ends without a second reduction: the recovery already made it.
+    r.send(.{ .seq = e.rcv, .ack = e.snd +% u32of(data.len), .flags = .{ .ack = true }, .window = 0xffff });
+    const k2 = e.st.debugConn().?;
+    try t.expect(!k2.in_recovery);
+    try t.expectEqual(@as(u64, 0), r.stack.stats().tlp_loss_repairs);
+    try t.expectEqual(k1.ssthresh, k2.ssthresh);
+    try t.expectEqual(k1.ssthresh, k2.cwnd);
 }
 // ---- IPv6 ------------------------------------------------------------------
 // Handshakes both ways, data, FIN / RST, retransmission, user timeout,
