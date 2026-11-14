@@ -28,6 +28,11 @@ pub const Udp = struct {
     family: common.Family,
 
     pub fn open(family: common.Family, port: u16) common.OpenError!Udp {
+        return openScoped(family, port, .default);
+    }
+
+    /// `scope` (common.Scope): every interface, or loopback only.
+    pub fn openScoped(family: common.Family, port: u16, scope: common.Scope) common.OpenError!Udp {
         const af: u32 = if (family == .v4) posix.AF.INET else posix.AF.INET6;
         var kind: u32 = posix.SOCK.DGRAM;
         if (is_linux) kind |= posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
@@ -45,9 +50,10 @@ pub const Udp = struct {
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&bufsz)) catch {};
 
         var storage: posix.sockaddr.storage = undefined;
+        const loopback = scope == .loopback;
         const len = toSockaddr(&storage, switch (family) {
-            .v4 => .{ .ip4 = .{ .bytes = @splat(0), .port = port } },
-            .v6 => .{ .ip6 = .{ .bytes = @splat(0), .port = port } },
+            .v4 => .{ .ip4 = .{ .bytes = if (loopback) .{ 127, 0, 0, 1 } else @splat(0), .port = port } },
+            .v6 => .{ .ip6 = .{ .bytes = if (loopback) .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } else @splat(0), .port = port } },
         });
         const brc = sys.bind(fd, @ptrCast(&storage), len);
         switch (posix.errno(brc)) {

@@ -3,7 +3,7 @@
 //! Run ONCE from an elevated prompt (it installs a temporary tunnel service):
 //!
 //!     zig build interop-live                      (builds zig-out\bin\zwg-interop-live.exe)
-//!     zig-out\bin\zwg-interop-live.exe [--zwg zig-out\bin\zwg.exe] [--record tests\interop\vectors\official.zig]
+//!     zig-out\bin\zwg-interop-live.exe [--zwg zig-out\bin\zwg-testtun.exe] [--record tests\interop\vectors\official.zig]
 //!
 //! Phase A (needs nothing but this driver): the official service initiates a
 //! handshake to us on 127.0.0.1; the reference model (spec.zig) answers,
@@ -13,7 +13,7 @@
 //! report the handshake. With --record, the transcript is written as a Zig
 //! file the offline golden tests then replay forever.
 //!
-//! Phase B (with --zwg): the
+//! Phase B (with --zwg, a -Dtest-tun build: zwg-testtun.exe): the
 //! same official tunnel, now with a real `zwg up <conf> --tun udp:<port>`
 //! process as the peer. zwg initiates this time (the other direction), and
 //! the driver feeds/reads raw IP packets through UdpTun. No Wintun needed.
@@ -186,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- Phase B: official <-> zwg -------------------------------------------
     const zwg = opts.zwg orelse {
-        drive.step("phase B skipped (pass --zwg zig-out/bin/zwg.exe)", .{});
+        drive.step("phase B skipped (pass --zwg zig-out/bin/zwg-testtun.exe)", .{});
         return;
     };
     drive.step("phase B: zwg initiates to the official tunnel", .{});
@@ -233,7 +233,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage() error{InteropFailed} {
-    return drive.fail("usage: zwg-interop-live [--zwg <zwg.exe>] [--record <file.zig>]", .{});
+    return drive.fail("usage: zwg-interop-live [--zwg <zwg-testtun.exe>] [--record <file.zig>]", .{});
 }
 
 /// `wg show <if> latest-handshakes` prints "<pubkey>\t<unix seconds>".

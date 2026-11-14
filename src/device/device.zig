@@ -94,6 +94,9 @@ pub const Options = struct {
     private_key: crypto.PrivateKey,
     /// null or 0 = any free port.
     listen_port: ?u16 = null,
+    /// Listen on loopback only (the `--tun udp:<port>` test mode; unit
+    /// tests do anyway): never reachable from, nor visible to, the network.
+    loopback_only: bool = false,
     peers: []const PeerConfig = &.{},
 };
 
@@ -145,6 +148,7 @@ pub const Device = struct {
     udp4: ?os.Udp = null,
     udp6: ?os.Udp = null,
     listen_port: u16 = 0,
+    scope: os.Scope = .default,
 
     waker: tun_mod.queue.Waker,
     /// Wakes the loop at the earliest timer deadline even across a
@@ -212,6 +216,7 @@ pub const Device = struct {
             .tun = tun,
             .mtu = tun.mtu(),
             .waker = waker,
+            .scope = if (options.loopback_only) .loopback else .default,
             .deadline_timer = deadline_timer,
             .rx_buf = rx_buf,
             .tx_buf = tx_buf,
@@ -261,10 +266,10 @@ pub const Device = struct {
     }
 
     fn bind(d: *Device, port: u16) InitError!void {
-        d.udp4 = try os.Udp.open(.v4, port);
+        d.udp4 = try os.Udp.openScoped(.v4, port, d.scope);
         d.listen_port = d.udp4.?.localPort();
         // Same port for IPv6; a host without IPv6 just runs IPv4-only.
-        d.udp6 = os.Udp.open(.v6, d.listen_port) catch |err| blk: {
+        d.udp6 = os.Udp.openScoped(.v6, d.listen_port, d.scope) catch |err| blk: {
             log.info("IPv6 UDP socket unavailable ({s}); IPv4 only", .{@errorName(err)});
             break :blk null;
         };

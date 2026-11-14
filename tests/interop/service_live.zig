@@ -2,14 +2,18 @@
 //! run ONCE by the owner from an elevated prompt:
 //!
 //!   zig build interop-service
-//!   zig-out\bin\zwg-service-live.exe --zwg zig-out\bin\zwg.exe
+//!   zig-out\bin\zwg-service-live.exe --zwg zig-out\bin\zwg.exe [--peer zig-out\bin\zwg-testtun.exe]
+//!
+//! The service is installed from the release zwg.exe (no test mode); the
+//! peer runs as zwg-testtun.exe (the -Dtest-tun build: `--tun udp:<port>`),
+//! by default the one next to --zwg.
 //!
 //! What it does (and undoes, on success and on failure):
 //!  1. refuses unless elevated (changes nothing);
 //!  2. writes two throwaway .conf files to %TEMP% (zwgsvctest.conf: the
 //!     tunnel, 10.79.0.1/24, peer 10.79.0.2 at 127.0.0.1:<port>, keepalive
 //!     25 s; zwgsvcpeer.conf: the peer) and starts the peer as an ordinary
-//!     `zwg up --tun udp:<port>` process (no adapter, no privileges);
+//!     `zwg-testtun up --tun udp:<port>` process (no adapter, no privileges);
 //!  3. `zwg installtunnel zwgsvctest.conf`: service zwgTunnel$zwgsvctest,
 //!     %ProgramFiles%\zwg\tunnels\zwgsvctest\{zwg.exe,wintun.dll,tunnel.conf.dpapi},
 //!     %ProgramFiles%\zwg\logs\zwgsvctest.log, a Wintun adapter "zwgsvctest"
@@ -59,15 +63,18 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
     var zwg: ?[]const u8 = null;
+    var peer_zwg: ?[]const u8 = null;
     var args = try init.minimal.args.iterateAllocator(arena);
     _ = args.skip();
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--zwg")) zwg = args.next();
+        if (std.mem.eql(u8, a, "--peer")) peer_zwg = args.next();
     }
     const zwg_path = zwg orelse {
-        std.debug.print("usage: zwg-service-live --zwg <path to zwg.exe>\n", .{});
+        std.debug.print("usage: zwg-service-live --zwg <path to zwg.exe> [--peer <path to zwg-testtun.exe>]\n", .{});
         std.process.exit(2);
     };
+    const peer_path_exe = peer_zwg orelse try std.fs.path.join(arena, &.{ std.fs.path.dirname(zwg_path) orelse ".", "zwg-testtun.exe" });
     if (!win.isElevated()) {
         std.debug.print(
             \\This driver installs and removes a temporary zwg tunnel service, so it
@@ -119,9 +126,9 @@ pub fn main(init: std.process.Init) !void {
     try drive.writeFile(io, peer_path, peer_conf);
     defer drive.shredFile(io, peer_path, peer_conf.len);
 
-    drive.step("start the peer: zwg up --tun udp:{d} (UDP {d})", .{ peer_tun_port, peer_port });
+    drive.step("start the peer: {s} up --tun udp:{d} (UDP {d})", .{ peer_path_exe, peer_tun_port, peer_port });
     const tun_arg = try std.fmt.allocPrint(arena, "udp:{d}", .{peer_tun_port});
-    var peer = try std.process.spawn(io, .{ .argv = &.{ zwg_path, "up", peer_path, "--tun", tun_arg } });
+    var peer = try std.process.spawn(io, .{ .argv = &.{ peer_path_exe, "up", peer_path, "--tun", tun_arg } });
     defer peer.kill(io);
     var peer_tun = try tun.UdpTun.open(0, 1500);
     defer peer_tun.close();

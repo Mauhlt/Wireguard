@@ -100,12 +100,16 @@ pub fn initNetworking() common.OpenError!void {
     wsa_started.store(true, .release);
 }
 
-/// The address the device's sockets listen on: every interface, as a real
-/// endpoint must. Unit tests listen on loopback only, so running them never
-/// opens the machine to the network (and never raises a Windows Firewall
-/// prompt for each freshly built test executable).
-const any4: [4]u8 = if (@import("builtin").is_test) .{ 127, 0, 0, 1 } else @splat(0);
-const any6: [16]u8 = if (@import("builtin").is_test) .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } else @splat(0);
+/// The addresses the device's sockets listen on (common.Scope): every
+/// interface, as a real endpoint must, or loopback only (unit tests, the
+/// `--tun` test mode), which never opens the machine to the network nor
+/// raises a Windows Firewall prompt for a freshly built executable.
+fn bindAddr4(scope: common.Scope) [4]u8 {
+    return if (scope == .loopback) .{ 127, 0, 0, 1 } else @splat(0);
+}
+fn bindAddr6(scope: common.Scope) [16]u8 {
+    return if (scope == .loopback) .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } else @splat(0);
+}
 
 pub const Udp = struct {
     sock: SOCKET,
@@ -113,6 +117,10 @@ pub const Udp = struct {
     family: common.Family,
 
     pub fn open(family: common.Family, port: u16) common.OpenError!Udp {
+        return openScoped(family, port, .default);
+    }
+
+    pub fn openScoped(family: common.Family, port: u16, scope: common.Scope) common.OpenError!Udp {
         try initNetworking();
         const af = if (family == .v4) AF_INET else AF_INET6;
         const s = socket(af, SOCK_DGRAM, IPPROTO_UDP);
@@ -135,11 +143,11 @@ pub const Udp = struct {
 
         const rc = switch (family) {
             .v4 => blk: {
-                const sa: sockaddr_in = .{ .family = AF_INET, .port = std.mem.nativeToBig(u16, port), .addr = any4 };
+                const sa: sockaddr_in = .{ .family = AF_INET, .port = std.mem.nativeToBig(u16, port), .addr = bindAddr4(scope) };
                 break :blk bind(s, &sa, @sizeOf(sockaddr_in));
             },
             .v6 => blk: {
-                const sa: sockaddr_in6 = .{ .family = AF_INET6, .port = std.mem.nativeToBig(u16, port), .addr = any6 };
+                const sa: sockaddr_in6 = .{ .family = AF_INET6, .port = std.mem.nativeToBig(u16, port), .addr = bindAddr6(scope) };
                 break :blk bind(s, &sa, @sizeOf(sockaddr_in6));
             },
         };

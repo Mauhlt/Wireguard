@@ -30,8 +30,12 @@ zwg up <conf> --tun udp:<port>
   and routes are not applied in this mode (`setAddress` / `addRoute` are no-ops
   on UdpTun).
 * `zwg` with no arguments prints a usage text that mentions `--tun` (if a
-  binary does not, the runner reports `SKIP` for it). Implemented in
-  src/main.zig.
+  binary does not, the runner fails). Implemented in src/main.zig.
+* **Test builds only.** The mode is compiled in only with `-Dtest-tun`
+  (default off), and always into `zig-out\bin\zwg-testtun.exe`, which the
+  interop steps build and run; the release `zwg.exe` (what `installtunnel`
+  copies into the service) does not have it — `zig build interop` checks
+  that it refuses `up <conf> --tun udp:<port>` as a usage error.
 * The process is ended with a kill (TerminateProcess / SIGKILL) at the end of
   the test.
 
@@ -47,10 +51,10 @@ nor zwg for phase A.
 
 One admin prompt, one command:
 
-1. Build as your normal user: `zig build interop-live` (and `zig build` for zwg).
+1. Build as your normal user: `zig build interop-live` (builds zwg-testtun.exe too).
 2. Open **Terminal (Admin)** in the repo and run
    ```
-   zig-out\bin\zwg-interop-live.exe --record tests\interop\vectors\official.zig --zwg zig-out\bin\zwg.exe
+   zig-out\bin\zwg-interop-live.exe --record tests\interop\vectors\official.zig --zwg zig-out\bin\zwg-testtun.exe
    ```
    (without `--zwg`, phase B is skipped.)
 3. Commit the recorded `tests/interop/vectors/official.zig` (throwaway keys).
@@ -327,8 +331,12 @@ in System32. Then, as your normal user `zig build interop-service`, and in
 zig-out\bin\zwg-service-live.exe --zwg zig-out\bin\zwg.exe
 ```
 
+(The service is installed from the release `zwg.exe`; the peer runs as
+`zwg-testtun.exe` from the same folder, the `-Dtest-tun` build; `--peer <exe>`
+picks another.)
+
 It installs `zwgTunnel$zwgsvctest` (10.79.0.1/24, peer 10.79.0.2 = a plain
-`zwg up --tun udp:<port>` process on 127.0.0.1), checks the store's DACL and
+`zwg-testtun up --tun udp:<port>` process on 127.0.0.1), checks the store's DACL and
 encryption (every store directory under the Program Files known folder, a plain
 directory owned by Administrators with the protected DACL; the installer's
 verifier `Dirs.openExisting` accepts it; an ordinary user can neither read the

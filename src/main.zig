@@ -17,6 +17,10 @@ const dev = wg.device;
 const keys = dev.keys;
 const config = dev.config;
 const is_windows = @import("builtin").os.tag == .windows;
+/// `up <conf> --tun udp:<port>`: the TUN is a 127.0.0.1 UDP socket (no
+/// adapter, no privileges). A test-harness hook for tests/interop, compiled
+/// in only by `-Dtest-tun` and into the `zwg-testtun` build.
+const test_tun_enabled = @import("build_options").test_tun;
 
 // In the tunnel service, std.log output goes to the tunnel's log file.
 pub const std_options: std.Options = .{ .logFn = if (is_windows) wg.service.log.logFn else std.log.defaultLog };
@@ -28,8 +32,12 @@ const usage =
     \\  pubkey                 read a private key on stdin, print its public key
     \\  show <file.conf>       show a configuration (keys other than public ones hidden)
     \\  up <file.conf>         bring the tunnel up (foreground; needs Administrator on Windows)
+    \\
+++ (if (test_tun_enabled)
     \\  up <file.conf> --tun udp:<port>
     \\                         test mode: the TUN is a 127.0.0.1 UDP socket (tests/interop)
+    \\
+else "") ++
     \\  down <name|file.conf>  stop a tunnel started with `zwg up`
     \\
 ++ (if (is_windows) "\nInstalled tunnels (Windows service; nothing else runs elevated):\n" ++ wg.service.cli.usage else "");
@@ -101,8 +109,8 @@ fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, out: *std.I
         try dev.show.write(out, interfaceName(args[1]), &c, null, null, 0);
         return 0;
     }
-    if (std.mem.eql(u8, cmd, "up") and (args.len == 2 or (args.len == 4 and std.mem.eql(u8, args[2], "--tun")))) {
-        const test_tun: ?u16 = if (args.len == 4) wg.tun.UdpTun.parseSpec(args[3]) catch {
+    if (std.mem.eql(u8, cmd, "up") and (args.len == 2 or (test_tun_enabled and args.len == 4 and std.mem.eql(u8, args[2], "--tun")))) {
+        const test_tun: ?u16 = if (test_tun_enabled and args.len == 4) wg.tun.UdpTun.parseSpec(args[3]) catch {
             try errw.writeAll("zwg: --tun expects udp:<port>\n");
             return 1;
         } else null;
@@ -153,7 +161,9 @@ fn loadConfig(gpa: std.mem.Allocator, io: std.Io, path: []const u8, errw: *std.I
     return c;
 }
 
-fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Config, test_tun: ?u16, out: *std.Io.Writer, errw: *std.Io.Writer) !u8 {
+fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Config, test_tun_arg: ?u16, out: *std.Io.Writer, errw: *std.Io.Writer) !u8 {
+    // Comptime-known null without -Dtest-tun: the UdpTun path is not compiled in.
+    const test_tun: ?u16 = if (comptime test_tun_enabled) test_tun_arg else null;
     const builtin = @import("builtin");
     const tun = wg.tun;
     if (comptime builtin.os.tag == .ios) {
@@ -235,6 +245,7 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
         .private_key = c.interface.private_key,
         .listen_port = c.interface.listen_port,
         .peers = peers,
+        .loopback_only = test_tun != null,
     });
     defer d.destroy();
     d.external_stop = stop.waitHandle();

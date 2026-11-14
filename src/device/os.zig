@@ -8,6 +8,7 @@ const common = @import("os/common.zig");
 const backend = if (builtin.os.tag == .windows) @import("os/windows.zig") else @import("os/posix.zig");
 
 pub const Family = common.Family;
+pub const Scope = common.Scope;
 pub const Datagram = common.Datagram;
 pub const OpenError = common.OpenError;
 pub const RecvError = common.RecvError;

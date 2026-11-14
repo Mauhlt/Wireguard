@@ -3,6 +3,18 @@ const std = @import("std");
 
 pub const Family = enum { v4, v6 };
 
+/// Where a UDP socket listens: every interface (a real endpoint), or
+/// loopback only (unit tests, and the `--tun udp:<port>` test mode, so
+/// neither ever opens the machine to the network nor raises a Windows
+/// Firewall prompt for a freshly built executable).
+pub const Scope = enum {
+    any,
+    loopback,
+
+    /// What `Udp.open` uses: loopback in unit tests, every interface otherwise.
+    pub const default: Scope = if (@import("builtin").is_test) .loopback else .any;
+};
+
 pub const Datagram = struct {
     len: usize,
     from: std.Io.net.IpAddress,
