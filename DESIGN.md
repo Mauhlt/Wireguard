@@ -258,18 +258,37 @@ derivation. `netstack.testing` holds the packet-crafting fake peer
 (`testing.Peer`) and `ImpairedTun` (seeded loss / reorder / duplication),
 for unit tests, tests/netstack and fuzzers alike.
 
-TCP: RFC 9293 state machine (both handshakes, FIN/RST, TIME-WAIT bounded
-by Limits.time_wait_ns), MSS from the MTU (1420 -> 1380), window scale
-(RFC 7323; SACK-permitted and timestamps parsed and ignored), RTO per
-RFC 6298 with Karn's rule, fast retransmit / NewReno (RFC 5681/6582), zero
-window probing, delayed ACK, no Nagle. ISNs: keyed SipHash over the
-4-tuple plus a clock (RFC 6528); per-listener SYN backlog cap.
+TCP: RFC 9293 state machine (both handshakes, simultaneous open, FIN/RST,
+TIME-WAIT bounded by Limits.time_wait_ns), MSS from the MTU (1420 ->
+1380), window scale (RFC 7323; SACK-permitted and timestamps parsed and
+ignored: no SACK), RTO per RFC 6298 with Karn's rule (200 ms floor like
+Linux, not 1 s), fast retransmit / NewReno (RFC 5681/6582), Limited
+Transmit (RFC 3042), Early Retransmit (RFC 5827), one duplicate ACK per
+out-of-order segment, RST handling per RFC 5961 (challenge ACKs), zero
+window probing and keepalive with an out-of-window probe (snd_una - 1),
+delayed ACK (every 2nd segment / 40 ms), receiver and sender SWS
+avoidance, no Nagle. Pure ACKs carry snd_max, not snd_nxt (as BSD): after
+an RTO rolls snd_nxt back, a peer that already has everything would drop
+an ACK at snd_nxt as unacceptable, and two such peers deadlock. ISNs:
+keyed SipHash-2-4 over the 4-tuple plus a 4 us clock (RFC 6528); per-
+listener SYN backlog cap; half-open connections get no buffers.
 Validation: IHL, total length, header checksum, TCP data offset, options,
 TCP checksum; fragments dropped; packets not addressed to Options.address
 dropped. The device already drops inner packets whose source is not in
 the peer's AllowedIPs. Memory: buffers allocated per established
 connection, bounded by Limits (defaults: ~33 MiB worst case, rings ~1.4 MiB
 idle); wiped when freed.
+
+Tests: unit and state-machine tests inline (src/netstack/*.zig, manual
+drive with `testing.Peer` and the advanceable device clock, plus two
+stacks over a deterministic lossy link); fuzz targets in
+src/netstack/fuzz.zig (also run with seeded random inputs, since `--fuzz`
+does not run on Windows); `src/netstack/e2e.zig` is its own ReleaseSafe
+test binary (`zig build test` runs it; `zig build netstack-e2e` alone):
+two real Devices over 127.0.0.1 UDP, 50 MiB each way with and without
+loss / reordering / duplication (SHA-256 checked), interactive latency
+under a saturating bulk stream, Node with the Reader / Writer adapters.
+Adversarial and conformance suites live in tests/netstack (separate agent).
 ## Rules
 
 * Pure Zig, std only (Wintun is the one runtime-loaded OS component).
