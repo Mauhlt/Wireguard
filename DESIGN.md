@@ -193,7 +193,8 @@ Public API (`const ns = @import("WireGuard").netstack;`):
 ns.Addr = device.ip.Addr                  // .v4 or .v6
 ns.Endpoint { addr: Addr, port: u16 }
 ns.Limits { max_connections=64, max_listeners=8, send_buffer=256K, recv_buffer=256K,
-            syn_backlog=16, accept_backlog=16, max_ooo_segments=32, ring_packets=512,
+            syn_backlog=16, accept_backlog=16, syn_backlog_per_source=4,
+            max_connections_per_source=16, max_ooo_segments=32, ring_packets=512,
             time_wait_ns=2s, fin_wait2_ns=30s, user_timeout_ns=60s, bulk_unsent_lowat=64K }
 ns.Priority = enum { interactive, bulk }
 ns.Options { address: Addr, address6: ?Addr=null, mtu=1420, limits, keepalive_idle_ns: ?u64=null, icmp_echo=true }

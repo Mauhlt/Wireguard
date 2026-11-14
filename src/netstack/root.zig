@@ -70,6 +70,18 @@ pub const Limits = struct {
     /// SYN-ACK retransmissions give it another chance, and it is dropped
     /// after their limit.
     accept_backlog: u16 = 16,
+    /// Half-open (SYN-RECEIVED) connections from one remote address, over
+    /// all listeners. A SYN beyond it replaces that address's oldest
+    /// half-open connection, so one peer cannot fill `syn_backlog` for
+    /// everyone else (its own SYN flood only churns its own entries).
+    syn_backlog_per_source: u16 = 4,
+    /// Accepted (or waiting to be) passive connections from one remote
+    /// address, in any state past SYN-RECEIVED, TIME-WAIT included. At the
+    /// cap a SYN from that address takes the place of its oldest TIME-WAIT
+    /// connection the application has let go of, or is dropped (counted in
+    /// `Stats.dropped_source_limit`). Connections this side dials are not
+    /// counted.
+    max_connections_per_source: u16 = 16,
     /// Out-of-order segments held per connection (each a byte range of
     /// the receive buffer; only the range bookkeeping is capped here).
     max_ooo_segments: u16 = 32,
@@ -159,6 +171,13 @@ pub const Stats = struct {
     dropped_not_for_us: u64 = 0,
     dropped_ring_full: u64 = 0,
     dropped_syn_backlog: u64 = 0,
+    /// SYNs dropped because their source holds
+    /// `Limits.max_connections_per_source` passive connections already.
+    dropped_source_limit: u64 = 0,
+    /// Connections freed early to make room: a source's oldest half-open
+    /// one past `Limits.syn_backlog_per_source`, or the oldest released
+    /// TIME-WAIT one when the table (or the source's share) is full.
+    evicted: u64 = 0,
     /// Handshake-completing ACKs dropped because the accept queue was full.
     dropped_accept_backlog: u64 = 0,
     dropped_ooo: u64 = 0,

@@ -242,6 +242,7 @@ test "hostile: absurd MSS (0, 1, 65535) and window scale (200) in a SYN: no pani
 test "hostile: SYN flood past syn_backlog: extra SYNs dropped and counted, half-opens expire" {
     var limits: ns.Limits = .{};
     limits.syn_backlog = 4;
+    limits.syn_backlog_per_source = 64; // one source here: test the listener's own cap
     const h = try H.create(gpa, .{ .limits = limits });
     defer h.destroy();
     const l = try h.stack.listen(8420);
@@ -298,6 +299,7 @@ test "hostile: connection exhaustion at max_connections: SYNs and dials refused,
     limits.max_connections = 4;
     limits.syn_backlog = 16;
     limits.accept_backlog = 16;
+    limits.syn_backlog_per_source = 64; // one source here: test the table's own cap
     const h = try H.create(gpa, .{ .limits = limits });
     defer h.destroy();
     const l = try h.stack.listen(8420);
@@ -323,6 +325,100 @@ test "hostile: connection exhaustion at max_connections: SYNs and dials refused,
     const st = try h.stack.dial(.{ .addr = hz.peer_addr, .port = 1 });
     st.abort();
     _ = l;
+}
+
+const other_addr: ns.Addr = .{ .v4 = .{ 10, 8, 0, 3 } };
+
+/// Opens a passive connection from peer_addr:`port` and closes it the stack-first way,
+/// so it sits in TIME-WAIT with its handle released.
+fn openToTimeWait(h: *H, l: ns.Listener, port: u16) !void {
+    var c = try hz.openPassive(h, l, .{ .peer_port = port });
+    c.stream.shutdown();
+    _ = (try h.waitSeg(&c.peer, 1 * sec)) orelse return error.NoFin;
+    c.rcv_nxt +%= 1;
+    c.fin(h);
+    _ = h.drain();
+    try t.expectEqual(ns.State.time_wait, c.state());
+    c.stream.close();
+}
+
+test "hostile: one source's SYN flood replaces its own half-opens, others still connect" {
+    const limits: ns.Limits = .{}; // syn_backlog 16, syn_backlog_per_source 4
+    const h = try H.create(gpa, .{ .limits = limits });
+    defer h.destroy();
+    const l = try h.stack.listen(8420);
+    var answered: usize = 0;
+    for (0..50) |i| {
+        var p = listenerPeer(@intCast(33000 + i));
+        h.send(&p, .{ .seq = 100, .flags = .{ .syn = true } });
+        while (h.out()) |pkt| {
+            const tp = try wire.parseTcp4(pkt);
+            if (tp.tcp.flags.syn and tp.tcp.flags.ack) answered += 1;
+        }
+    }
+    // Every SYN is answered, but the flooder never holds more than its share.
+    try t.expectEqual(@as(usize, 50), answered);
+    try t.expectEqual(@as(u16, limits.syn_backlog_per_source), h.stats().connections);
+    try t.expectEqual(@as(u64, 50 - limits.syn_backlog_per_source), h.stats().evicted);
+    try t.expectEqual(@as(u64, 0), h.stats().dropped_syn_backlog);
+    // Another peer connects at once.
+    var c = try hz.openPassive(h, l, .{ .peer_addr = other_addr });
+    c.stream.abort();
+}
+
+test "hostile: one source at max_connections_per_source: its SYNs dropped, others connect, TIME-WAIT makes room" {
+    var limits: ns.Limits = .{};
+    limits.max_connections_per_source = 3;
+    const h = try H.create(gpa, .{ .limits = limits });
+    defer h.destroy();
+    const l = try h.stack.listen(8420);
+    var held: [3]hz.Conn = undefined;
+    for (&held, 0..) |*c, i| c.* = try hz.openPassive(h, l, .{ .peer_port = @intCast(34000 + i) });
+    _ = h.drain();
+    // A fourth from the same source: dropped, no SYN-ACK.
+    var p = listenerPeer(34010);
+    h.send(&p, .{ .seq = 100, .flags = .{ .syn = true } });
+    try h.expectSilent();
+    try t.expectEqual(@as(u64, 1), h.stats().dropped_source_limit);
+    // Another source is not affected.
+    var other = try hz.openPassive(h, l, .{ .peer_addr = other_addr });
+    other.stream.abort();
+    _ = h.drain();
+    // Connections the application still holds are never evicted ...
+    held[0].stream.shutdown();
+    _ = (try h.waitSeg(&held[0].peer, 1 * sec)) orelse return error.NoFin;
+    held[0].rcv_nxt +%= 1;
+    held[0].fin(h);
+    _ = h.drain();
+    try t.expectEqual(ns.State.time_wait, held[0].state());
+    h.send(&p, .{ .seq = 100, .flags = .{ .syn = true } });
+    try h.expectSilent();
+    try t.expectEqual(@as(u64, 2), h.stats().dropped_source_limit);
+    // ... a released TIME-WAIT one makes room for the source's next SYN.
+    held[0].stream.close();
+    h.send(&p, .{ .seq = 100, .flags = .{ .syn = true } });
+    const sa = (try h.seg(&p)) orelse return error.NoSynAck;
+    try t.expect(sa.flags.syn and sa.flags.ack);
+    try t.expectEqual(@as(u64, 1), h.stats().evicted);
+    for (held[1..]) |*c| c.stream.abort();
+}
+
+test "hostile: TIME-WAIT churn fills the table: the oldest released TIME-WAIT is reclaimed" {
+    var limits: ns.Limits = .{};
+    limits.max_connections = 4;
+    limits.max_connections_per_source = 8;
+    const h = try H.create(gpa, .{ .limits = limits });
+    defer h.destroy();
+    const l = try h.stack.listen(8420);
+    for (0..4) |i| try openToTimeWait(h, l, @intCast(35000 + i));
+    try t.expectEqual(@as(u16, 4), h.stats().connections);
+    // Another source still gets in, and so does a dial.
+    var c = try hz.openPassive(h, l, .{ .peer_addr = other_addr });
+    defer c.stream.abort();
+    _ = h.drain();
+    const st = try h.stack.dial(.{ .addr = hz.peer_addr, .port = 1 });
+    st.abort();
+    try t.expectEqual(@as(u64, 2), h.stats().evicted);
 }
 
 test "hostile: out-of-order flood (1000 one-byte holes): bookkeeping capped, no new memory" {

@@ -48,6 +48,11 @@ const Slot = struct {
     listener: ?u8 = null,
     /// Established, waiting in the listener's accept queue.
     queued: bool = false,
+    /// Opened by a SYN to one of our listeners (stays set after accept):
+    /// what the per-source limits count.
+    passive: bool = false,
+    /// Allocation order (oldest first when evicting).
+    born: u64 = 0,
     accept_seq: u64 = 0,
     conn: tcp.Conn = .{ .local = undefined, .remote = undefined },
     /// Never reinitialised (a woken waiter may still touch it).
@@ -125,6 +130,7 @@ pub const Stack = struct {
     isn_key: [SipHash.key_length]u8,
     ip_id: u16 = 0,
     accept_counter: u64 = 0,
+    alloc_counter: u64 = 0,
     next_port: u32,
     rr: usize = 0,
     st: root.Stats = .{},
@@ -149,6 +155,7 @@ pub const Stack = struct {
         if (options.mtu < min_mtu) return error.InvalidMtu;
         const l = options.limits;
         if (l.max_connections == 0 or l.send_buffer == 0 or l.recv_buffer == 0 or
+            l.syn_backlog_per_source == 0 or l.max_connections_per_source == 0 or
             l.max_ooo_segments > tcp.max_ooo_ranges or l.ring_packets < 4 or l.recv_buffer > (0xffff << wire.max_window_scale))
             return error.InvalidLimits;
 
@@ -534,6 +541,20 @@ pub const Stack = struct {
         if (seg.flags.rst) return;
         if (seg.flags.syn and !seg.flags.ack) {
             if (s.findListener(seg.dst_port)) |li| {
+                const lim = s.options.limits;
+                // Per-source caps first, so that one remote address can
+                // only use up its own share of the listener's backlog and
+                // of the connection table.
+                if (s.countFromSource(remote.addr, .half_open) >= lim.syn_backlog_per_source) {
+                    if (s.oldestFromSource(remote.addr, .half_open)) |old| s.evict(old);
+                }
+                if (s.countFromSource(remote.addr, .past_handshake) >= lim.max_connections_per_source) {
+                    const old = s.oldestFromSource(remote.addr, .time_wait) orelse {
+                        s.st.dropped_source_limit += 1;
+                        return;
+                    };
+                    s.evict(old);
+                }
                 if (s.countForListener(li) >= @as(usize, s.options.limits.syn_backlog) + s.options.limits.accept_backlog or
                     s.countHalfOpen(li) >= s.options.limits.syn_backlog)
                 {
@@ -546,6 +567,7 @@ pub const Stack = struct {
                 };
                 const sl = &s.slots[i];
                 sl.listener = li;
+                sl.passive = true;
                 sl.conn = .{ .local = local, .remote = remote };
                 sl.conn.acceptSyn(&e, seg, s.isn(local, remote, now));
                 return;
@@ -675,18 +697,87 @@ pub const Stack = struct {
         return n >= s.options.limits.accept_backlog;
     }
 
+    /// A free slot; when the table is full, the oldest TIME-WAIT slot the
+    /// host has released is reclaimed for it (TIME-WAIT churn must not
+    /// lock out new connections; both ends are ours, one hop away).
     fn allocSlot(s: *Stack) ?usize {
+        const i = for (s.slots, 0..) |*sl, i| {
+            if (!sl.used) break i;
+        } else blk: {
+            const old = s.oldestReleasedTimeWait() orelse return null;
+            s.evict(old);
+            break :blk old;
+        };
+        const sl = &s.slots[i];
+        std.debug.assert(!sl.used);
+        sl.used = true;
+        sl.gen +%= 1;
+        sl.handle_open = false;
+        sl.listener = null;
+        sl.queued = false;
+        sl.passive = false;
+        s.alloc_counter += 1;
+        sl.born = s.alloc_counter;
+        s.st.connections += 1;
+        return i;
+    }
+
+    const SourceClass = enum {
+        /// Passive SYN-RECEIVED, never handed to the host.
+        half_open,
+        /// Passive, past SYN-RECEIVED (TIME-WAIT and held handles too).
+        past_handshake,
+        /// Passive TIME-WAIT the host has released.
+        time_wait,
+    };
+
+    fn inClass(sl: *const Slot, class: SourceClass) bool {
+        if (!sl.used or !sl.passive) return false;
+        return switch (class) {
+            .half_open => sl.conn.state == .syn_received and !sl.handle_open,
+            .past_handshake => sl.conn.state != .syn_received,
+            .time_wait => sl.conn.state == .time_wait and !sl.handle_open,
+        };
+    }
+
+    fn countFromSource(s: *Stack, addr: Addr, class: SourceClass) usize {
+        var n: usize = 0;
+        for (s.slots) |*sl| if (inClass(sl, class) and sl.conn.remote.addr.eql(addr)) {
+            n += 1;
+        };
+        return n;
+    }
+
+    fn oldestFromSource(s: *Stack, addr: Addr, class: SourceClass) ?usize {
+        var best: ?usize = null;
         for (s.slots, 0..) |*sl, i| {
-            if (sl.used) continue;
-            sl.used = true;
-            sl.gen +%= 1;
-            sl.handle_open = false;
-            sl.listener = null;
-            sl.queued = false;
-            s.st.connections += 1;
-            return i;
+            if (!inClass(sl, class) or !sl.conn.remote.addr.eql(addr)) continue;
+            if (best == null or sl.born < s.slots[best.?].born) best = i;
         }
-        return null;
+        return best;
+    }
+
+    /// Oldest TIME-WAIT slot (any direction) the host no longer holds.
+    fn oldestReleasedTimeWait(s: *Stack) ?usize {
+        var best: ?usize = null;
+        for (s.slots, 0..) |*sl, i| {
+            if (!sl.used or sl.handle_open or sl.conn.state != .time_wait) continue;
+            if (best == null or sl.born < s.slots[best.?].born) best = i;
+        }
+        return best;
+    }
+
+    /// Frees a half-open slot (RST to the peer) or a released TIME-WAIT
+    /// one (silently) to make room.
+    fn evict(s: *Stack, i: usize) void {
+        const sl = &s.slots[i];
+        std.debug.assert(sl.used and !sl.handle_open);
+        if (sl.conn.state == .syn_received) s.resetLocked(sl) else sl.conn.fail(error.ConnectionReset);
+        sl.queued = false;
+        sl.listener = null;
+        s.maybeRelease(i);
+        std.debug.assert(!sl.used);
+        s.st.evicted += 1;
     }
 
     fn portInUse(s: *Stack, port: u16) bool {
