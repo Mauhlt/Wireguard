@@ -11,6 +11,12 @@
 //!     adapters and the ready callback. (No TLS smoke test: std has a
 //!     TLS client but no server to run it against in-process.)
 //!
+//! The transfer and latency runs go over IPv4 (10.8.0.1 / 10.8.0.2,
+//! IPv4-only stacks) and over IPv6 (fd0a:8::1 / fd0a:8::2 on dual-stack
+//! stacks that also hold the IPv4 addresses, as Portal would configure
+//! them). Only the inner addresses change: the outer WireGuard UDP stays
+//! on 127.0.0.1.
+//!
 //! Everything waits on real events (blocking stream calls with
 //! timeouts); nothing sleeps or polls. Sockets bind 127.0.0.1 only.
 const std = @import("std");
@@ -21,6 +27,13 @@ const t = std.testing;
 
 const server_addr: ns.Addr = .{ .v4 = .{ 10, 8, 0, 1 } };
 const client_addr: ns.Addr = .{ .v4 = .{ 10, 8, 0, 2 } };
+const server_addr6: ns.Addr = .{ .v6 = .{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+const client_addr6: ns.Addr = .{ .v6 = .{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 } };
+
+/// The inner address family a Pair's connections use. `.v6`: both stacks
+/// are dual-stack (IPv4 + IPv6 addresses, both in AllowedIPs) and the
+/// connections go over IPv6.
+const Family = enum { v4, v6 };
 const port_main: u16 = 8420;
 const port_bulk: u16 = 8421;
 const io_timeout_ns: u64 = 60 * std.time.ns_per_s;
@@ -31,10 +44,10 @@ const Side = struct {
     device: *dev.Device,
     thread: ?std.Thread = null,
 
-    fn create(gpa: std.mem.Allocator, clock: *dev.device.Clock, addr: ns.Addr, priv: wg.crypto.PrivateKey, peer: dev.device.PeerConfig, seed: u64, imp_in: ns.testing.Impairment, imp_out: ns.testing.Impairment) !*Side {
+    fn create(gpa: std.mem.Allocator, clock: *dev.device.Clock, options: ns.Options, priv: wg.crypto.PrivateKey, peer: dev.device.PeerConfig, seed: u64, imp_in: ns.testing.Impairment, imp_out: ns.testing.Impairment) !*Side {
         const s = try gpa.create(Side);
         errdefer gpa.destroy(s);
-        s.stack = try ns.Stack.create(gpa, clock, .{ .address = addr });
+        s.stack = try ns.Stack.create(gpa, clock, options);
         errdefer s.stack.destroy();
         s.imp = .init(s.stack.tun(), seed, imp_in, imp_out);
         s.device = try dev.Device.create(gpa, clock, s.imp.tun(), .{
@@ -70,13 +83,15 @@ const Side = struct {
 
 const Pair = struct {
     clock: dev.device.Clock,
+    family: Family,
     server: *Side,
     client: *Side,
 
-    fn create(gpa: std.mem.Allocator, imp_in: ns.testing.Impairment, imp_out: ns.testing.Impairment) !*Pair {
+    fn create(gpa: std.mem.Allocator, family: Family, imp_in: ns.testing.Impairment, imp_out: ns.testing.Impairment) !*Pair {
         const p = try gpa.create(Pair);
         errdefer gpa.destroy(p);
         p.clock = .{ .io = t.io };
+        p.family = family;
         var ks: wg.crypto.PrivateKey = undefined;
         var kc: wg.crypto.PrivateKey = undefined;
         t.io.random(&ks);
@@ -85,16 +100,18 @@ const Pair = struct {
         wg.crypto.clampPrivateKey(&kc);
         defer wg.crypto.wipe(&ks);
         defer wg.crypto.wipe(&kc);
-        const server_cidr = [_]dev.ip.Cidr{try dev.ip.Cidr.parse("10.8.0.1/32")};
-        const client_cidr = [_]dev.ip.Cidr{try dev.ip.Cidr.parse("10.8.0.2/32")};
-        p.server = try Side.create(gpa, &p.clock, server_addr, ks, .{
+        const server_cidrs = [_]dev.ip.Cidr{ try dev.ip.Cidr.parse("10.8.0.1/32"), try dev.ip.Cidr.parse("fd0a:8::1/128") };
+        const client_cidrs = [_]dev.ip.Cidr{ try dev.ip.Cidr.parse("10.8.0.2/32"), try dev.ip.Cidr.parse("fd0a:8::2/128") };
+        const n_cidrs: usize = if (family == .v6) 2 else 1;
+        const dual = family == .v6;
+        p.server = try Side.create(gpa, &p.clock, .{ .address = server_addr, .address6 = if (dual) server_addr6 else null }, ks, .{
             .public_key = wg.crypto.publicKey(kc),
-            .allowed_ips = &client_cidr,
+            .allowed_ips = client_cidrs[0..n_cidrs],
         }, 0x5e5e, imp_in, imp_out);
         errdefer p.server.destroy(gpa);
-        p.client = try Side.create(gpa, &p.clock, client_addr, kc, .{
+        p.client = try Side.create(gpa, &p.clock, .{ .address = client_addr, .address6 = if (dual) client_addr6 else null }, kc, .{
             .public_key = wg.crypto.publicKey(ks),
-            .allowed_ips = &server_cidr,
+            .allowed_ips = server_cidrs[0..n_cidrs],
             .endpoint = .{ .ip4 = .loopback(p.server.device.listen_port) },
         }, 0xc1c1, imp_in, imp_out);
         errdefer p.client.destroy(gpa);
@@ -107,6 +124,23 @@ const Pair = struct {
         p.client.destroy(gpa);
         p.server.destroy(gpa);
         gpa.destroy(p);
+    }
+
+    /// The server's inner address the client dials.
+    fn serverAddr(p: *const Pair) ns.Addr {
+        return if (p.family == .v6) server_addr6 else server_addr;
+    }
+
+    /// Dials the server's `port` from the client and accepts it; checks
+    /// both ends use the Pair's family.
+    fn connect(p: *Pair, l: ns.Listener, port: u16, priority: ns.Priority) !struct { c: ns.Stream, s: ns.Stream } {
+        const c = try p.client.stack.dialWith(.{ .addr = p.serverAddr(), .port = port }, priority);
+        errdefer c.abort();
+        try c.waitConnected(20 * std.time.ns_per_s);
+        const s = try l.acceptWait(5 * std.time.ns_per_s);
+        try t.expectEqual(p.serverAddr(), c.remote().addr);
+        try t.expectEqual(std.meta.activeTag(p.serverAddr()), std.meta.activeTag(s.remote().addr));
+        return .{ .c = c, .s = s };
     }
 };
 
@@ -159,14 +193,15 @@ const Pump = struct {
     }
 };
 
-fn transfer(gpa: std.mem.Allocator, size: usize, loss_ppm: u32, reorder_ppm: u32, dup_ppm: u32) !void {
+fn transfer(gpa: std.mem.Allocator, family: Family, size: usize, loss_ppm: u32, reorder_ppm: u32, dup_ppm: u32) !void {
     const imp: ns.testing.Impairment = .{ .loss_ppm = loss_ppm, .reorder_ppm = reorder_ppm, .duplicate_ppm = dup_ppm };
-    const p = try Pair.create(gpa, imp, imp);
+    const p = try Pair.create(gpa, family, imp, imp);
     defer p.destroy(gpa);
 
     const l = try p.server.stack.listen(port_main);
-    const c = try p.client.stack.dialWait(.{ .addr = server_addr, .port = port_main }, 20 * std.time.ns_per_s);
-    const s = try l.acceptWait(5 * std.time.ns_per_s);
+    const conn = try p.connect(l, port_main, .interactive);
+    const c = conn.c;
+    const s = conn.s;
 
     const t0 = p.clock.now();
     var c_out: Pump = .{ .stream = c, .total = size, .seed = 1 };
@@ -208,13 +243,14 @@ fn transfer(gpa: std.mem.Allocator, size: usize, loss_ppm: u32, reorder_ppm: u32
     const cc = p.client.imp.counts;
     std.debug.print(
         \\
-        \\netstack e2e: {d} MiB each way, loss {d} ppm, reorder {d} ppm, dup {d} ppm per direction per side
+        \\netstack e2e ({t}): {d} MiB each way, loss {d} ppm, reorder {d} ppm, dup {d} ppm per direction per side
         \\  {d:.2} s, {d:.1} MiB/s aggregate ({d:.1} MiB/s each way)
         \\  impaired: dropped {d}, reordered {d}, duplicated {d}, passed {d}
         \\  server: tx {d} rx {d} retransmits {d} fast {d} rto {d} ooo-drop {d} ring-drop {d}
         \\  client: tx {d} rx {d} retransmits {d} fast {d} rto {d} ooo-drop {d} ring-drop {d}
         \\
     , .{
+        family,
         size / (1024 * 1024),                  loss_ppm,           reorder_ppm,     dup_ppm,
         secs,                                  mib / secs,         mib / 2 / secs,  sc.dropped + cc.dropped,
         sc.reordered + cc.reordered,           sc.duplicated + cc.duplicated, sc.passed + cc.passed, ss.tx_packets,
@@ -227,16 +263,24 @@ fn transfer(gpa: std.mem.Allocator, size: usize, loss_ppm: u32, reorder_ppm: u32
 test "e2e: 50 MiB both ways, 1% loss + reordering + duplication, SHA-256 checked" {
     // 0.5% per impairment point; a packet crosses two (sender's outbound,
     // receiver's inbound), so about 1% end to end, both directions.
-    try transfer(t.allocator, 50 * 1024 * 1024, 5_000, 5_000, 1_000);
+    try transfer(t.allocator, .v4, 50 * 1024 * 1024, 5_000, 5_000, 1_000);
 }
 
 test "e2e: 50 MiB both ways, 5% loss + reordering + duplication, SHA-256 checked" {
     // 2.5% per impairment point: ~5% end to end, both directions.
-    try transfer(t.allocator, 50 * 1024 * 1024, 25_000, 5_000, 1_000);
+    try transfer(t.allocator, .v4, 50 * 1024 * 1024, 25_000, 5_000, 1_000);
 }
 
 test "e2e: 50 MiB both ways, clean path" {
-    try transfer(t.allocator, 50 * 1024 * 1024, 0, 0, 0);
+    try transfer(t.allocator, .v4, 50 * 1024 * 1024, 0, 0, 0);
+}
+
+test "e2e IPv6: 50 MiB both ways over fd0a:8::/64, 1% loss + reordering + duplication, SHA-256 checked" {
+    try transfer(t.allocator, .v6, 50 * 1024 * 1024, 5_000, 5_000, 1_000);
+}
+
+test "e2e IPv6: 50 MiB both ways over fd0a:8::/64, clean path" {
+    try transfer(t.allocator, .v6, 50 * 1024 * 1024, 0, 0, 0);
 }
 
 // ---- interactive latency under bulk -----------------------------------------
@@ -320,20 +364,21 @@ const Echo = struct {
 /// One-way latency of interactive round trips while a bulk stream
 /// saturates the tunnel. `loss_ppm` applies to `lossy_port` only; the
 /// p99 must stay under `p99_bound_ns`.
-fn latencyUnderBulk(gpa: std.mem.Allocator, loss_ppm: u32, lossy_port: u16, p99_bound_ns: i64) !void {
+fn latencyUnderBulk(gpa: std.mem.Allocator, family: Family, loss_ppm: u32, lossy_port: u16, p99_bound_ns: i64) !void {
     const bulk_loss_ppm = loss_ppm;
     const imp: ns.testing.Impairment = .{ .loss_ppm = loss_ppm, .only_port = lossy_port };
-    const p = try Pair.create(gpa, imp, imp);
+    const p = try Pair.create(gpa, family, imp, imp);
     defer p.destroy(gpa);
 
     const lb = try p.server.stack.listen(port_bulk);
     const li = try p.server.stack.listen(port_main);
-    const cb = try p.client.stack.dialWith(.{ .addr = server_addr, .port = port_bulk }, .bulk);
-    try cb.waitConnected(20 * std.time.ns_per_s);
-    const sb = try lb.acceptWait(5 * std.time.ns_per_s);
+    const bulk = try p.connect(lb, port_bulk, .bulk);
+    const cb = bulk.c;
+    const sb = bulk.s;
     sb.setPriority(.bulk);
-    const ci = try p.client.stack.dialWait(.{ .addr = server_addr, .port = port_main }, 5 * std.time.ns_per_s);
-    const si = try li.acceptWait(5 * std.time.ns_per_s);
+    const inter = try p.connect(li, port_main, .interactive);
+    const ci = inter.c;
+    const si = inter.s;
 
     // Bulk: server -> client, saturating; the client drains it.
     var bulk_tx: Bulk = .{ .stream = sb };
@@ -378,9 +423,10 @@ fn latencyUnderBulk(gpa: std.mem.Allocator, loss_ppm: u32, lossy_port: u16, p99_
     const avg = @divTrunc(echo.sum_ns, @as(i64, @intCast(@max(echo.count, 1))));
     std.debug.print(
         \\
-        \\netstack latency under bulk ({d} ppm loss on port {d}): {d} samples, one-way avg {d} us, p99 {d} us, max {d} us, echo RTT max {d} us; bulk moved {d} MiB; probes {d}+{d}, rto {d}+{d}
+        \\netstack latency under bulk ({t}, {d} ppm loss on port {d}): {d} samples, one-way avg {d} us, p99 {d} us, max {d} us, echo RTT max {d} us; bulk moved {d} MiB; probes {d}+{d}, rto {d}+{d}
         \\
     , .{
+        family,
         bulk_loss_ppm,                                   lossy_port,                                    echo.count,
         @divTrunc(avg, 1000),                            @divTrunc(echo.percentile(99), 1000),          @divTrunc(echo.max_ns, 1000),
         @divTrunc(rtt_max, 1000),                        bulk_bytes_during / (1024 * 1024),             p.client.stack.stats().tail_loss_probes,
@@ -396,17 +442,29 @@ fn latencyUnderBulk(gpa: std.mem.Allocator, loss_ppm: u32, lossy_port: u16, p99_
 }
 
 test "e2e: interactive latency stays low under a saturating bulk stream (no loss)" {
-    try latencyUnderBulk(t.allocator, 0, port_bulk, 20 * std.time.ns_per_ms);
+    try latencyUnderBulk(t.allocator, .v4, 0, port_bulk, 20 * std.time.ns_per_ms);
 }
 
 test "e2e: interactive latency under 1 RTO with 1% loss on the bulk stream" {
-    try latencyUnderBulk(t.allocator, 5_000, port_bulk, 200 * std.time.ns_per_ms);
+    try latencyUnderBulk(t.allocator, .v4, 5_000, port_bulk, 200 * std.time.ns_per_ms);
+}
+
+test "e2e IPv6: interactive latency stays low under a saturating bulk stream (no loss)" {
+    try latencyUnderBulk(t.allocator, .v6, 0, port_bulk, 20 * std.time.ns_per_ms);
+}
+
+test "e2e IPv6: interactive latency with 1% loss on the bulk stream" {
+    try latencyUnderBulk(t.allocator, .v6, 5_000, port_bulk, 200 * std.time.ns_per_ms);
 }
 
 test "e2e: lost keystrokes are repaired by the tail loss probe (1% loss on the interactive stream)" {
     // 0.5% at each of two impairment points per direction: ~1% per packet.
     // Without TLP the p99 is one 200 ms RTO; with it, ~max(2 SRTT, 10 ms).
-    try latencyUnderBulk(t.allocator, 5_000, port_main, 60 * std.time.ns_per_ms);
+    try latencyUnderBulk(t.allocator, .v4, 5_000, port_main, 60 * std.time.ns_per_ms);
+}
+
+test "e2e IPv6: lost keystrokes are repaired by the tail loss probe (1% loss on the interactive stream)" {
+    try latencyUnderBulk(t.allocator, .v6, 5_000, port_main, 60 * std.time.ns_per_ms);
 }
 
 test "e2e: Node (device + stack + threads) with the std.Io Reader / Writer adapters" {
