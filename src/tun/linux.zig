@@ -11,7 +11,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const root = @import("root.zig");
-const Cidr = root.Cidr;
+const Cidr = @import("../ip.zig").Cidr;
 const Tun = root.Tun;
 
 pub const OpenError = error{
@@ -228,19 +228,19 @@ pub const LinuxTun = struct {
 
     fn setAddress(ptr: *anyopaque, cidr: Cidr) root.ConfigError!void {
         const t = self(ptr);
-        switch (cidr.family) {
-            .ip4 => {
+        switch (cidr.addr) {
+            .v4 => |a| {
                 var r = t.ifreq();
-                r.u.addr = sockaddr4(cidr.addr[0..4].*);
+                r.u.addr = sockaddr4(a);
                 try checkConfig(linux.ioctl(t.ctl4, SIOCSIFADDR, @intFromPtr(&r)));
                 r = t.ifreq();
                 r.u.addr = sockaddr4(cidr.netmask4());
                 try checkConfig(linux.ioctl(t.ctl4, SIOCSIFNETMASK, @intFromPtr(&r)));
             },
-            .ip6 => {
+            .v6 => |a| {
                 const s6 = try socket6();
                 defer _ = linux.close(s6);
-                var r: In6IfReq = .{ .addr = cidr.addr, .prefixlen = cidr.prefix_len, .ifindex = try t.ifindex() };
+                var r: In6IfReq = .{ .addr = a, .prefixlen = cidr.prefix, .ifindex = try t.ifindex() };
                 try checkConfig(linux.ioctl(s6, SIOCSIFADDR, @intFromPtr(&r)));
             },
         }
@@ -248,11 +248,10 @@ pub const LinuxTun = struct {
 
     fn addRoute(ptr: *anyopaque, cidr: Cidr) root.ConfigError!void {
         const t = self(ptr);
-        const net = cidr.network();
-        switch (cidr.family) {
-            .ip4 => {
+        switch (cidr.masked().addr) {
+            .v4 => |net| {
                 var rt: RtEntry = .{
-                    .dst = sockaddr4(net.addr[0..4].*),
+                    .dst = sockaddr4(net),
                     .gateway = sockaddr4(.{ 0, 0, 0, 0 }),
                     .genmask = sockaddr4(cidr.netmask4()),
                     .flags = RTF_UP,
@@ -260,12 +259,12 @@ pub const LinuxTun = struct {
                 };
                 try checkConfig(linux.ioctl(t.ctl4, SIOCADDRT, @intFromPtr(&rt)));
             },
-            .ip6 => {
+            .v6 => |net| {
                 const s6 = try socket6();
                 defer _ = linux.close(s6);
                 var rt = std.mem.zeroes(In6RtMsg);
-                rt.dst = net.addr;
-                rt.dst_len = cidr.prefix_len;
+                rt.dst = net;
+                rt.dst_len = cidr.prefix;
                 rt.metric = 1;
                 rt.flags = RTF_UP;
                 rt.ifindex = try t.ifindex();

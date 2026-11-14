@@ -168,11 +168,11 @@ fn runTunnel(paths: ?*const store.Paths) state.Exit {
     };
     defer native.close();
     const t = native.tun();
-    for (c.interface.addresses) |a| t.setAddress(a.toTun()) catch |err| {
+    for (c.interface.addresses) |a| t.setAddress(a) catch |err| {
         log.print("cannot set address {f}: {s}", .{ a, @errorName(err) });
         return .address_failed;
     };
-    for (c.peers) |*cp| for (cp.allowed_ips) |a| t.addRoute(a.toTun()) catch |err| {
+    for (c.peers) |*cp| for (cp.allowed_ips) |a| t.addRoute(a) catch |err| {
         log.print("warning: route {f}: {s}", .{ a, @errorName(err) });
     };
     if (c.interface.dns.len + c.interface.dns_search.len != 0)

@@ -7,6 +7,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const wire = @import("wire.zig");
 const wg_tun = @import("../tun/root.zig");
+const Cidr = @import("../ip.zig").Cidr;
 
 const Endpoint = root.Endpoint;
 
@@ -191,11 +192,11 @@ pub const ImpairedTun = struct {
         return self(ptr).inner.mtu();
     }
 
-    fn setAddress(ptr: *anyopaque, c: wg_tun.Cidr) wg_tun.ConfigError!void {
+    fn setAddress(ptr: *anyopaque, c: Cidr) wg_tun.ConfigError!void {
         return self(ptr).inner.setAddress(c);
     }
 
-    fn addRoute(ptr: *anyopaque, c: wg_tun.Cidr) wg_tun.ConfigError!void {
+    fn addRoute(ptr: *anyopaque, c: Cidr) wg_tun.ConfigError!void {
         return self(ptr).inner.addRoute(c);
     }
 

@@ -56,7 +56,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(e2e).step);
 
     // TUN backends for OSes we cannot run here: analysis-only cross builds of
-    // src/tun (nothing is linked or run; see src/tun/root.zig).
+    // src/tun (nothing is linked or run; see src/tun/root.zig). The root sits
+    // in src/ so src/tun can import the shared src/ip.zig.
     const tun_check = b.step("tun-check", "Cross-compile check the Linux/macOS/iOS TUN backends");
     const cross: []const std.Target.Query = &.{
         .{ .cpu_arch = .x86_64, .os_tag = .linux },
@@ -69,7 +70,7 @@ pub fn build(b: *std.Build) void {
         const check = b.addObject(.{
             .name = "tun-check",
             .root_module = b.createModule(.{
-                .root_source_file = b.path("src/tun/check.zig"),
+                .root_source_file = b.path("src/tun_check.zig"),
                 .target = b.resolveTargetQuery(query),
                 .optimize = optimize,
             }),

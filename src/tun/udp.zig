@@ -19,7 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
-const Cidr = root.Cidr;
+const Cidr = @import("../ip.zig").Cidr;
 const Tun = root.Tun;
 
 const is_windows = builtin.os.tag == .windows;

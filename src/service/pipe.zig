@@ -436,7 +436,7 @@ test "query: no such tunnel" {
 const testing = std.testing;
 const tun = @import("../tun/root.zig");
 const dev = @import("../device/device.zig");
-const Cidr = @import("../device/ip.zig").Cidr;
+const Cidr = @import("../ip.zig").Cidr;
 
 /// Raw exchange for protocol tests: send `request`, read to EOF or "\n\n".
 fn exchange(gpa: std.mem.Allocator, pipe_name: []const u8, request: []const u8) ![]u8 {

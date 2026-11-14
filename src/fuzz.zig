@@ -29,7 +29,7 @@ const noise = @import("noise/root.zig");
 const session = @import("session/root.zig");
 const dev = @import("device/root.zig");
 const tun = @import("tun/root.zig");
-const ip = dev.ip;
+const ip = @import("ip.zig");
 
 /// Corpus entry for a target whose first Smith draw is `slice`: Smith's
 /// input encoding is a little-endian u32 length followed by the bytes.
@@ -177,14 +177,10 @@ fn fuzzTextParsers(_: void, s: *Smith) anyerror!void {
         try testing.expect(c.eql(try ip.Cidr.parse(w.buffered())));
         try testing.expect(c.masked().contains(c.addr));
         try testing.expect(!c.masked().hasHostBits());
-    } else |_| {}
-    if (tun.Cidr.parse(text)) |c| {
-        var w: std.Io.Writer = .fixed(&fbuf);
-        try w.print("{f}", .{c});
-        const back = try tun.Cidr.parse(w.buffered());
-        try testing.expect(std.meta.eql(c, back));
-        _ = c.network();
-        if (c.family == .ip4) _ = c.netmask4();
+        switch (c.addr) {
+            .v4 => _ = c.netmask4(),
+            .v6 => _ = c.netmask6(),
+        }
     } else |_| {}
     if (dev.config.Endpoint.parse(text)) |e| {
         var w: std.Io.Writer = .fixed(&fbuf);

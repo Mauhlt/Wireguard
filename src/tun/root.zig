@@ -25,7 +25,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const Cidr = @import("cidr.zig").Cidr;
+/// Interface addresses and routes are the shared `ip.Cidr` (src/ip.zig).
+const Cidr = @import("../ip.zig").Cidr;
 pub const queue = @import("queue.zig");
 pub const FakeTun = @import("fake.zig").FakeTun;
 
@@ -138,7 +139,6 @@ pub const Tun = struct {
 
 test {
     std.testing.refAllDecls(@This());
-    _ = @import("cidr.zig");
     _ = @import("queue.zig");
     _ = @import("fake.zig");
     _ = @import("packetflow.zig");
@@ -153,13 +153,12 @@ test {
 }
 
 /// Forces semantic analysis of the target's backend. Used by the
-/// cross-compile checks in build.zig through `check.zig` (an object build:
+/// cross-compile checks in build.zig through `src/tun_check.zig` (an object build:
 /// std.testing.refAllDecls is a no-op outside test builds, and the iOS test
 /// runner does not build with this std).
 pub fn analyzeBackend() void {
     refAll(Native);
     refAll(packetflow.c_api);
-    refAll(Cidr);
     refAll(queue.Channel);
     refAll(UdpTun);
 }

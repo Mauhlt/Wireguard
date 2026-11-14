@@ -19,7 +19,7 @@
 //! Everything here is pure and bounded; `decode` treats its input as hostile.
 
 const std = @import("std");
-const ip = @import("../device/ip.zig");
+const ip = @import("../ip.zig");
 const config = @import("../device/config.zig");
 
 pub const max_request = 4096;

@@ -16,7 +16,7 @@
 const std = @import("std");
 const c = std.c;
 const root = @import("root.zig");
-const Cidr = root.Cidr;
+const Cidr = @import("../ip.zig").Cidr;
 const Tun = root.Tun;
 
 pub const OpenError = error{ AccessDenied, InvalidName, NameTooLong, SystemResources, Unexpected };
@@ -238,11 +238,10 @@ pub const Utun = struct {
 
     fn setAddress(ptr: *anyopaque, cidr: Cidr) root.ConfigError!void {
         const t = self(ptr);
-        switch (cidr.family) {
-            .ip4 => {
+        switch (cidr.addr) {
+            .v4 => |a| {
                 const s = try socketConfig(AF_INET, SOCK_DGRAM);
                 defer _ = c.close(s);
-                const a = cidr.addr[0..4].*;
                 var req: IfAliasReq = .{
                     .name = t.name_buf,
                     .addr = .{ .addr = a },
@@ -251,14 +250,14 @@ pub const Utun = struct {
                 };
                 if (c.ioctl(s, @bitCast(@as(c_uint, @truncate(SIOCAIFADDR))), &req) < 0) return errnoConfig();
             },
-            .ip6 => {
+            .v6 => |a| {
                 const s = try socketConfig(AF_INET6, SOCK_DGRAM);
                 defer _ = c.close(s);
                 var req: In6AliasReq = .{
                     .name = t.name_buf,
-                    .addr = .{ .addr = cidr.addr },
+                    .addr = .{ .addr = a },
                     .dstaddr = .{ .len = 0, .family = 0, .addr = @splat(0) },
-                    .prefixmask = .{ .addr = prefixMask6(cidr.prefix_len) },
+                    .prefixmask = .{ .addr = cidr.netmask6() },
                 };
                 if (c.ioctl(s, @bitCast(@as(c_uint, @truncate(SIOCAIFADDR_IN6))), &req) < 0) return errnoConfig();
             },
@@ -269,21 +268,20 @@ pub const Utun = struct {
         const t = self(ptr);
         const index = if_nametoindex(@ptrCast(&t.name_buf));
         if (index == 0) return error.Closed;
-        const net = cidr.network();
         t.route_seq +%= 1;
 
         var msg: [512]u8 align(4) = undefined;
         var len: usize = @sizeOf(RtMsgHdr);
-        switch (cidr.family) {
-            .ip4 => {
-                len += appendSa(&msg, len, SockaddrIn{ .addr = net.addr[0..4].* });
+        switch (cidr.masked().addr) {
+            .v4 => |net| {
+                len += appendSa(&msg, len, SockaddrIn{ .addr = net });
                 len += appendSa(&msg, len, SockaddrDl{ .index = @intCast(index) });
                 len += appendSa(&msg, len, SockaddrIn{ .addr = cidr.netmask4() });
             },
-            .ip6 => {
-                len += appendSa(&msg, len, SockaddrIn6{ .addr = net.addr });
+            .v6 => |net| {
+                len += appendSa(&msg, len, SockaddrIn6{ .addr = net });
                 len += appendSa(&msg, len, SockaddrDl{ .index = @intCast(index) });
-                len += appendSa(&msg, len, SockaddrIn6{ .addr = prefixMask6(cidr.prefix_len) });
+                len += appendSa(&msg, len, SockaddrIn6{ .addr = cidr.netmask6() });
             },
         }
         const hdr: RtMsgHdr = .{
@@ -311,21 +309,6 @@ fn appendSa(msg: []u8, at: usize, sa: anytype) usize {
     return std.mem.alignForward(usize, b.len, 4);
 }
 
-fn prefixMask6(prefix_len: u8) [16]u8 {
-    var m: [16]u8 = @splat(0);
-    var bits: usize = prefix_len;
-    for (&m) |*b| {
-        if (bits >= 8) {
-            b.* = 0xff;
-            bits -= 8;
-        } else {
-            b.* = @truncate(@as(u16, 0xff00) >> @intCast(bits));
-            bits = 0;
-        }
-    }
-    return m;
-}
-
 fn socketConfig(family: c_uint, kind: c_uint) root.ConfigError!c.fd_t {
     const s = c.socket(family, kind, 0);
     if (s < 0) return errnoConfig();
@@ -347,10 +330,4 @@ fn errnoConfig() root.ConfigError {
         .NXIO, .NODEV => error.Closed,
         else => error.Unexpected,
     };
-}
-
-test "ipv6 prefix masks" {
-    try std.testing.expectEqual(@as(u8, 0xff), prefixMask6(64)[7]);
-    try std.testing.expectEqual(@as(u8, 0), prefixMask6(64)[8]);
-    try std.testing.expectEqual(@as(u8, 0xfe), prefixMask6(7)[0]);
 }

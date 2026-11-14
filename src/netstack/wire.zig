@@ -5,7 +5,7 @@
 //! and returns an error for anything malformed: no `unreachable`, no
 //! unchecked casts on packet data. Big-endian via std.mem.readInt/writeInt.
 const std = @import("std");
-const Addr = @import("../device/ip.zig").Addr;
+const Addr = @import("../ip.zig").Addr;
 
 pub const proto_icmp: u8 = 1;
 pub const proto_tcp: u8 = 6;

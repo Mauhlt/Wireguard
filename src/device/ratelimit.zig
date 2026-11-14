@@ -17,7 +17,7 @@
 //!   packet is refused.
 
 const std = @import("std");
-const ip = @import("ip.zig");
+const ip = @import("../ip.zig");
 
 const ns_per_s: i64 = std.time.ns_per_s;
 

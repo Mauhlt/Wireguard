@@ -1,6 +1,6 @@
 //! Root of the analysis-only cross builds (`zig build tun-check`).
 const std = @import("std");
-const tun = @import("root.zig");
+const tun = @import("tun/root.zig");
 
 // This std's default panic handler pulls in std.Io.Threaded, which does not
 // compile for iOS (Threaded.zig: null_file has no `fd` on .ios). The check

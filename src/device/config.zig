@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const keys = @import("keys.zig");
-const ip = @import("ip.zig");
+const ip = @import("../ip.zig");
 
 pub const Key = keys.Key;
 pub const Cidr = ip.Cidr;

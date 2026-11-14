@@ -38,7 +38,7 @@ const noise = @import("../noise/root.zig");
 const session = @import("../session/root.zig");
 const tun_mod = @import("../tun/root.zig");
 
-const ip = @import("ip.zig");
+const ip = @import("../ip.zig");
 const os = @import("os.zig");
 const AllowedIps = @import("allowed_ips.zig").AllowedIps;
 const IndexTable = @import("index_table.zig").IndexTable;

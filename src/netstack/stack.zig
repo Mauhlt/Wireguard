@@ -17,6 +17,7 @@ const root = @import("root.zig");
 const wire = @import("wire.zig");
 const tcp = @import("tcp.zig");
 const wg_tun = @import("../tun/root.zig");
+const Cidr = @import("../ip.zig").Cidr;
 const dev = @import("../device/root.zig");
 const queue = wg_tun.queue;
 const os = dev.os;
@@ -1027,8 +1028,8 @@ pub const Stack = struct {
     }
 
     /// The address is Options.address; nothing to configure.
-    fn tunSetAddress(_: *anyopaque, _: wg_tun.Cidr) wg_tun.ConfigError!void {}
-    fn tunAddRoute(_: *anyopaque, _: wg_tun.Cidr) wg_tun.ConfigError!void {}
+    fn tunSetAddress(_: *anyopaque, _: Cidr) wg_tun.ConfigError!void {}
+    fn tunAddRoute(_: *anyopaque, _: Cidr) wg_tun.ConfigError!void {}
 };
 
 pub const Listener = struct {

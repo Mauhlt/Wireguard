@@ -39,7 +39,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const root = @import("root.zig");
 const queue = @import("queue.zig");
-const Cidr = root.Cidr;
+const Cidr = @import("../ip.zig").Cidr;
 const Tun = root.Tun;
 
 /// AF_INET / AF_INET6 as Darwin numbers them (what writePackets expects).

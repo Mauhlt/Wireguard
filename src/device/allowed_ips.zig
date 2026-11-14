@@ -10,7 +10,7 @@
 //! growth comes from configuration, never from network input.
 
 const std = @import("std");
-const ip = @import("ip.zig");
+const ip = @import("../ip.zig");
 
 pub fn AllowedIps(comptime V: type) type {
     return struct {

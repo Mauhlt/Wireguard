@@ -6,7 +6,7 @@ const std = @import("std");
 const testing = std.testing;
 const crypto = @import("../crypto.zig");
 const tun = @import("../tun/root.zig");
-const ip = @import("ip.zig");
+const ip = @import("../ip.zig");
 const dev = @import("device.zig");
 const os = @import("os.zig");
 

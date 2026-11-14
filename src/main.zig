@@ -210,8 +210,8 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
         tun_open = true;
         break :blk native.tun();
     };
-    for (c.interface.addresses) |a| try t.setAddress(a.toTun());
-    for (c.peers) |*p| for (p.allowed_ips) |a| t.addRoute(a.toTun()) catch |err| {
+    for (c.interface.addresses) |a| try t.setAddress(a);
+    for (c.peers) |*p| for (p.allowed_ips) |a| t.addRoute(a) catch |err| {
         try errw.print("zwg: warning: route {f}: {s}\n", .{ a, @errorName(err) });
     };
     if (c.interface.dns.len + c.interface.dns_search.len != 0)

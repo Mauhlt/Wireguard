@@ -1,10 +1,11 @@
-//! IP addresses and prefixes as the device uses them: raw network-order
-//! bytes (4 for IPv4, 16 for IPv6), parsing and printing the forms .conf
-//! files use ("10.8.0.1/24", "fd00::1/64", "10.8.0.2" = /32).
+//! IP addresses and prefixes, the one type for both layers: the device
+//! (allowed IPs, .conf, UAPI) and the TUN backends (`Tun.setAddress` /
+//! `addRoute`). Raw network-order bytes (4 for IPv4, 16 for IPv6), parsing
+//! and printing the forms .conf files use ("10.8.0.1/24", "fd00::1/64",
+//! "10.8.0.2" = /32). Depends only on std.
 
 const std = @import("std");
 const net = std.Io.net;
-const TunCidr = @import("../tun/root.zig").Cidr;
 
 pub const Family = enum { v4, v6 };
 
@@ -82,14 +83,6 @@ pub const Cidr = struct {
         return .{ .addr = addr, .prefix = prefix };
     }
 
-    /// The same prefix as the TUN layer's type (`Tun.setAddress` / `addRoute`).
-    pub fn toTun(c: Cidr) TunCidr {
-        return switch (c.addr) {
-            .v4 => |b| TunCidr.ip4(b, c.prefix),
-            .v6 => |b| TunCidr.ip6(b, c.prefix),
-        };
-    }
-
     /// The prefix with host bits cleared (what routing uses).
     pub fn masked(c: Cidr) Cidr {
         var out = c;
@@ -97,6 +90,22 @@ pub const Cidr = struct {
             .v4 => |*b| maskBytes(b, c.prefix),
             .v6 => |*b| maskBytes(b, c.prefix),
         }
+        return out;
+    }
+
+    /// IPv4 netmask as 4 bytes (for ioctl-style APIs). IPv4 only.
+    pub fn netmask4(c: Cidr) [4]u8 {
+        std.debug.assert(c.addr == .v4 and c.prefix <= 32);
+        var out: [4]u8 = @splat(0xff);
+        maskBytes(&out, c.prefix);
+        return out;
+    }
+
+    /// IPv6 prefix mask as 16 bytes (for ioctl / routing-socket APIs). IPv6 only.
+    pub fn netmask6(c: Cidr) [16]u8 {
+        std.debug.assert(c.addr == .v6 and c.prefix <= 128);
+        var out: [16]u8 = @splat(0xff);
+        maskBytes(&out, c.prefix);
         return out;
     }
 
@@ -192,6 +201,40 @@ test "parse and format" {
     try std.testing.expect(!(try Cidr.parse("10.8.0.0/24")).contains(try Addr.parse("10.8.1.1")));
     try std.testing.expect((try Cidr.parse("0.0.0.0/0")).contains(try Addr.parse("1.2.3.4")));
     try std.testing.expect(!(try Cidr.parse("0.0.0.0/0")).contains(try Addr.parse("::1")));
+}
+
+test "netmask and masked network (what the TUN backends use)" {
+    const c = try Cidr.parse("10.0.0.1/24");
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1 }, c.addr.bytes());
+    try std.testing.expectEqual(@as(u8, 24), c.prefix);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 0 }, c.masked().addr.bytes());
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 0 }, c.netmask4());
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, (try Cidr.parse("0.0.0.0/0")).netmask4());
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, (try Cidr.parse("1.2.3.4")).netmask4());
+    try std.testing.expectEqual([4]u8{ 255, 255, 128, 0 }, (try Cidr.parse("1.2.3.4/17")).netmask4());
+    try std.testing.expectEqualSlices(u8, &.{ 10, 1, 128, 0 }, (try Cidr.parse("10.1.200.7/17")).masked().addr.bytes());
+
+    const v6 = try Cidr.parse("fd00:1::5/64");
+    try std.testing.expect(v6.addr == .v6);
+    try std.testing.expectEqual(@as(u8, 0xfd), v6.addr.v6[0]);
+    try std.testing.expectEqual(@as(u8, 5), v6.addr.v6[15]);
+    try std.testing.expectEqual(@as(u8, 0), v6.masked().addr.v6[15]);
+    try std.testing.expectEqual(@as(u8, 128), (try Cidr.parse("::1")).prefix);
+    const m64 = (try Cidr.parse("fd00::/64")).netmask6();
+    try std.testing.expectEqual(@as(u8, 0xff), m64[7]);
+    try std.testing.expectEqual(@as(u8, 0), m64[8]);
+    try std.testing.expectEqual(@as(u8, 0xfe), (try Cidr.parse("fe00::/7")).netmask6()[0]);
+    try std.testing.expectEqual(@as([16]u8, @splat(0)), (try Cidr.parse("::/0")).netmask6());
+    try std.testing.expectEqual(@as([16]u8, @splat(0xff)), (try Cidr.parse("::1")).netmask6());
+}
+
+test "reject bad prefixes and addresses" {
+    for ([_][]const u8{ "10.0.0.1/33", "10.0.0.1/", "fd00::/129", "1.2.3.4/x", "1.2.3.4/-1", "1.2.3.4/0024" }) |s| {
+        try std.testing.expectError(error.InvalidPrefix, Cidr.parse(s));
+    }
+    for ([_][]const u8{ "nope", "10.0.0/8", "", "/8", "1.2.3.4.5/8" }) |s| {
+        try std.testing.expectError(error.InvalidAddress, Cidr.parse(s));
+    }
 }
 
 test "packet addresses" {

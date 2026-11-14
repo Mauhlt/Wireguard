@@ -33,7 +33,8 @@
 //! waits again; no polling.
 const std = @import("std");
 const root = @import("root.zig");
-const Cidr = root.Cidr;
+const ip = @import("../ip.zig");
+const Cidr = ip.Cidr;
 const Tun = root.Tun;
 const WaitHandle = root.WaitHandle;
 
@@ -438,16 +439,16 @@ fn netioToConfigError(status: u32) root.ConfigError!void {
     };
 }
 
-fn sockaddrInet(cidr: Cidr) iphlp.SOCKADDR_INET {
+fn sockaddrInet(addr: ip.Addr) iphlp.SOCKADDR_INET {
     var sa: iphlp.SOCKADDR_INET = std.mem.zeroes(iphlp.SOCKADDR_INET);
-    switch (cidr.family) {
-        .ip4 => {
+    switch (addr) {
+        .v4 => |a| {
             sa.v4.family = AF_INET;
-            sa.v4.addr = cidr.addr[0..4].*;
+            sa.v4.addr = a;
         },
-        .ip6 => {
+        .v6 => |a| {
             sa.v6.family = AF_INET6;
-            sa.v6.addr = cidr.addr;
+            sa.v6.addr = a;
         },
     }
     return sa;
@@ -456,9 +457,9 @@ fn sockaddrInet(cidr: Cidr) iphlp.SOCKADDR_INET {
 pub fn addUnicastAddress(luid: NET_LUID, cidr: Cidr) root.ConfigError!void {
     var row: iphlp.MIB_UNICASTIPADDRESS_ROW = undefined;
     iphlp.InitializeUnicastIpAddressEntry(&row);
-    row.Address = sockaddrInet(cidr);
+    row.Address = sockaddrInet(cidr.addr);
     row.InterfaceLuid = luid;
-    row.OnLinkPrefixLength = cidr.prefix_len;
+    row.OnLinkPrefixLength = cidr.prefix;
     row.DadState = iphlp.IpDadStatePreferred;
     return netioToConfigError(iphlp.CreateUnicastIpAddressEntry(&row));
 }
@@ -467,12 +468,12 @@ pub fn addOnLinkRoute(luid: NET_LUID, cidr: Cidr) root.ConfigError!void {
     var row: iphlp.MIB_IPFORWARD_ROW2 = undefined;
     iphlp.InitializeIpForwardEntry(&row);
     row.InterfaceLuid = luid;
-    row.DestinationPrefix.Prefix = sockaddrInet(cidr.network());
-    row.DestinationPrefix.PrefixLength = cidr.prefix_len;
+    row.DestinationPrefix.Prefix = sockaddrInet(cidr.masked().addr);
+    row.DestinationPrefix.PrefixLength = cidr.prefix;
     // On-link: next hop is the unspecified address of the same family.
-    row.NextHop = sockaddrInet(switch (cidr.family) {
-        .ip4 => Cidr.ip4(.{ 0, 0, 0, 0 }, 0),
-        .ip6 => Cidr.ip6(@splat(0), 0),
+    row.NextHop = sockaddrInet(switch (cidr.addr) {
+        .v4 => .{ .v4 = @splat(0) },
+        .v6 => .{ .v6 = @splat(0) },
     });
     row.Metric = 0;
     return netioToConfigError(iphlp.CreateIpForwardEntry2(&row));
