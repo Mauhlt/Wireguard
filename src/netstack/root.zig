@@ -36,8 +36,12 @@ pub const Endpoint = struct {
     addr: Addr,
     port: u16,
 
+    /// 10.8.0.1:8420, [fd0a:8::1]:8420 (RFC 5952 section 6).
     pub fn format(e: Endpoint, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("{f}:{d}", .{ e.addr, e.port });
+        switch (e.addr) {
+            .v4 => try w.print("{f}:{d}", .{ e.addr, e.port }),
+            .v6 => try w.print("[{f}]:{d}", .{ e.addr, e.port }),
+        }
     }
 };
 
@@ -178,7 +182,8 @@ pub const Stats = struct {
 /// handle (handles are generation-checked: a stale one returns Closed).
 pub const Stack = stack_impl.Stack;
 
-/// A listening port on `Options.address`. A value handle (copyable).
+/// A listening port on every configured address (`Options.address` and
+/// `Options.address6`). A value handle (copyable).
 pub const Listener = stack_impl.Listener;
 
 /// One TCP connection. A value handle (copyable); `close()` releases it.
@@ -192,6 +197,12 @@ pub const Stream = stack_impl.Stream;
 /// both, joins them, destroys the device (keys wiped) and the stack
 /// (buffers wiped).
 pub const Node = stack_impl.Node;
+
+test "endpoint format: IPv6 in brackets" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("10.8.0.1:8420", try std.fmt.bufPrint(&buf, "{f}", .{Endpoint{ .addr = try Addr.parse("10.8.0.1"), .port = 8420 }}));
+    try std.testing.expectEqualStrings("[fd0a:8::1]:8420", try std.fmt.bufPrint(&buf, "{f}", .{Endpoint{ .addr = try Addr.parse("fd0a:8::1"), .port = 8420 }}));
+}
 
 test {
     std.testing.refAllDecls(@This());

@@ -69,6 +69,22 @@ fn isV4Mapped(a: Addr) bool {
     };
 }
 
+/// IPv6 addresses that are never a unicast peer on the tunnel: the
+/// unspecified address (::), loopback (::1), multicast (ff00::/8) and
+/// v4-mapped (::ffff:0:0/96). False for IPv4 (Stack.bogusSource holds the
+/// IPv4 side). Packets from them are dropped before TCP or ICMPv6 see
+/// them (so no RST and no echo reply goes to such an address), and dial
+/// refuses them.
+fn notUnicastPeer6(a: Addr) bool {
+    const b = switch (a) {
+        .v4 => return false,
+        .v6 => |b| b,
+    };
+    if (b[0] == 0xff) return true;
+    if (isV4Mapped(a)) return true;
+    return std.mem.allEqual(u8, b[0..15], 0) and b[15] <= 1;
+}
+
 fn handleId(index: usize, gen: u16) u32 {
     return (@as(u32, gen) << 16) | @as(u32, @intCast(index));
 }
@@ -294,17 +310,18 @@ pub const Stack = struct {
         return mine.eql(a);
     }
 
-    /// A source no unicast peer can have (RFC 1122 3.2.1.3, RFC 9293
-    /// 3.10.7.2: a SYN from it gets no SYN-ACK, nothing else gets a reply
-    /// either): unspecified, multicast, IPv4 limited broadcast, or one of
-    /// our own addresses. No prefix is configured (the device's
-    /// tunSetAddress is a no-op), so there is no subnet broadcast to know.
+    /// The one source filter, either family (RFC 1122 3.2.1.3, RFC 9293
+    /// 3.10.7.2: a SYN from such a source gets no SYN-ACK, nothing else
+    /// gets a reply either): one of our own addresses; IPv4 0.0.0.0,
+    /// 255.255.255.255 and 224.0.0.0/4; IPv6 per notUnicastPeer6. No
+    /// prefix is configured (the device's tunSetAddress is a no-op), so
+    /// there is no subnet broadcast to know.
     fn bogusSource(s: *const Stack, a: Addr) bool {
         if (s.isOurs(a)) return true;
         return switch (a) {
             .v4 => |b| std.mem.allEqual(u8, &b, 0) or std.mem.allEqual(u8, &b, 0xff) or
                 b[0] & 0xf0 == 224, // 224.0.0.0/4
-            .v6 => |b| std.mem.allEqual(u8, &b, 0) or b[0] == 0xff, // ::, ff00::/8
+            .v6 => notUnicastPeer6(a),
         };
     }
 
@@ -454,8 +471,10 @@ pub const Stack = struct {
             s.st.dropped_not_for_us += 1;
             return;
         }
+        // A source that cannot be a peer, or our own address: spoofed or
+        // looped (either family, see bogusSource).
         if (s.bogusSource(ip.src)) {
-            s.st.dropped_malformed += 1;
+            s.st.dropped_not_for_us += 1;
             return;
         }
         switch (ip.protocol) {
@@ -759,7 +778,7 @@ pub const Stack = struct {
     pub fn dialWith(s: *Stack, to: Endpoint, priority: root.Priority) root.DialError!Stream {
         // The destination's family picks our address; no v4-mapped IPv6.
         const local_addr = s.localFor(to.addr) orelse return error.AddressFamilyUnsupported;
-        if (to.port == 0 or isV4Mapped(to.addr)) return error.AddressFamilyUnsupported;
+        if (to.port == 0 or notUnicastPeer6(to.addr) or local_addr.eql(to.addr)) return error.AddressFamilyUnsupported;
         s.lock();
         defer s.unlock();
         const port = s.pickPort() orelse return error.NoPortsAvailable;

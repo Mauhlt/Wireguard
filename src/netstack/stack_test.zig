@@ -11,6 +11,31 @@ const Peer = root.testing.Peer;
 var one: [1]u8 = undefined;
 const stack_addr: root.Addr = .{ .v4 = .{ 10, 8, 0, 1 } };
 const peer_addr: root.Addr = .{ .v4 = .{ 10, 8, 0, 2 } };
+const stack_addr6: root.Addr = .{ .v6 = .{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+const peer_addr6: root.Addr = .{ .v6 = .{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 } };
+
+/// One address family's tunnel addresses. The tests that matter for both
+/// families are written once against a `Fam` and run over `families`.
+const Fam = struct { stack: root.Addr, peer: root.Addr };
+const fam4: Fam = .{ .stack = stack_addr, .peer = peer_addr };
+const fam6: Fam = .{ .stack = stack_addr6, .peer = peer_addr6 };
+const families = [_]Fam{ fam4, fam6 };
+
+/// `a` with its last byte replaced: another host in the same subnet.
+fn otherHost(a: root.Addr, last: u8) root.Addr {
+    var x = a;
+    switch (x) {
+        inline else => |*b| b[b.len - 1] = last,
+    }
+    return x;
+}
+
+const icmpPacket = root.testing.icmpPacket;
+const withExtHeaders = root.testing.withExtHeaders6;
+
+fn echoRequestKind(a: root.Addr) u8 {
+    return if (a == .v6) wire.icmp6_echo_request else wire.icmp_echo_request;
+}
 
 const Rig = struct {
     clock: root.Clock,
@@ -20,9 +45,19 @@ const Rig = struct {
     out: [2048]u8 = undefined,
 
     fn init(r: *Rig, limits: root.Limits) !void {
+        return r.initFor(fam4, limits);
+    }
+
+    /// A stack on `f.stack` alone; the peer on `f.peer`.
+    fn initFor(r: *Rig, f: Fam, limits: root.Limits) !void {
+        return r.initWith(.{ .address = f.stack, .limits = limits }, f);
+    }
+
+    /// A stack with `options` (e.g. dual-stack); the peer talks `f`.
+    fn initWith(r: *Rig, options: root.Options, f: Fam) !void {
         r.clock = .{ .io = t.io };
-        r.stack = try root.Stack.create(t.allocator, &r.clock, .{ .address = stack_addr, .limits = limits });
-        r.peer = .{ .peer = .{ .addr = peer_addr, .port = 40000 }, .stack = .{ .addr = stack_addr, .port = 8420 } };
+        r.stack = try root.Stack.create(t.allocator, &r.clock, options);
+        r.peer = .{ .peer = .{ .addr = f.peer, .port = 40000 }, .stack = .{ .addr = f.stack, .port = 8420 } };
     }
 
     fn deinit(r: *Rig) void {
@@ -58,7 +93,8 @@ const Rig = struct {
         const sa = try r.recv();
         try t.expect(sa.flags.syn and sa.flags.ack);
         try t.expectEqual(iss + 1, sa.ack);
-        try t.expectEqual(@as(?u16, 1380), sa.options.mss);
+        // Our MSS for the family: 1380 over IPv4, 1360 over IPv6 (MTU 1420).
+        try t.expectEqual(@as(?u16, wire.mssFor(r.peer.stack.addr, r.stack.options.mtu)), sa.options.mss);
         try t.expect(sa.options.window_scale != null);
         try t.expectError(error.WouldBlock, l.accept());
         r.send(.{ .seq = iss + 1, .ack = sa.seq +% 1, .flags = .{ .ack = true }, .window = 2048 });
@@ -68,8 +104,12 @@ const Rig = struct {
 };
 
 test "passive open, data both ways, FIN from the peer, close" {
+    for (families) |f| try passiveOpenDataFin(f);
+}
+
+fn passiveOpenDataFin(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try r.established(l);
@@ -109,12 +149,17 @@ test "passive open, data both ways, FIN from the peer, close" {
 }
 
 test "active open, our FIN first, TIME-WAIT then freed" {
+    for (families) |f| try activeOpenFinTimeWait(f);
+}
+
+fn activeOpenFinTimeWait(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{ .time_wait_ns = 50 * std.time.ns_per_ms });
+    try r.initFor(f, .{ .time_wait_ns = 50 * std.time.ns_per_ms });
     defer r.deinit();
-    const st = try r.stack.dial(.{ .addr = peer_addr, .port = 9000 });
+    const st = try r.stack.dial(.{ .addr = f.peer, .port = 9000 });
+    try t.expectEqual(f.stack, st.local().addr);
     r.peer.peer.port = 9000;
-    const syn = (try wire.parseTcp4(r.stack.output(&r.out).?)).tcp;
+    const syn = try r.peer.expectAnyPort(r.stack.output(&r.out).?);
     try t.expect(syn.flags.syn and !syn.flags.ack);
     r.peer.stack.port = syn.src_port;
     try t.expect(syn.src_port >= 49152);
@@ -143,8 +188,12 @@ test "active open, our FIN first, TIME-WAIT then freed" {
 }
 
 test "SYN to a closed port gets RST, RST answers nothing, connect refused" {
+    for (families) |f| try closedPortRstRefused(f);
+}
+
+fn closedPortRstRefused(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     r.send(.{ .seq = 77, .flags = .{ .syn = true } });
     const rst = try r.recv();
@@ -153,9 +202,9 @@ test "SYN to a closed port gets RST, RST answers nothing, connect refused" {
     r.send(.{ .seq = 77, .flags = .{ .rst = true } });
     try r.expectSilent();
 
-    const st = try r.stack.dial(.{ .addr = peer_addr, .port = 9000 });
+    const st = try r.stack.dial(.{ .addr = f.peer, .port = 9000 });
     r.peer.peer.port = 9000;
-    const syn = (try wire.parseTcp4(r.stack.output(&r.out).?)).tcp;
+    const syn = try r.peer.expectAnyPort(r.stack.output(&r.out).?);
     r.peer.stack.port = syn.src_port;
     r.send(.{ .seq = 0, .ack = syn.seq +% 1, .flags = .{ .rst = true, .ack = true } });
     try t.expectError(error.ConnectionRefused, st.waitConnected(0));
@@ -164,8 +213,12 @@ test "SYN to a closed port gets RST, RST answers nothing, connect refused" {
 }
 
 test "retransmission after loss: RTO, backoff, Karn" {
+    for (families) |f| try retransmitRtoBackoff(f);
+}
+
+fn retransmitRtoBackoff(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try r.established(l);
@@ -191,10 +244,14 @@ test "retransmission after loss: RTO, backoff, Karn" {
 }
 
 test "user timeout: an unanswered connection fails" {
+    for (families) |f| try userTimeoutDial(f);
+}
+
+fn userTimeoutDial(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{ .user_timeout_ns = 3 * std.time.ns_per_s });
+    try r.initFor(f, .{ .user_timeout_ns = 3 * std.time.ns_per_s });
     defer r.deinit();
-    const st = try r.stack.dial(.{ .addr = peer_addr, .port = 9000 });
+    const st = try r.stack.dial(.{ .addr = f.peer, .port = 9000 });
     var n: usize = 0;
     while (n < 20) : (n += 1) {
         while (r.stack.output(&r.out)) |_| {}
@@ -281,24 +338,30 @@ test "out-of-order segments: dup ACK, then both delivered in order" {
 }
 
 test "fast retransmit on three duplicate ACKs" {
+    for (families) |f| try fastRetransmit(f);
+}
+
+fn fastRetransmit(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try r.established(l);
-    var data: [4 * 1380]u8 = undefined;
-    for (&data, 0..) |*b, i| b.* = @truncate(i);
-    try t.expectEqual(data.len, try e.st.write(&data));
+    const mss = wire.mssFor(f.stack, r.stack.options.mtu);
+    var buf: [4 * 1380]u8 = undefined;
+    const data = buf[0 .. 4 * @as(usize, mss)];
+    for (data, 0..) |*b, i| b.* = @truncate(i);
+    try t.expectEqual(data.len, try e.st.write(data));
     var segs: [4]wire.Tcp = undefined;
     for (&segs) |*sg| sg.* = try r.recv();
-    try t.expectEqual(@as(usize, 1380), segs[0].payload.len);
+    try t.expectEqual(@as(usize, mss), segs[0].payload.len);
     // Segment 0 lost; 1, 2, 3 arrive: three duplicate ACKs.
     for (0..3) |_| r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 2048 });
     const re = try r.recv();
     try t.expectEqual(segs[0].seq, re.seq);
     try t.expectEqual(@as(u64, 1), r.stack.stats().fast_retransmits);
     // Full ACK ends recovery.
-    r.send(.{ .seq = e.rcv, .ack = e.snd +% @as(u32, data.len), .flags = .{ .ack = true }, .window = 2048 });
+    r.send(.{ .seq = e.rcv, .ack = e.snd +% @as(u32, @intCast(data.len)), .flags = .{ .ack = true }, .window = 2048 });
     try r.expectSilent();
 }
 
@@ -352,8 +415,12 @@ test "receive window: we advertise what is free, never accept beyond it" {
 }
 
 test "RST in window but not exact: challenge ACK; exact: reset" {
+    for (families) |f| try rstChallengeExact(f);
+}
+
+fn rstChallengeExact(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     const l = try r.stack.listen(8420);
     const e = try r.established(l);
@@ -421,8 +488,12 @@ test "accept backlog full: the final ACK is dropped, the SYN-ACK retry completes
 }
 
 test "malformed and foreign packets are dropped silently" {
+    for (families) |f| try malformedForeignDropped(f);
+}
+
+fn malformedForeignDropped(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
     _ = try r.stack.listen(8420);
     var p = r.peer.packet(&r.buf, .{ .seq = 1, .flags = .{ .syn = true } });
@@ -434,26 +505,31 @@ test "malformed and foreign packets are dropped silently" {
     try r.expectSilent();
     try t.expectEqual(@as(u64, 3), r.stack.stats().dropped_malformed);
     // Not our address.
-    r.peer.stack.addr = .{ .v4 = .{ 10, 8, 0, 9 } };
+    r.peer.stack.addr = otherHost(f.stack, 9);
     r.send(.{ .seq = 1, .flags = .{ .syn = true } });
     try r.expectSilent();
     try t.expectEqual(@as(u64, 1), r.stack.stats().dropped_not_for_us);
 }
 
-test "ICMP echo request gets a reply" {
+test "ICMP / ICMPv6 echo request gets a reply" {
+    for (families) |f| try icmpEcho(f);
+}
+
+fn icmpEcho(f: Fam) !void {
     var r: Rig = undefined;
-    try r.init(.{});
+    try r.initFor(f, .{});
     defer r.deinit();
-    var msg = [_]u8{ wire.icmp_echo_request, 0, 0, 0, 0x12, 0x34, 0, 1, 'p', 'i', 'n', 'g' };
-    std.mem.writeInt(u16, msg[2..4], wire.checksum(&msg), .big);
-    try (wire.Ip4{ .protocol = wire.proto_icmp, .src = peer_addr.v4, .dst = stack_addr.v4 }).write(&r.buf, msg.len);
-    @memcpy(r.buf[20..][0..msg.len], &msg);
-    r.stack.input(r.buf[0 .. 20 + msg.len]);
+    r.stack.input(icmpPacket(&r.buf, f.peer, f.stack, echoRequestKind(f.stack), "ping"));
     const reply = r.stack.output(&r.out).?;
-    const ip = try wire.Ip4.parse(reply);
-    try t.expectEqual(peer_addr.v4, ip.header.dst);
-    try t.expectEqual(wire.icmp_echo_reply, try wire.icmp4Type(ip.payload));
+    const ip = try wire.parseIp(reply);
+    try t.expectEqual(f.stack, ip.src);
+    try t.expectEqual(f.peer, ip.dst);
+    // The reply's checksum is valid (ICMPv6: over the pseudo-header).
+    const kind = if (f.stack == .v6) try wire.icmp6Type(ip.src, ip.dst, ip.payload) else try wire.icmp4Type(ip.payload);
+    try t.expectEqual(if (f.stack == .v6) wire.icmp6_echo_reply else wire.icmp_echo_reply, kind);
+    try t.expectEqualSlices(u8, &.{ 0x12, 0x34, 0, 1 }, ip.payload[4..8]);
     try t.expectEqualStrings("ping", ip.payload[8..]);
+    try t.expectEqual(@as(u64, 1), r.stack.stats().icmp_echo_replies);
 }
 
 test "bulk stream: write stops at the unsent low-watermark; interactive goes first" {
@@ -498,9 +574,15 @@ const Link = struct {
     dropped: usize = 0,
 
     fn init(l: *Link, seed: u64, loss_ppm: u32, reorder_ppm: u32, limits: root.Limits) !void {
+        return l.initOver(fam4, seed, loss_ppm, reorder_ppm, limits);
+    }
+
+    /// Stack a on `f.stack`, stack b on `f.peer`.
+    fn initOver(l: *Link, f: Fam, seed: u64, loss_ppm: u32, reorder_ppm: u32, limits: root.Limits) !void {
         l.* = .{ .clock = .{ .io = t.io }, .a = undefined, .b = undefined, .prng = .init(seed), .loss_ppm = loss_ppm, .reorder_ppm = reorder_ppm };
-        l.a = try root.Stack.create(t.allocator, &l.clock, .{ .address = stack_addr, .limits = limits });
-        l.b = try root.Stack.create(t.allocator, &l.clock, .{ .address = peer_addr, .limits = limits });
+        l.a = try root.Stack.create(t.allocator, &l.clock, .{ .address = f.stack, .limits = limits });
+        errdefer l.a.destroy();
+        l.b = try root.Stack.create(t.allocator, &l.clock, .{ .address = f.peer, .limits = limits });
     }
 
     fn deinit(l: *Link) void {
@@ -582,12 +664,16 @@ const Both = struct {
 };
 
 fn bothWays(seed: u64, loss_ppm: u32, reorder_ppm: u32, dup_ppm: u32, size: usize) !void {
+    return bothWaysOver(fam4, seed, loss_ppm, reorder_ppm, dup_ppm, size);
+}
+
+fn bothWaysOver(f: Fam, seed: u64, loss_ppm: u32, reorder_ppm: u32, dup_ppm: u32, size: usize) !void {
     var l: Link = undefined;
-    try l.init(seed, loss_ppm, reorder_ppm, .{});
+    try l.initOver(f, seed, loss_ppm, reorder_ppm, .{});
     defer l.deinit();
     l.dup_ppm = dup_ppm;
     const lis = try l.b.listen(8420);
-    const c = try l.a.dial(.{ .addr = peer_addr, .port = 8420 });
+    const c = try l.a.dial(.{ .addr = f.peer, .port = 8420 });
     var srv: ?root.Stream = null;
     var guard: usize = 0;
     while (srv == null) : (guard += 1) {
@@ -615,7 +701,7 @@ fn bothWays(seed: u64, loss_ppm: u32, reorder_ppm: u32, dup_ppm: u32, size: usiz
         var pr: [1]u8 = undefined;
         std.debug.print("errors: a={any} b={any}\n", .{ c.read(&pr), srv.?.read(&pr) });
         for ([_]root.Stream{ c, srv.? }) |s| if (s.debugConn()) |k| std.debug.print("  {t} una={d} nxt={d} max={d} base={d} wnd={d} cwnd={d} ssth={d} rec={} rcv_nxt={d} rcvlen={d} ooo={d} unsent={d} sndlen={d} rto_at={?d} persist={?d} rto={d} backoff={d} fin_q={} eof={} err={?}\n", .{ k.state, k.snd_una, k.snd_nxt, k.snd_max, k.snd_base, k.snd_wnd, k.cwnd, k.ssthresh, k.in_recovery, k.rcv_nxt, k.rcv.len, k.ooo_len, k.unsent(), k.snd.len, k.rto_at, k.persist_at, k.rto, k.backoff, k.fin_queued, k.eof, k.err }) else std.debug.print("  (stale)\n", .{});
-        if (l.a.output(&l.buf)) |p| std.debug.print("a would send {any}\n", .{(try wire.parseTcp4(p)).tcp}) else std.debug.print("a sends nothing\n", .{});
+        if (l.a.output(&l.buf)) |p| std.debug.print("a would send {any}\n", .{(try wire.parseTcp(p)).tcp}) else std.debug.print("a sends nothing\n", .{});
         std.debug.print("stalled both ways (seed {d}): ab sent {d} got {d}, ba sent {d} got {d}, dropped {d}\n  a={any}\n  b={any}\n", .{ seed, x.ab.sent, x.ab.got.items.len, x.ba.sent, x.ba.got.items.len, l.dropped, c.status(), srv.?.status() });
         return e;
     };
@@ -691,6 +777,10 @@ test "two stacks, both directions at once, loss + reordering + duplication" {
     for (0..40) |seed| try bothWays(seed + 10, 10_000, 10_000, 2_000, 1 << 20);
 }
 
+test "two stacks over IPv6, both directions at once, loss + reordering + duplication" {
+    for (0..10) |seed| try bothWaysOver(fam6, seed + 600, 10_000, 10_000, 2_000, 1 << 20);
+}
+
 const Transfer = struct {
     tx: root.Stream,
     rx: root.Stream,
@@ -722,11 +812,15 @@ const Transfer = struct {
 };
 
 fn lossyTransfer(seed: u64, loss_ppm: u32, reorder_ppm: u32, size: usize) !void {
+    return lossyTransferOver(fam4, seed, loss_ppm, reorder_ppm, size);
+}
+
+fn lossyTransferOver(f: Fam, seed: u64, loss_ppm: u32, reorder_ppm: u32, size: usize) !void {
     var l: Link = undefined;
-    try l.init(seed, loss_ppm, reorder_ppm, .{ .recv_buffer = 64 * 1024, .send_buffer = 64 * 1024 });
+    try l.initOver(f, seed, loss_ppm, reorder_ppm, .{ .recv_buffer = 64 * 1024, .send_buffer = 64 * 1024 });
     defer l.deinit();
     const lis = try l.b.listen(8420);
-    const c = try l.a.dial(.{ .addr = peer_addr, .port = 8420 });
+    const c = try l.a.dial(.{ .addr = f.peer, .port = 8420 });
     var srv: ?root.Stream = null;
     var guard: usize = 0;
     while (srv == null) : (guard += 1) {
@@ -752,7 +846,7 @@ fn lossyTransfer(seed: u64, loss_ppm: u32, reorder_ppm: u32, size: usize) !void 
     };
     try t.expectEqualSlices(u8, data, x.got.items);
     const st = l.a.stats();
-    std.debug.print("lossy link seed {d} loss {d} reorder {d}: {d} KiB in {d} ms simulated, rto {d} fast {d} retrans {d} dropped {d}\n", .{ seed, loss_ppm, reorder_ppm, size / 1024, @divTrunc(l.clock.offset_ns.load(.monotonic), std.time.ns_per_ms), st.rto_expirations, st.fast_retransmits, st.retransmits, l.dropped });
+    std.debug.print("lossy link ({t}) seed {d} loss {d} reorder {d}: {d} KiB in {d} ms simulated, rto {d} fast {d} retrans {d} dropped {d}\n", .{ f.stack, seed, loss_ppm, reorder_ppm, size / 1024, @divTrunc(l.clock.offset_ns.load(.monotonic), std.time.ns_per_ms), st.rto_expirations, st.fast_retransmits, st.retransmits, l.dropped });
 }
 
 test "two stacks over a lossy, reordering link: data intact" {
@@ -760,6 +854,12 @@ test "two stacks over a lossy, reordering link: data intact" {
     try lossyTransfer(2, 10_000, 0, 1 << 20);
     try lossyTransfer(3, 10_000, 10_000, 1 << 20);
     try lossyTransfer(4, 50_000, 20_000, 256 << 10);
+}
+
+test "two stacks over IPv6, lossy reordering link: data intact" {
+    try lossyTransferOver(fam6, 1, 0, 0, 1 << 20);
+    try lossyTransferOver(fam6, 3, 10_000, 10_000, 1 << 20);
+    try lossyTransferOver(fam6, 4, 50_000, 20_000, 256 << 10);
 }
 
 // ---- SACK ------------------------------------------------------------------
@@ -1085,4 +1185,247 @@ test "SACK: a flood of random blocks costs bounded work and output per ACK" {
     // Each ACK releases at most a handful of segments (pipe-limited), not
     // a burst proportional to the junk it carried.
     try t.expect(max_out_per_ack <= 12);
+}
+// ---- IPv6 ------------------------------------------------------------------
+// Handshakes both ways, data, FIN / RST, retransmission, user timeout,
+// ICMP echo and the two-stack transfers run over both families above
+// (`families`); what follows is IPv6-specific.
+
+
+test "IPv6: MSS 1360 at MTU 1420 (SYN-ACK, our SYN, full-size segments fill the MTU)" {
+    var r: Rig = undefined;
+    try r.initFor(fam6, .{});
+    defer r.deinit();
+    try t.expectEqual(@as(u16, 1420), r.stack.options.mtu);
+    const l = try r.stack.listen(8420);
+    // The peer offers more than fits: segments are capped at 1360.
+    r.send(.{ .seq = 1000, .flags = .{ .syn = true }, .options = .{ .mss = 1440 } });
+    const sa = try r.recv();
+    try t.expectEqual(@as(?u16, 1360), sa.options.mss);
+    r.send(.{ .seq = 1001, .ack = sa.seq +% 1, .flags = .{ .ack = true }, .window = 0xffff });
+    const st = try l.accept();
+    try t.expectEqual(@as(u16, 1360), st.debugConn().?.mss);
+    var data: [3000]u8 = @splat('6');
+    _ = try st.write(&data);
+    const p = r.stack.output(&r.out).?;
+    try t.expectEqual(@as(usize, 1420), p.len); // 40 + 20 + 1360
+    try t.expectEqual(@as(usize, 1360), (try r.peer.expect(p)).payload.len);
+    while (r.stack.output(&r.out)) |_| {}
+    // Our own SYN offers 1360 too.
+    _ = try r.stack.dial(.{ .addr = peer_addr6, .port = 9000 });
+    r.peer.peer.port = 9000;
+    const syn = try r.peer.expectAnyPort(r.stack.output(&r.out).?);
+    try t.expect(syn.flags.syn);
+    try t.expectEqual(@as(?u16, 1360), syn.options.mss);
+}
+
+test "IPv6: extension headers: padding options walked, fragments and the rest dropped" {
+    var r: Rig = undefined;
+    try r.initFor(fam6, .{});
+    defer r.deinit();
+    _ = try r.stack.listen(8420);
+    var ext: [2048]u8 = undefined;
+    // hop-by-hop + destination options in front of a SYN: answered.
+    r.stack.input(withExtHeaders(&ext, r.peer.packet(&r.buf, .{ .seq = 1, .flags = .{ .syn = true } }), &.{ 0, 60 }));
+    const sa = try r.recv();
+    try t.expect(sa.flags.syn and sa.flags.ack);
+    try t.expectEqual(@as(u32, 2), sa.ack);
+    // Up to four headers are walked.
+    r.peer.peer.port = 40001;
+    r.stack.input(withExtHeaders(&ext, r.peer.packet(&r.buf, .{ .seq = 1, .flags = .{ .syn = true } }), &.{ 0, 60, 60, 60 }));
+    try t.expect((try r.recv()).flags.syn);
+    const before = r.stack.stats().dropped_malformed;
+    r.peer.peer.port = 40002;
+    const rejected = [_][]const u8{
+        &.{ 0, 60, 60, 60, 60 }, // five: too many
+        &.{44}, // fragment, even an atomic one
+        &.{ 60, 44 }, // fragment after a padding header
+        &.{43}, // routing
+        &.{51}, // AH
+        &.{50}, // ESP
+        &.{59}, // no next header
+        &.{ 60, 0 }, // hop-by-hop not first
+    };
+    for (rejected) |kinds| {
+        r.stack.input(withExtHeaders(&ext, r.peer.packet(&r.buf, .{ .seq = 1, .flags = .{ .syn = true } }), kinds));
+        try r.expectSilent(); // no SYN-ACK, and no RST either
+    }
+    try t.expectEqual(before + rejected.len, r.stack.stats().dropped_malformed);
+    try t.expectEqual(@as(u16, 2), r.stack.stats().connections);
+    // A SYN to a closed port behind a padding header gets a plain RST.
+    r.peer.stack.port = 9999;
+    r.stack.input(withExtHeaders(&ext, r.peer.packet(&r.buf, .{ .seq = 5, .flags = .{ .syn = true } }), &.{60}));
+    const rst = try r.recv();
+    try t.expect(rst.flags.rst and rst.flags.ack);
+    try t.expectEqual(@as(u32, 6), rst.ack);
+}
+
+test "IPv6: ICMPv6 echo behind a header, pseudo-header checksum required, other ICMPv6 ignored" {
+    var r: Rig = undefined;
+    try r.initFor(fam6, .{});
+    defer r.deinit();
+    var ext: [2048]u8 = undefined;
+    // Odd-length data behind a destination-options header: the reply
+    // carries no extension header.
+    r.stack.input(withExtHeaders(&ext, icmpPacket(&r.buf, peer_addr6, stack_addr6, wire.icmp6_echo_request, "odd"), &.{60}));
+    const reply = r.stack.output(&r.out).?;
+    try t.expectEqual(@as(usize, 40 + 8 + 3), reply.len);
+    const ip = try wire.parseIp(reply);
+    try t.expectEqual(wire.icmp6_echo_reply, try wire.icmp6Type(ip.src, ip.dst, ip.payload));
+    try t.expectEqualStrings("odd", ip.payload[8..]);
+
+    const malformed = r.stack.stats().dropped_malformed;
+    // An ICMPv4-style checksum (no pseudo-header) is wrong for ICMPv6.
+    const req = icmpPacket(&r.buf, peer_addr6, stack_addr6, wire.icmp6_echo_request, "ping");
+    const msg = req[wire.ip6_header_len..];
+    @memset(msg[2..4], 0);
+    std.mem.writeInt(u16, msg[2..4], wire.checksum(msg), .big);
+    r.stack.input(req);
+    try r.expectSilent();
+    // Truncated (under 8 bytes).
+    const short = icmpPacket(&r.buf, peer_addr6, stack_addr6, wire.icmp6_echo_request, "");
+    std.mem.writeInt(u16, short[4..6], 4, .big);
+    r.stack.input(short[0 .. wire.ip6_header_len + 4]);
+    try r.expectSilent();
+    try t.expectEqual(malformed + 2, r.stack.stats().dropped_malformed);
+
+    const not_ours = r.stack.stats().dropped_not_for_us;
+    // Neighbor solicitation, echo reply: valid, ignored (no NDP here).
+    r.stack.input(icmpPacket(&r.buf, peer_addr6, stack_addr6, 135, "nd"));
+    r.stack.input(icmpPacket(&r.buf, peer_addr6, stack_addr6, wire.icmp6_echo_reply, "x"));
+    try r.expectSilent();
+    // ICMPv4 inside IPv6; an echo to another address; one from multicast.
+    var v4in6 = icmpPacket(&r.buf, peer_addr6, stack_addr6, wire.icmp6_echo_request, "four");
+    v4in6[6] = wire.proto_icmp;
+    r.stack.input(v4in6);
+    r.stack.input(icmpPacket(&r.buf, peer_addr6, otherHost(stack_addr6, 9), wire.icmp6_echo_request, "x"));
+    const all_nodes: root.Addr = .{ .v6 = .{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    r.stack.input(icmpPacket(&r.buf, all_nodes, stack_addr6, wire.icmp6_echo_request, "x"));
+    try r.expectSilent();
+    try t.expectEqual(not_ours + 3, r.stack.stats().dropped_not_for_us);
+    try t.expectEqual(@as(u64, 1), r.stack.stats().icmp_echo_replies);
+
+    // icmp_echo = false: no reply.
+    var q: Rig = undefined;
+    try q.initWith(.{ .address = stack_addr6, .icmp_echo = false }, fam6);
+    defer q.deinit();
+    q.stack.input(icmpPacket(&q.buf, peer_addr6, stack_addr6, wire.icmp6_echo_request, "x"));
+    try q.expectSilent();
+}
+
+test "IPv6: v4-mapped addresses rejected; unusable sources dropped without a reply" {
+    const v6 = struct {
+        fn a(b: [16]u8) root.Addr {
+            return .{ .v6 = b };
+        }
+    }.a;
+    const mapped_self = v6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 8, 0, 1 });
+    const mapped_peer = v6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 8, 0, 2 });
+    const all_nodes = v6(.{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+    const unspecified = v6(@splat(0));
+    const loopback = v6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+
+    var clock: root.Clock = .{ .io = t.io };
+    for ([_]root.Options{
+        .{ .address = mapped_self },
+        .{ .address = stack_addr, .address6 = mapped_self },
+        .{ .address = stack_addr6, .address6 = otherHost(stack_addr6, 7) }, // two IPv6
+        .{ .address = stack_addr, .address6 = stack_addr }, // IPv4 as address6
+    }) |o| try t.expectError(error.AddressFamilyUnsupported, root.Stack.create(t.allocator, &clock, o));
+
+    var r: Rig = undefined;
+    try r.initWith(.{ .address = stack_addr, .address6 = stack_addr6 }, fam6);
+    defer r.deinit();
+    _ = try r.stack.listen(8420);
+    for ([_]root.Addr{ mapped_peer, all_nodes, unspecified, loopback, stack_addr6, stack_addr }) |a|
+        try t.expectError(error.AddressFamilyUnsupported, r.stack.dial(.{ .addr = a, .port = 9000 }));
+
+    const before = r.stack.stats().dropped_not_for_us;
+    const sources = [_]root.Addr{ mapped_peer, all_nodes, unspecified, loopback, stack_addr6 };
+    for (sources) |src| {
+        r.peer.peer.addr = src;
+        r.peer.stack.port = 8420; // listening: no SYN-ACK
+        r.send(.{ .seq = 1, .flags = .{ .syn = true } });
+        r.peer.stack.port = 9999; // closed: no RST
+        r.send(.{ .seq = 1, .flags = .{ .syn = true } });
+        r.stack.input(icmpPacket(&r.buf, src, stack_addr6, wire.icmp6_echo_request, "x"));
+        try r.expectSilent();
+    }
+    try t.expectEqual(before + 3 * sources.len, r.stack.stats().dropped_not_for_us);
+    try t.expectEqual(@as(u16, 0), r.stack.stats().connections);
+}
+
+test "IPv6: dual-stack listener: one port on both addresses, each family its own MSS" {
+    var r: Rig = undefined;
+    try r.initWith(.{ .address = stack_addr, .address6 = stack_addr6 }, fam4);
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e4 = try r.established(l);
+    // Same peer port over IPv6: a separate connection on the same listener.
+    r.peer = .{ .peer = .{ .addr = peer_addr6, .port = 40000 }, .stack = .{ .addr = stack_addr6, .port = 8420 } };
+    const e6 = try r.established(l);
+    try t.expectEqual(stack_addr, e4.st.local().addr);
+    try t.expectEqual(stack_addr6, e6.st.local().addr);
+    try t.expectEqual(peer_addr6, e6.st.remote().addr);
+    try t.expectEqual(@as(u16, 1380), e4.st.debugConn().?.mss);
+    try t.expectEqual(@as(u16, 1360), e6.st.debugConn().?.mss);
+    try t.expectEqual(@as(u16, 2), r.stack.stats().connections);
+
+    // Data and an exact RST on the IPv6 connection leave the IPv4 one alone.
+    r.send(.{ .seq = e6.rcv, .ack = e6.snd, .flags = .{ .ack = true, .psh = true }, .window = 2048, .payload = "six" });
+    var buf: [8]u8 = undefined;
+    try t.expectEqual(@as(usize, 3), try e6.st.read(&buf));
+    try t.expectEqualStrings("six", buf[0..3]);
+    try t.expectError(error.WouldBlock, e4.st.read(&buf));
+    try t.expectEqual(e6.rcv + 3, (try r.recv()).ack); // an IPv6 ACK
+    r.send(.{ .seq = e6.rcv + 3, .flags = .{ .rst = true } });
+    try t.expectError(error.ConnectionReset, e6.st.read(&buf));
+    try t.expectEqual(root.State.established, e4.st.status().state);
+    e6.st.close();
+
+    // Another IPv6 address is not ours.
+    const nfu = r.stack.stats().dropped_not_for_us;
+    r.peer.stack.addr = otherHost(stack_addr6, 9);
+    r.send(.{ .seq = 1, .flags = .{ .syn = true } });
+    try r.expectSilent();
+    try t.expectEqual(nfu + 1, r.stack.stats().dropped_not_for_us);
+
+    // Dial picks our address by the destination's family.
+    const d6 = try r.stack.dial(.{ .addr = peer_addr6, .port = 9000 });
+    const d4 = try r.stack.dial(.{ .addr = peer_addr, .port = 9000 });
+    try t.expectEqual(stack_addr6, d6.local().addr);
+    try t.expectEqual(stack_addr, d4.local().addr);
+    var seen6 = false;
+    var seen4 = false;
+    while (r.stack.output(&r.out)) |p| {
+        const sg = try wire.parseTcp(p);
+        if (!sg.tcp.flags.syn) continue;
+        if (sg.ip.src.eql(stack_addr6) and sg.ip.dst.eql(peer_addr6)) seen6 = true;
+        if (sg.ip.src.eql(stack_addr) and sg.ip.dst.eql(peer_addr)) seen4 = true;
+    }
+    try t.expect(seen6 and seen4);
+}
+
+test "IPv6: a single-family stack refuses and ignores the other family" {
+    // IPv4 only.
+    var r4: Rig = undefined;
+    try r4.initFor(fam4, .{});
+    defer r4.deinit();
+    _ = try r4.stack.listen(8420);
+    try t.expectError(error.AddressFamilyUnsupported, r4.stack.dial(.{ .addr = peer_addr6, .port = 9000 }));
+    r4.peer = .{ .peer = .{ .addr = peer_addr6, .port = 40000 }, .stack = .{ .addr = stack_addr6, .port = 8420 } };
+    r4.send(.{ .seq = 1, .flags = .{ .syn = true } });
+    try r4.expectSilent();
+    try t.expectEqual(@as(u64, 1), r4.stack.stats().dropped_not_for_us);
+    // IPv6 only.
+    var r6: Rig = undefined;
+    try r6.initFor(fam6, .{});
+    defer r6.deinit();
+    _ = try r6.stack.listen(8420);
+    try t.expectError(error.AddressFamilyUnsupported, r6.stack.dial(.{ .addr = peer_addr, .port = 9000 }));
+    r6.peer = .{ .peer = .{ .addr = peer_addr, .port = 40000 }, .stack = .{ .addr = stack_addr, .port = 8420 } };
+    r6.send(.{ .seq = 1, .flags = .{ .syn = true } });
+    r6.stack.input(icmpPacket(&r6.buf, peer_addr, stack_addr, wire.icmp_echo_request, "x"));
+    try r6.expectSilent();
+    try t.expectEqual(@as(u64, 2), r6.stack.stats().dropped_not_for_us);
 }
