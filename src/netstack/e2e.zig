@@ -7,9 +7,9 @@
 //!     SHA-256 checked on both ends; prints throughput and loss counts.
 //!   * Interactive latency under a saturating bulk stream, without loss
 //!     and with 1% loss on the bulk stream only.
-//!   * TLS 1.3 handshake + data over a netstack stream (std.crypto.tls
-//!     client against a minimal in-test TLS server is not available in
-//!     std, so the TLS smoke test is not here; see the report).
+//!   * Node (device + stack + threads) with the std.Io Reader / Writer
+//!     adapters and the ready callback. (No TLS smoke test: std has a
+//!     TLS client but no server to run it against in-process.)
 //!
 //! Everything waits on real events (blocking stream calls with
 //! timeouts); nothing sleeps or polls. Sockets bind 127.0.0.1 only.
@@ -375,4 +375,65 @@ test "e2e: interactive latency stays low under a saturating bulk stream (no loss
 
 test "e2e: interactive latency under 1 RTO with 1% loss on the bulk stream" {
     try latencyUnderBulk(t.allocator, 5_000, 200 * std.time.ns_per_ms);
+}
+
+test "e2e: Node (device + stack + threads) with the std.Io Reader / Writer adapters" {
+    const gpa = t.allocator;
+    var clock: dev.device.Clock = .{ .io = t.io };
+    var ks: wg.crypto.PrivateKey = undefined;
+    var kc: wg.crypto.PrivateKey = undefined;
+    t.io.random(&ks);
+    t.io.random(&kc);
+    wg.crypto.clampPrivateKey(&ks);
+    wg.crypto.clampPrivateKey(&kc);
+    defer wg.crypto.wipe(&ks);
+    defer wg.crypto.wipe(&kc);
+    const server_cidr = [_]dev.ip.Cidr{try dev.ip.Cidr.parse("10.8.0.1/32")};
+    const client_cidr = [_]dev.ip.Cidr{try dev.ip.Cidr.parse("10.8.0.2/32")};
+    const server = try ns.Node.start(gpa, &clock, .{
+        .private_key = ks,
+        .loopback_only = true,
+        .peers = &.{.{ .public_key = wg.crypto.publicKey(kc), .allowed_ips = &client_cidr }},
+    }, .{ .address = server_addr });
+    defer server.destroy();
+    const client = try ns.Node.start(gpa, &clock, .{
+        .private_key = kc,
+        .loopback_only = true,
+        .peers = &.{.{ .public_key = wg.crypto.publicKey(ks), .allowed_ips = &server_cidr, .endpoint = .{ .ip4 = .loopback(server.device.listen_port) } }},
+    }, .{ .address = client_addr });
+    defer client.destroy();
+
+    // The ready callback fires (stack thread) when the connection arrives.
+    const Flag = struct {
+        hits: std.atomic.Value(u32) = .init(0),
+        fn ready(ctx: ?*anyopaque) void {
+            const f: *@This() = @ptrCast(@alignCast(ctx.?));
+            _ = f.hits.fetchAdd(1, .monotonic);
+        }
+    };
+    var flag: Flag = .{};
+    server.stack.setReadyCallback(&flag, Flag.ready);
+
+    const l = try server.stack.listen(port_main);
+    const c = try client.stack.dialWait(.{ .addr = server_addr, .port = port_main }, 20 * std.time.ns_per_s);
+    const s = try l.acceptWait(5 * std.time.ns_per_s);
+    try t.expect(flag.hits.load(.monotonic) > 0);
+    try t.expectEqual(client_addr.v4, s.remote().addr.v4);
+    try t.expectEqual(port_main, c.remote().port);
+
+    var wbuf: [64]u8 = undefined;
+    var w = c.writer(&wbuf, 5 * std.time.ns_per_s);
+    try w.interface.print("hello over {s}\n", .{"netstack"});
+    try w.interface.flush();
+    c.shutdown();
+
+    var rbuf: [64]u8 = undefined;
+    var r = s.reader(&rbuf, 5 * std.time.ns_per_s);
+    const line = try r.interface.take(20);
+    try t.expectEqualStrings("hello over netstack\n", line);
+    try t.expectError(error.EndOfStream, r.interface.takeByte());
+
+    s.close();
+    c.close();
+    l.close();
 }

@@ -178,4 +178,5 @@ test {
     _ = stack_impl;
     _ = @import("tcp.zig");
     _ = @import("stack_test.zig");
+    _ = @import("fuzz.zig");
 }
