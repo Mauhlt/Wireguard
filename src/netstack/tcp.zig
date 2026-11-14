@@ -1,5 +1,6 @@
 //! Per-connection TCP (RFC 9293): the state machine, sequence / window
-//! bookkeeping, RTO (RFC 6298, Karn), NewReno (RFC 5681 / 6582), zero
+//! bookkeeping, RTO (RFC 6298, Karn), SACK (RFC 2018) with RFC 6675
+//! loss recovery, NewReno (RFC 5681 / 6582) without SACK, zero
 //! window probing, delayed ACK, keepalive, TIME-WAIT. Pure: no locking,
 //! no I/O, no clock reads (the caller passes `Env.now`). The stack owns
 //! the table, the locking and the packets; this file decides what a
@@ -38,6 +39,9 @@ const min_peer_mss: u16 = 64;
 pub const initial_cwnd_segments = 10;
 /// Storage bound for out-of-order ranges (Limits.max_ooo_segments <= this).
 pub const max_ooo_ranges = 64;
+/// Sender SACK scoreboard: SACKed ranges remembered per connection. A
+/// peer that fragments it beyond this gets NewReno (never more memory).
+pub const max_sack_ranges = 16;
 /// Duplicate ACKs owed at most (one per out-of-order segment): enough for
 /// the sender's fast retransmit (3) and some NewReno window inflation.
 const max_dup_acks_owed = 8;
@@ -119,8 +123,8 @@ pub const Env = struct {
     now: i64,
     gpa: std.mem.Allocator,
     limits: *const root.Limits,
-    /// Our MSS (from the MTU).
-    mss: u16,
+    /// Tunnel MTU; our MSS follows from it per address family.
+    mtu: u16,
     keepalive_idle_ns: ?u64,
     stats: *root.Stats,
 };
@@ -148,7 +152,12 @@ pub const OutputClass = enum {
     control,
 };
 
-const Range = struct { start: u32, end: u32 };
+const Range = struct {
+    start: u32,
+    end: u32,
+    /// Receiver: when the range last grew (most recent SACK block first).
+    seen: u32 = 0,
+};
 
 pub const Conn = struct {
     state: State = .closed,
@@ -186,6 +195,7 @@ pub const Conn = struct {
     rcv_adv: u32 = 0,
     ooo: [max_ooo_ranges]Range = undefined,
     ooo_len: u8 = 0,
+    ooo_clock: u32 = 0,
     /// Peer's FIN, seen at this sequence number but not yet in order.
     fin_seq: ?u32 = null,
     /// The peer's FIN was consumed: reads end once rcv is drained.
@@ -226,6 +236,19 @@ pub const Conn = struct {
     dupacks: u32 = 0,
     recover: u32 = 0,
     in_recovery: bool = false,
+
+    // SACK (RFC 2018 / 6675)
+    /// Both SYNs carried SACK-permitted.
+    sack_ok: bool = false,
+    /// Sender scoreboard: SACKed ranges in [snd_una, snd_max], sorted, disjoint.
+    sacked: [max_sack_ranges]Range = undefined,
+    sacked_len: u8 = 0,
+    /// A block did not fit the scoreboard: NewReno until it empties.
+    sack_degraded: bool = false,
+    /// The current recovery is pipe-driven (RFC 6675), not NewReno.
+    sack_recovery: bool = false,
+    /// Highest sequence number retransmitted in this recovery (HighRxt).
+    high_rxt: u32 = 0,
 
     keepalive_sent: u8 = 0,
     err: ?ConnError = null,
@@ -268,7 +291,7 @@ pub const Conn = struct {
         c.rcv_shift = ourShift(env.limits);
         c.state = .syn_sent;
         c.send_syn = true;
-        c.cwnd = initial_cwnd_segments * @as(u32, env.mss);
+        c.cwnd = initial_cwnd_segments * @as(u32, c.ourMss(env));
         c.armKeepalive(env);
     }
 
@@ -292,7 +315,10 @@ pub const Conn = struct {
 
     fn applySynOptions(c: *Conn, env: *const Env, syn: wire.Tcp) void {
         const peer_mss = syn.options.mss orelse default_peer_mss;
-        c.mss = @max(@min(peer_mss, env.mss), min_peer_mss);
+        c.mss = @max(@min(peer_mss, c.ourMss(env)), min_peer_mss);
+        // We offer SACK-permitted on our SYN, and on a SYN-ACK only if the
+        // peer's SYN did: so the peer's SYN (or SYN-ACK) decides.
+        c.sack_ok = syn.options.sack_permitted;
         if (syn.options.window_scale) |sh| {
             c.snd_shift = @intCast(@min(sh, wire.max_window_scale));
             if (c.state == .syn_received) c.rcv_shift = ourShift(env.limits);
@@ -301,6 +327,12 @@ pub const Conn = struct {
             c.snd_shift = 0;
             c.rcv_shift = 0;
         }
+    }
+
+    /// Our MSS for this connection's address family (IPv4 1380, IPv6
+    /// 1360 at MTU 1420).
+    fn ourMss(c: *const Conn, env: *const Env) u16 {
+        return wire.mssFor(c.local.addr, env.mtu);
     }
 
     fn armKeepalive(c: *Conn, env: *const Env) void {
@@ -379,7 +411,7 @@ pub const Conn = struct {
         // buffer, 2 MSS) (RFC 9293 3.8.6.2.2, receiver SWS avoidance).
         if (n > 0 and c.synchronized()) {
             const edge = c.rcv_nxt +% len32(c.rcv.free());
-            const threshold = @min(len32(c.rcv.cap()) / 2, 2 * @as(u32, env.mss));
+            const threshold = @min(len32(c.rcv.cap()) / 2, 2 * @as(u32, c.ourMss(env)));
             if (seqLe(c.rcv_adv, edge) and edge -% c.rcv_adv >= threshold) c.ack_now = true;
         }
         return n;
@@ -651,31 +683,29 @@ pub const Conn = struct {
                 c.persist_backoff = 0;
             }
         }
+        // SACK blocks first: on duplicate ACKs is where they matter.
+        var sacked_more = false;
+        if (c.sack_ok) if (seg.options.sack) |*s| {
+            sacked_more = c.takeSack(env, s);
+        };
         if (seqLe(ack, c.snd_una)) {
             // Duplicate ACK (RFC 5681 2): no data, no window change,
             // data outstanding, ack == snd_una.
-            if (ack == c.snd_una and seg.payload.len == 0 and !seg.flags.fin and
-                c.snd_wnd == old_wnd and c.snd_max != c.snd_una)
-            {
-                c.dupacks += 1;
-                if (c.dupacks == c.dupThreshold() and !c.in_recovery) {
-                    // RFC 6582 3.2 step 2: only if this is not a loss we
-                    // already recovered from (ack - 1 > recover).
-                    if (seqLt(c.recover, ack -% 1) or c.recover == c.iss) {
-                        const fl = c.snd_max -% c.snd_una;
-                        c.ssthresh = @max(fl / 2, 2 * @as(u32, c.mss));
-                        c.recover = c.snd_max;
-                        c.cwnd = c.ssthresh + 3 * @as(u32, c.mss);
-                        c.in_recovery = true;
-                        c.retransmit_one = true;
-                        c.rtt_seq = null; // Karn
-                        env.stats.fast_retransmits += 1;
-                    }
-                } else if (c.in_recovery) {
-                    c.cwnd +|= c.mss; // inflate
-                }
+            const dup = ack == c.snd_una and seg.payload.len == 0 and !seg.flags.fin and
+                c.snd_wnd == old_wnd and c.snd_max != c.snd_una;
+            if (dup) c.dupacks += 1;
+            if (!c.in_recovery) {
+                // DupThresh duplicates (Early Retransmit lowers it), or with
+                // SACK enough SACKed above snd_una to call it lost (RFC
+                // 6675 IsLost); never for a loss already recovered from.
+                const by_dupacks = dup and c.dupacks >= c.dupThreshold();
+                const by_sack = c.usingSack() and sacked_more and c.lostWith(c.sackedBytes());
+                if ((by_dupacks or by_sack) and c.mayRecover(ack)) c.enterRecovery(env);
+            } else if (dup and !c.sack_recovery) {
+                c.cwnd +|= c.mss; // NewReno inflation
             }
-            return c.snd_wnd > old_wnd;
+            if (c.sack_recovery and c.sack_degraded) c.sack_recovery = false; // fall back to NewReno
+            return c.snd_wnd > old_wnd or sacked_more;
         }
 
         // New data acknowledged.
@@ -687,21 +717,31 @@ pub const Conn = struct {
         }
         c.snd_una = ack;
         if (seqLt(c.snd_nxt, ack)) c.snd_nxt = ack;
+        if (seqLt(c.high_rxt, ack)) c.high_rxt = ack;
+        c.pruneSacked();
         if (c.rtt_seq) |rs| if (seqLe(rs, ack)) c.sampleRtt(env.now);
         c.backoff = 0;
         c.stalled_since = null;
 
         if (c.in_recovery) {
             if (seqLe(c.recover, ack)) {
-                // Full ACK: leave recovery (RFC 6582 3.2 step 3).
-                c.cwnd = @min(c.ssthresh, (c.snd_max -% c.snd_una) + c.mss);
+                // Full ACK: leave recovery (RFC 6582 3.2 step 3 / RFC 6675).
+                c.cwnd = if (c.sack_recovery) c.ssthresh else @min(c.ssthresh, (c.snd_max -% c.snd_una) + c.mss);
                 c.in_recovery = false;
+                c.sack_recovery = false;
                 c.dupacks = 0;
-            } else {
-                // Partial ACK: retransmit the next hole, deflate.
+            } else if (!c.sack_recovery) {
+                // NewReno partial ACK: retransmit the next hole, deflate.
                 c.retransmit_one = true;
                 c.cwnd = (c.cwnd -| acked) +| c.mss;
             }
+            // SACK recovery: pipe and NextSeg drive the retransmissions;
+            // a partial ACK also retransmits the segment at snd_una (as
+            // NewReno / Linux do): RFC 6675 IsLost would not call a hole
+            // with fewer than DupThresh segments SACKed above it lost,
+            // and without this it would wait for the RTO.
+            if (c.sack_recovery) c.retransmit_one = true;
+            if (c.sack_recovery and c.sack_degraded) c.sack_recovery = false;
         } else {
             c.dupacks = 0;
             if (c.cwnd < c.ssthresh) {
@@ -718,6 +758,12 @@ pub const Conn = struct {
         return true;
     }
 
+    /// May a new recovery start at this ACK? Not for losses in the window
+    /// already recovered from (RFC 6582 3.2 step 2: ack - 1 > recover).
+    fn mayRecover(c: *const Conn, ack: u32) bool {
+        return seqLt(c.recover, ack -% 1) or c.recover == c.iss;
+    }
+
     /// Duplicate ACKs that trigger fast retransmit: 3, or fewer when fewer
     /// than 4 segments are outstanding and there is no new data to send
     /// (Early Retransmit, RFC 5827): with so little in flight a single
@@ -726,6 +772,186 @@ pub const Conn = struct {
         const outstanding = (c.snd_max -% c.snd_una + c.mss - 1) / c.mss;
         if (c.unsent() == 0 and outstanding < 4) return @max(outstanding -| 1, 1);
         return 3;
+    }
+
+    // ---- SACK: receiver side (RFC 2018) -------------------------------------
+
+    /// SACK blocks for the next ACK: the out-of-order ranges, most
+    /// recently changed first (RFC 2018 4: the first block holds the
+    /// segment that triggered the ACK), at most `wire.max_sack_blocks`.
+    fn sackToSend(c: *const Conn) ?wire.Sack {
+        if (!c.sack_ok or c.ooo_len == 0) return null;
+        var s: wire.Sack = .{};
+        var used: [max_ooo_ranges]bool = @splat(false);
+        while (s.len < wire.max_sack_blocks) {
+            var best: ?usize = null;
+            for (c.ooo[0..c.ooo_len], 0..) |r, i| {
+                if (used[i]) continue;
+                if (best == null or r.seen > c.ooo[best.?].seen) best = i;
+            }
+            const i = best orelse break;
+            used[i] = true;
+            s.blocks[s.len] = .{ .start = c.ooo[i].start, .end = c.ooo[i].end };
+            s.len += 1;
+        }
+        return s;
+    }
+
+    fn ackOptions(c: *const Conn) wire.TcpOptions {
+        return .{ .sack = c.sackToSend() };
+    }
+
+    // ---- SACK: sender side (RFC 6675) ---------------------------------------
+
+    /// Merges the peer's SACK blocks into the scoreboard. Every block is
+    /// validated against [snd_una, snd_max] (D-SACK and anything outside
+    /// are ignored, never trusted); work is bounded (<= 4 blocks, each
+    /// merged into <= max_sack_ranges ranges). A block that fits nowhere
+    /// once the scoreboard is full is dropped and recovery falls back to
+    /// NewReno until the scoreboard empties. Returns true when new data
+    /// was SACKed.
+    fn takeSack(c: *Conn, env: *const Env, sack: *const wire.Sack) bool {
+        var grew = false;
+        for (sack.slice()) |b| {
+            var start = b.start;
+            const end = b.end;
+            if (!seqLt(start, end) or !seqLt(c.snd_una, end) or seqLt(c.snd_max, end) or
+                (end -% start) > (c.snd_max -% c.snd_una))
+            {
+                env.stats.sack_blocks_ignored += 1;
+                continue;
+            }
+            if (seqLt(start, c.snd_una)) start = c.snd_una;
+            const before = c.sackedBytes();
+            if (!c.insertSacked(start, end)) {
+                env.stats.sack_blocks_ignored += 1;
+                c.sack_degraded = true;
+                continue;
+            }
+            if (c.sackedBytes() != before) grew = true;
+        }
+        return grew;
+    }
+
+    /// Sorted, disjoint insert with merging. False when a new range is
+    /// needed but the scoreboard is full.
+    fn insertSacked(c: *Conn, start_in: u32, end_in: u32) bool {
+        var start = start_in;
+        var end = end_in;
+        // Absorb every range that overlaps or touches [start, end).
+        var i: usize = 0;
+        while (i < c.sacked_len) {
+            const r = c.sacked[i];
+            if (seqLe(r.start, end) and seqLe(start, r.end)) {
+                if (seqLt(r.start, start)) start = r.start;
+                if (seqLt(end, r.end)) end = r.end;
+                std.mem.copyForwards(Range, c.sacked[i .. c.sacked_len - 1], c.sacked[i + 1 .. c.sacked_len]);
+                c.sacked_len -= 1;
+                continue;
+            }
+            i += 1;
+        }
+        if (c.sacked_len >= max_sack_ranges) return false;
+        // Keep sorted by start.
+        var pos: usize = 0;
+        while (pos < c.sacked_len and seqLt(c.sacked[pos].start, start)) pos += 1;
+        std.mem.copyBackwards(Range, c.sacked[pos + 1 .. c.sacked_len + 1], c.sacked[pos..c.sacked_len]);
+        c.sacked[pos] = .{ .start = start, .end = end };
+        c.sacked_len += 1;
+        return true;
+    }
+
+    /// Drops what the cumulative ACK now covers.
+    fn pruneSacked(c: *Conn) void {
+        var w: usize = 0;
+        for (c.sacked[0..c.sacked_len]) |r| {
+            if (seqLe(r.end, c.snd_una)) continue;
+            c.sacked[w] = .{ .start = if (seqLt(r.start, c.snd_una)) c.snd_una else r.start, .end = r.end };
+            w += 1;
+        }
+        c.sacked_len = @intCast(w);
+        if (w == 0) c.sack_degraded = false;
+    }
+
+    fn clearSacked(c: *Conn) void {
+        c.sacked_len = 0;
+        c.sack_degraded = false;
+    }
+
+    fn sackedBytes(c: *const Conn) u32 {
+        var n: u32 = 0;
+        for (c.sacked[0..c.sacked_len]) |r| n +%= r.end -% r.start;
+        return n;
+    }
+
+    /// RFC 6675 IsLost for a hole starting at `seq`, given the SACKed
+    /// bytes above it: more than (DupThresh - 1) * SMSS.
+    fn lostWith(c: *const Conn, sacked_above: u32) bool {
+        return sacked_above > 2 * @as(u32, c.mss);
+    }
+
+    fn usingSack(c: *const Conn) bool {
+        return c.sack_ok and !c.sack_degraded;
+    }
+
+    /// RFC 6675 SetPipe over ranges: unSACKed bytes in flight, minus holes
+    /// deemed lost, plus the part of lost holes already retransmitted.
+    fn pipe(c: *const Conn) u32 {
+        var total_sacked = c.sackedBytes();
+        var p: u32 = 0;
+        var pos = c.snd_una;
+        for (c.sacked[0..c.sacked_len]) |r| {
+            p +%= c.holePipe(pos, r.start, total_sacked);
+            total_sacked -%= r.end -% r.start;
+            pos = r.end;
+        }
+        // Above the highest SACK: nothing SACKed above, never "lost".
+        if (seqLt(pos, c.snd_nxt)) p +%= c.snd_nxt -% pos;
+        return p;
+    }
+
+    fn holePipe(c: *const Conn, a: u32, b: u32, sacked_above: u32) u32 {
+        if (!seqLt(a, b)) return 0;
+        if (!c.lostWith(sacked_above)) return b -% a;
+        // Lost: only what was retransmitted (below high_rxt) is in flight.
+        if (!seqLt(a, c.high_rxt)) return 0;
+        const e = if (seqLt(c.high_rxt, b)) c.high_rxt else b;
+        return e -% a;
+    }
+
+    /// RFC 6675 NextSeg rule 1: the first lost, not yet retransmitted
+    /// byte range below the highest SACKed sequence number.
+    fn nextLost(c: *const Conn) ?struct { seq: u32, len: u32 } {
+        var total_sacked = c.sackedBytes();
+        var pos = c.snd_una;
+        for (c.sacked[0..c.sacked_len]) |r| {
+            if (!c.lostWith(total_sacked)) return null; // holes above are not lost either
+            const start = if (seqLt(pos, c.high_rxt)) c.high_rxt else pos;
+            if (seqLt(start, r.start)) return .{ .seq = start, .len = @min(r.start -% start, c.mss) };
+            total_sacked -%= r.end -% r.start;
+            pos = r.end;
+        }
+        return null;
+    }
+
+    fn enterRecovery(c: *Conn, env: *const Env) void {
+        const fl = c.snd_max -% c.snd_una;
+        c.ssthresh = @max(fl / 2, 2 * @as(u32, c.mss));
+        c.recover = c.snd_max;
+        c.in_recovery = true;
+        c.retransmit_one = true;
+        c.rtt_seq = null; // Karn
+        env.stats.fast_retransmits += 1;
+        if (c.usingSack()) {
+            // RFC 6675 5 (4): cwnd = ssthresh; pipe governs from here.
+            c.sack_recovery = true;
+            c.cwnd = c.ssthresh;
+            c.high_rxt = c.snd_una;
+        } else {
+            // RFC 6582 3.2 step 2.
+            c.sack_recovery = false;
+            c.cwnd = c.ssthresh + 3 * @as(u32, c.mss);
+        }
     }
 
     fn sampleRtt(c: *Conn, now: i64) void {
@@ -788,7 +1014,8 @@ pub const Conn = struct {
         }
         const cap = @min(env.limits.max_ooo_segments, max_ooo_ranges);
         if (c.ooo_len >= cap) return false;
-        c.ooo[c.ooo_len] = .{ .start = s, .end = e };
+        c.ooo_clock +%= 1;
+        c.ooo[c.ooo_len] = .{ .start = s, .end = e, .seen = c.ooo_clock };
         c.ooo_len += 1;
         return true;
     }
@@ -892,6 +1119,11 @@ pub const Conn = struct {
             c.dupacks = 0;
             c.snd_nxt = c.snd_una; // go back N
             c.rtt_seq = null; // Karn
+            // RFC 2018 8 / RFC 6675 5.1: SACK information may be reneged;
+            // after a timeout start over without it.
+            c.clearSacked();
+            c.sack_recovery = false;
+            c.high_rxt = c.snd_una;
             c.rto = @min(c.rto * 2, max_rto_ns);
             c.backoff +|= 1;
             if (c.state == .syn_sent or c.state == .syn_received) c.send_syn = true;
@@ -920,8 +1152,8 @@ pub const Conn = struct {
 
     // ---- output ----------------------------------------------------------------
 
-    /// Builds the next segment this connection wants to send (an IPv4
-    /// packet in `buf`, `buf.len >= mtu`) of the given class, or null.
+    /// Builds the next segment this connection wants to send (an IPv4 or
+    /// IPv6 packet in `buf`, `buf.len >= mtu`) of the given class, or null.
     pub fn output(c: *Conn, env: *const Env, buf: []u8, ip_id: u16, class: OutputClass) ?[]u8 {
         switch (c.state) {
             .closed, .listen => return null,
@@ -957,7 +1189,16 @@ pub const Conn = struct {
                     if (c.segmentAt(env, buf, ip_id, c.snd_una, c.mss, true)) |p| return p;
                 }
             }
-            if (c.dataSegment(env, buf, ip_id)) |p| return p;
+            if (c.sack_recovery) {
+                // RFC 6675 5 (C): while cwnd - pipe >= 1 SMSS, send NextSeg:
+                // a lost hole first, else new data.
+                if (c.cwnd -| c.pipe() >= c.mss) {
+                    if (c.nextLost()) |l| {
+                        if (c.segmentAt(env, buf, ip_id, l.seq, l.len, true)) |p| return p;
+                    }
+                    if (c.dataSegment(env, buf, ip_id)) |p| return p;
+                }
+            } else if (c.dataSegment(env, buf, ip_id)) |p| return p;
         } else {
             // A bare FIN carries no data: control class.
             if (c.unsent() == 0 and c.fin_queued and seqLe(c.snd_nxt, c.finSeq()) and c.snd_wnd > 0) {
@@ -996,12 +1237,19 @@ pub const Conn = struct {
         // ACK one new segment each, beyond cwnd, so that a loss in a small
         // window still produces the three duplicates fast retransmit needs.
         const limited: u32 = if (!c.in_recovery and c.dupacks > 0 and c.dupacks < 3) c.dupacks * @as(u32, c.mss) else 0;
-        const avail = @min(c.snd_wnd, c.cwnd +| limited) -| fl;
-        const n = @min(@min(left, c.mss), avail);
+        // In SACK recovery the congestion window is measured against pipe
+        // (RFC 6675), not against everything outstanding.
+        const avail = if (c.sack_recovery)
+            @min(c.snd_wnd -| fl, c.cwnd -| c.pipe())
+        else
+            @min(c.snd_wnd, c.cwnd +| limited) -| fl;
+        // A full segment is MSS minus the options it carries (RFC 6691).
+        const smss = c.sendMss();
+        const n = @min(@min(left, smss), avail);
         // Sender SWS avoidance (RFC 9293 3.8.6.2.1): a full segment, all
         // that is left, or nothing in flight. No Nagle: small writes go
         // out at once.
-        if (n > 0 and (n == c.mss or n == left or fl == 0)) {
+        if (n > 0 and (n == smss or n == left or fl == 0)) {
             if (c.segmentAt(env, buf, ip_id, c.snd_nxt, n, false)) |p| return p;
         } else if (left == 0 and fin_pending and (c.snd_wnd > 0 or fl == 0)) {
             if (c.segmentAt(env, buf, ip_id, c.snd_nxt, 0, false)) |p| return p;
@@ -1014,14 +1262,23 @@ pub const Conn = struct {
         return null;
     }
 
+    /// Payload bytes per full segment: MSS minus the options this
+    /// connection's segments carry right now (SACK blocks).
+    fn sendMss(c: *const Conn) u32 {
+        return @max(@as(u32, c.mss) -| len32(c.ackOptions().len()), 1);
+    }
+
     /// Data (and FIN when it ends the stream) starting at `seq`, at most
     /// `max` bytes.
     fn segmentAt(c: *Conn, env: *const Env, buf: []u8, ip_id: u16, seq: u32, max: u32, retransmit: bool) ?[]u8 {
         const off = seq -% c.snd_base;
         const total = len32(c.snd.len);
         const avail: u32 = if (seqLe(c.snd_base, seq) and off <= total) total - off else 0;
-        const n = @min(avail, max);
-        const hl = wire.ip4_header_len + wire.tcp_header_len;
+        const opt_len = c.ackOptions().len();
+        const n = @min(@min(avail, max), c.sendMss());
+        // Header length exactly as `emit` will build it, so the payload
+        // read into place below is where the serializer expects it.
+        const hl = wire.ipHeaderLen(c.local.addr) + wire.tcp_header_len + opt_len;
         if (buf.len < hl + n) return null;
         const payload = buf[hl..][0..n];
         c.snd.readAt(off, payload);
@@ -1032,6 +1289,7 @@ pub const Conn = struct {
         const end = seq +% n +% @intFromBool(flags.fin);
         // Anything below snd_max was sent before (go-back-N or fast retransmit).
         if (retransmit or seqLt(seq, c.snd_max)) env.stats.retransmits += 1;
+        if (retransmit and seqLt(c.high_rxt, end)) c.high_rxt = end;
         if (!retransmit) {
             // Karn: time only segments never sent before.
             if (c.rtt_seq == null and c.backoff == 0 and seqLe(c.snd_max, seq)) {
@@ -1054,9 +1312,11 @@ pub const Conn = struct {
         c.snd_nxt = c.iss +% 1;
         if (seqLt(c.snd_max, c.snd_nxt)) c.snd_max = c.snd_nxt;
         if (c.rto_at == null) c.rto_at = env.now + c.rto;
-        var opts: wire.TcpOptions = .{ .mss = env.mss };
-        // Offer window scaling on our SYN; on a SYN-ACK only if the peer did.
+        var opts: wire.TcpOptions = .{ .mss = c.ourMss(env) };
+        // Offer window scaling and SACK on our SYN; on a SYN-ACK only what
+        // the peer offered.
         if (!ack or c.snd_shift != 0 or c.rcv_shift != 0) opts.window_scale = c.rcv_shift;
+        opts.sack_permitted = !ack or c.sack_ok;
         const wnd: u16 = @intCast(@min(c.rcvSpace(env), 0xffff)); // never scaled in a SYN
         c.rcv_adv = c.rcv_nxt +% wnd;
         if (ack) {
@@ -1082,6 +1342,7 @@ pub const Conn = struct {
         const edge = c.rcv_nxt +% (@as(u32, wnd) << c.rcv_shift);
         // Never shrink the advertised right edge (RFC 9293 3.8.6.2.2).
         if (seqLt(c.rcv_adv, edge)) c.rcv_adv = edge;
+        const opts = c.ackOptions();
         c.ack_now = false;
         c.delack_at = null;
         c.unacked_segs = 0;
@@ -1092,17 +1353,13 @@ pub const Conn = struct {
             .ack = c.rcv_nxt,
             .flags = flags,
             .window = wnd,
+            .options = opts,
             .payload = payload,
         });
     }
 
     fn build(c: *const Conn, buf: []u8, ip_id: u16, seg: wire.Tcp) ?[]u8 {
-        return wire.buildTcp4(buf, .{
-            .protocol = wire.proto_tcp,
-            .id = ip_id,
-            .src = c.local.addr.v4,
-            .dst = c.remote.addr.v4,
-        }, seg) catch null;
+        return wire.buildTcp(buf, c.local.addr, c.remote.addr, ip_id, seg) catch null;
     }
 };
 

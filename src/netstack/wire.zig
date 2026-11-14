@@ -1,5 +1,6 @@
-//! Wire formats: the one parser / serializer per protocol (IPv4, TCP,
-//! ICMPv4 echo) and the Internet checksum, shared by the stack, the tests
+//! Wire formats: the one parser / serializer per protocol (IPv4, IPv6 with
+//! a bounded extension-header walk, TCP with SACK, ICMPv4 / ICMPv6 echo)
+//! and the Internet checksum, shared by the stack, the tests
 //! and the fuzz targets. Every parser validates every field it relies on
 //! and returns an error for anything malformed: no `unreachable`, no
 //! unchecked casts on packet data. Big-endian via std.mem.readInt/writeInt.
@@ -12,14 +13,44 @@ pub const proto_tcp: u8 = 6;
 pub const ip4_header_len = 20;
 pub const tcp_header_len = 20;
 pub const tcp_max_options_len = 40;
+pub const proto_icmp6: u8 = 58;
+pub const ip6_header_len = 40;
 /// IPv4 + TCP headers without options: what MSS is relative to.
 pub const tcp_ip4_overhead = ip4_header_len + tcp_header_len;
+pub const tcp_ip6_overhead = ip6_header_len + tcp_header_len;
 /// RFC 7323: the largest window shift.
 pub const max_window_scale = 14;
+/// SACK blocks per segment: 4 fill the 40-byte option space (2 NOP + 2 +
+/// 4 * 8 = 36; with timestamps it would be 3, but we send none). The
+/// window-scale option only ever appears on SYNs, which carry no SACK.
+pub const max_sack_blocks = 4;
+/// IPv6 extension headers walked at most, and their total bytes.
+pub const max_ext_headers = 4;
+pub const max_ext_bytes = 256;
 
-/// MSS for a tunnel MTU (1420 -> 1380). The one place this is derived.
+/// MSS for a tunnel MTU over IPv4 (1420 -> 1380).
 pub fn mssForMtu(mtu: u16) u16 {
     return mtu -| tcp_ip4_overhead;
+}
+
+/// MSS for a tunnel MTU over IPv6 (1420 -> 1360).
+pub fn mssForMtu6(mtu: u16) u16 {
+    return mtu -| tcp_ip6_overhead;
+}
+
+/// MSS for connections of `a`'s family: the one place this is derived.
+pub fn mssFor(a: Addr, mtu: u16) u16 {
+    return switch (a) {
+        .v4 => mssForMtu(mtu),
+        .v6 => mssForMtu6(mtu),
+    };
+}
+
+pub fn ipHeaderLen(a: Addr) usize {
+    return switch (a) {
+        .v4 => ip4_header_len,
+        .v6 => ip6_header_len,
+    };
 }
 
 pub const ParseError = error{
@@ -33,6 +64,12 @@ pub const ParseError = error{
     BadOptions,
     BadDataOffset,
 };
+
+/// IPv6 adds one reason: an extension header we do not accept (routing,
+/// AH / ESP, a non-padding option, a chain too long, ...).
+pub const Ip6Error = ParseError || error{BadExtensionHeader};
+
+pub const BuildError = error{ BufferTooSmall, PacketTooLarge, AddressFamilyMismatch };
 
 // ---- Internet checksum (RFC 1071) -------------------------------------
 
@@ -163,6 +200,117 @@ pub const Ip4 = struct {
     }
 };
 
+// ---- IPv6 --------------------------------------------------------------
+
+pub const Ip6 = struct {
+    traffic_class: u8 = 0,
+    flow_label: u20 = 0,
+    /// On parse: the upper-layer protocol after the extension headers.
+    next_header: u8,
+    hop_limit: u8 = 64,
+    src: [16]u8,
+    dst: [16]u8,
+
+    pub const Parsed = struct {
+        header: Ip6,
+        /// 40 + extension headers.
+        header_len: usize,
+        /// Exactly what the payload length covers, minus extension headers.
+        payload: []const u8,
+    };
+
+    /// Validates version and payload length, then walks at most
+    /// `max_ext_headers` extension headers within `max_ext_bytes`:
+    /// hop-by-hop (first only) and destination options are skipped when
+    /// they hold nothing but padding; a fragment header is error.Fragment;
+    /// routing, AH, ESP, "no next header" and everything unexpected are
+    /// error.BadExtensionHeader. A jumbogram (payload length 0 with a
+    /// hop-by-hop jumbo option) is rejected by the padding-only rule.
+    pub fn parse(pkt: []const u8) Ip6Error!Parsed {
+        if (pkt.len < ip6_header_len) return error.Truncated;
+        if (pkt[0] >> 4 != 6) return error.BadVersion;
+        const plen: usize = std.mem.readInt(u16, pkt[4..6], .big);
+        const end = ip6_header_len + plen;
+        if (end > pkt.len) return error.BadTotalLength;
+        var nh = pkt[6];
+        var off: usize = ip6_header_len;
+        var count: usize = 0;
+        while (true) {
+            switch (nh) {
+                ext_hop_by_hop, ext_dest_opts => {
+                    if (nh == ext_hop_by_hop and off != ip6_header_len) return error.BadExtensionHeader;
+                    count += 1;
+                    if (count > max_ext_headers) return error.BadExtensionHeader;
+                    if (off + 2 > end) return error.Truncated;
+                    const hl = (@as(usize, pkt[off + 1]) + 1) * 8;
+                    if (off + hl > end) return error.Truncated;
+                    if (off + hl - ip6_header_len > max_ext_bytes) return error.BadExtensionHeader;
+                    try paddingOnly(pkt[off + 2 .. off + hl]);
+                    nh = pkt[off];
+                    off += hl;
+                },
+                ext_fragment => return error.Fragment,
+                ext_routing, ext_esp, ext_ah, ext_none, ext_mobility, ext_hip, ext_shim6, 253, 254 => return error.BadExtensionHeader,
+                else => break,
+            }
+        }
+        const b0: u32 = std.mem.readInt(u32, pkt[0..4], .big);
+        return .{
+            .header = .{
+                .traffic_class = @truncate(b0 >> 20),
+                .flow_label = @truncate(b0),
+                .next_header = nh,
+                .hop_limit = pkt[7],
+                .src = pkt[8..24].*,
+                .dst = pkt[24..40].*,
+            },
+            .header_len = off,
+            .payload = pkt[off..end],
+        };
+    }
+
+    /// Only Pad1 / PadN options (each PadN within the area).
+    fn paddingOnly(area: []const u8) Ip6Error!void {
+        var i: usize = 0;
+        while (i < area.len) {
+            switch (area[i]) {
+                0 => i += 1,
+                1 => {
+                    if (i + 1 >= area.len) return error.BadExtensionHeader;
+                    i += 2 + @as(usize, area[i + 1]);
+                    if (i > area.len) return error.BadExtensionHeader;
+                },
+                else => return error.BadExtensionHeader,
+            }
+        }
+    }
+
+    /// Writes the 40-byte header (no extension headers) for `payload_len`
+    /// bytes of payload.
+    pub fn write(h: Ip6, out: []u8, payload_len: usize) error{ BufferTooSmall, PacketTooLarge }!void {
+        if (out.len < ip6_header_len) return error.BufferTooSmall;
+        const plen = std.math.cast(u16, payload_len) orelse return error.PacketTooLarge;
+        const p = out[0..ip6_header_len];
+        std.mem.writeInt(u32, p[0..4], (@as(u32, 6) << 28) | (@as(u32, h.traffic_class) << 20) | h.flow_label, .big);
+        std.mem.writeInt(u16, p[4..6], plen, .big);
+        p[6] = h.next_header;
+        p[7] = h.hop_limit;
+        p[8..24].* = h.src;
+        p[24..40].* = h.dst;
+    }
+};
+
+const ext_hop_by_hop: u8 = 0;
+const ext_routing: u8 = 43;
+const ext_fragment: u8 = 44;
+const ext_esp: u8 = 50;
+const ext_ah: u8 = 51;
+const ext_none: u8 = 59;
+const ext_dest_opts: u8 = 60;
+const ext_mobility: u8 = 135;
+const ext_hip: u8 = 139;
+const ext_shim6: u8 = 140;
+
 // ---- TCP ---------------------------------------------------------------
 
 pub const Flags = packed struct(u8) {
@@ -176,6 +324,19 @@ pub const Flags = packed struct(u8) {
     cwr: bool = false,
 };
 
+pub const SackBlock = struct { start: u32, end: u32 };
+
+/// Up to `max_sack_blocks` SACK blocks (RFC 2018), as received or to send.
+/// Parsing checks only the encoding; the stack validates block contents.
+pub const Sack = struct {
+    blocks: [max_sack_blocks]SackBlock = undefined,
+    len: u8 = 0,
+
+    pub fn slice(s: *const Sack) []const SackBlock {
+        return s.blocks[0..@min(s.len, max_sack_blocks)];
+    }
+};
+
 pub const TcpOptions = struct {
     mss: ?u16 = null,
     /// Shift count as sent; parse clamps values above 14 to 14 (RFC 7323 2.3).
@@ -183,6 +344,9 @@ pub const TcpOptions = struct {
     sack_permitted: bool = false,
     /// TSval, TSecr. Parsed (validated) but not used by the stack.
     timestamp: ?[2]u32 = null,
+    /// SACK blocks (kind 5). A malformed SACK option is ignored (null),
+    /// not trusted and not fatal.
+    sack: ?Sack = null,
 
     /// Encoded length, padded to a multiple of 4.
     pub fn len(o: TcpOptions) usize {
@@ -191,11 +355,27 @@ pub const TcpOptions = struct {
         if (o.window_scale != null) n += 3;
         if (o.sack_permitted) n += 2;
         if (o.timestamp != null) n += 10;
+        if (o.sack) |s| if (s.slice().len > 0) {
+            n += 4 + 8 * s.slice().len; // NOP NOP kind len blocks
+        };
         return std.mem.alignForward(usize, n, 4);
     }
 
     fn write(o: TcpOptions, out: []u8) void {
         var i: usize = 0;
+        if (o.sack) |s| if (s.slice().len > 0) {
+            const blocks = s.slice();
+            out[i] = 1;
+            out[i + 1] = 1;
+            out[i + 2] = 5;
+            out[i + 3] = @intCast(2 + 8 * blocks.len);
+            i += 4;
+            for (blocks) |b| {
+                std.mem.writeInt(u32, out[i..][0..4], b.start, .big);
+                std.mem.writeInt(u32, out[i + 4 ..][0..4], b.end, .big);
+                i += 8;
+            }
+        };
         if (o.mss) |m| {
             out[i] = 2;
             out[i + 1] = 4;
@@ -256,7 +436,19 @@ pub const TcpOptions = struct {
                     if (l != 10) return error.BadOptions;
                     o.timestamp = .{ std.mem.readInt(u32, body[0..4], .big), std.mem.readInt(u32, body[4..8], .big) };
                 },
-                else => {}, // SACK blocks (5) and others: ignored
+                5 => {
+                    // 1..4 blocks of 8 bytes; anything else is ignored.
+                    const nb = body.len / 8;
+                    if (body.len % 8 == 0 and nb >= 1 and nb <= max_sack_blocks) {
+                        var s: Sack = .{ .len = @intCast(nb) };
+                        for (0..nb) |k| s.blocks[k] = .{
+                            .start = std.mem.readInt(u32, body[8 * k ..][0..4], .big),
+                            .end = std.mem.readInt(u32, body[8 * k + 4 ..][0..4], .big),
+                        };
+                        o.sack = s;
+                    }
+                },
+                else => {}, // others: skipped by length
             }
             i += l;
         }
@@ -349,7 +541,91 @@ pub fn icmp4Type(bytes: []const u8) ParseError!u8 {
     return bytes[0];
 }
 
-// ---- whole packets -----------------------------------------------------
+// ---- ICMPv6 echo -------------------------------------------------------
+
+pub const icmp6_echo_request: u8 = 128;
+pub const icmp6_echo_reply: u8 = 129;
+
+/// Validates an ICMPv6 message (length >= 8, checksum over the IPv6
+/// pseudo-header) and returns its type.
+pub fn icmp6Type(src: Addr, dst: Addr, bytes: []const u8) ParseError!u8 {
+    if (bytes.len < 8) return error.Truncated;
+    const n = std.math.cast(u32, bytes.len) orelse return error.BadTotalLength;
+    var c = pseudoHeader(src, dst, proto_icmp6, n);
+    c.add(bytes);
+    if (c.final() != 0) return error.BadChecksum;
+    return bytes[0];
+}
+
+/// The ICMPv6 checksum field value for `msg` (its checksum bytes zero).
+pub fn icmp6Checksum(src: Addr, dst: Addr, msg: []const u8) u16 {
+    var c = pseudoHeader(src, dst, proto_icmp6, @intCast(msg.len));
+    c.add(msg);
+    return c.final();
+}
+
+// ---- either family -----------------------------------------------------
+
+/// An IP packet of either family, validated (see Ip4.parse / Ip6.parse).
+pub const IpPacket = struct {
+    src: Addr,
+    dst: Addr,
+    /// Upper-layer protocol (after any IPv6 extension headers).
+    protocol: u8,
+    payload: []const u8,
+};
+
+pub fn parseIp(pkt: []const u8) Ip6Error!IpPacket {
+    if (pkt.len < 1) return error.Truncated;
+    switch (pkt[0] >> 4) {
+        4 => {
+            const p = try Ip4.parse(pkt);
+            return .{ .src = .{ .v4 = p.header.src }, .dst = .{ .v4 = p.header.dst }, .protocol = p.header.protocol, .payload = p.payload };
+        },
+        6 => {
+            const p = try Ip6.parse(pkt);
+            return .{ .src = .{ .v6 = p.header.src }, .dst = .{ .v6 = p.header.dst }, .protocol = p.header.next_header, .payload = p.payload };
+        },
+        else => return error.BadVersion,
+    }
+}
+
+/// Writes an IP header (no options / extension headers) for `src` ->
+/// `dst`; returns its length. `id` is used by IPv4 only.
+pub fn writeIpHeader(out: []u8, src: Addr, dst: Addr, protocol: u8, id: u16, payload_len: usize) BuildError!usize {
+    switch (src) {
+        .v4 => |s4| {
+            if (dst != .v4) return error.AddressFamilyMismatch;
+            try (Ip4{ .protocol = protocol, .id = id, .src = s4, .dst = dst.v4 }).write(out, payload_len);
+            return ip4_header_len;
+        },
+        .v6 => |s6| {
+            if (dst != .v6) return error.AddressFamilyMismatch;
+            try (Ip6{ .next_header = protocol, .src = s6, .dst = dst.v6 }).write(out, payload_len);
+            return ip6_header_len;
+        },
+    }
+}
+
+/// A complete IPv4 or IPv6 TCP packet `src` -> `dst` into `out`.
+pub fn buildTcp(out: []u8, src: Addr, dst: Addr, id: u16, seg: Tcp) BuildError![]u8 {
+    const hl = ipHeaderLen(src);
+    if (out.len < hl) return error.BufferTooSmall;
+    const n = try seg.write(src, dst, out[hl..]);
+    _ = try writeIpHeader(out, src, dst, proto_tcp, id, n);
+    return out[0 .. hl + n];
+}
+
+pub const TcpPacket = struct { ip: IpPacket, tcp: Tcp };
+
+/// Parses a TCP packet of either family (any validation failure is an error).
+pub fn parseTcp(pkt: []const u8) (Ip6Error || error{NotTcp})!TcpPacket {
+    const p = try parseIp(pkt);
+    if (p.protocol != proto_tcp) return error.NotTcp;
+    return .{ .ip = p, .tcp = try Tcp.parse(p.src, p.dst, p.payload) };
+}
+
+// ---- whole IPv4 packets -------------------------------------------------
 
 /// A complete IPv4/TCP packet into `out`; returns it.
 pub fn buildTcp4(out: []u8, ip: Ip4, seg: Tcp) error{ BufferTooSmall, PacketTooLarge }![]u8 {
@@ -449,4 +725,153 @@ test "parse rejects malformed packets" {
 test "mss for the tunnel mtu" {
     try std.testing.expectEqual(@as(u16, 1380), mssForMtu(1420));
     try std.testing.expectEqual(@as(u16, 0), mssForMtu(10));
+}
+/// The IPv6 pseudo-header written out byte by byte as RFC 8200 8.1 lays
+/// it out (an independent second implementation of `pseudoHeader`).
+fn referenceSum6(src: [16]u8, dst: [16]u8, protocol: u8, upper: []const u8) u16 {
+    var buf: [40 + 1600]u8 = undefined;
+    @memcpy(buf[0..16], &src);
+    @memcpy(buf[16..32], &dst);
+    std.mem.writeInt(u32, buf[32..36], @intCast(upper.len), .big);
+    buf[36] = 0;
+    buf[37] = 0;
+    buf[38] = 0;
+    buf[39] = protocol;
+    @memcpy(buf[40..][0..upper.len], upper);
+    return checksum(buf[0 .. 40 + upper.len]);
+}
+
+const ula_a = [16]u8{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+const ula_b = [16]u8{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
+test "ipv6 tcp: build -> parse, checksum agrees with the RFC 8200 layout, MSS 1360" {
+    var buf: [256]u8 = @splat(0);
+    const seg: Tcp = .{
+        .src_port = 40000,
+        .dst_port = 8420,
+        .seq = 1,
+        .ack = 2,
+        .flags = .{ .ack = true, .psh = true },
+        .window = 512,
+        .payload = "hello, v6 (odd)",
+    };
+    const pkt = try buildTcp(&buf, .{ .v6 = ula_a }, .{ .v6 = ula_b }, 0, seg);
+    try std.testing.expectEqual(@as(usize, 40 + 20 + 15), pkt.len);
+    const p = try parseTcp(pkt);
+    try std.testing.expectEqualStrings("hello, v6 (odd)", p.tcp.payload);
+    try std.testing.expect(p.ip.src.eql(.{ .v6 = ula_a }));
+    // The checksum field makes the reference sum come out zero.
+    try std.testing.expectEqual(@as(u16, 0), referenceSum6(ula_a, ula_b, proto_tcp, pkt[40..]));
+    // Corrupting any byte of the pseudo-header inputs is caught.
+    try std.testing.expectError(error.BadChecksum, Tcp.parse(.{ .v6 = ula_b }, .{ .v6 = ula_b }, pkt[40..]));
+    try std.testing.expectEqual(@as(u16, 1360), mssForMtu6(1420));
+    try std.testing.expectEqual(@as(u16, 1360), mssFor(.{ .v6 = ula_a }, 1420));
+    try std.testing.expectEqual(@as(u16, 1380), mssFor(.{ .v4 = .{ 10, 8, 0, 1 } }, 1420));
+    try std.testing.expectError(error.AddressFamilyMismatch, buildTcp(&buf, .{ .v6 = ula_a }, .{ .v4 = .{ 1, 2, 3, 4 } }, 0, seg));
+}
+
+test "ipv6 header fields round trip" {
+    var buf: [64]u8 = @splat(0);
+    try (Ip6{ .traffic_class = 0xab, .flow_label = 0xcdef1, .next_header = 99, .hop_limit = 7, .src = ula_a, .dst = ula_b }).write(&buf, 4);
+    const p = try Ip6.parse(buf[0..44]);
+    try std.testing.expectEqual(@as(u8, 0xab), p.header.traffic_class);
+    try std.testing.expectEqual(@as(u20, 0xcdef1), p.header.flow_label);
+    try std.testing.expectEqual(@as(u8, 99), p.header.next_header);
+    try std.testing.expectEqual(@as(u8, 7), p.header.hop_limit);
+    try std.testing.expectEqual(@as(usize, 4), p.payload.len);
+}
+
+test "ipv6 extension headers: padding-only skipped, everything else dropped" {
+    var buf: [256]u8 = @splat(0);
+    const tcp_len = 20;
+    // hop-by-hop (8 bytes: PadN 4) -> dest options (8 bytes: Pad1 x6) -> TCP
+    try (Ip6{ .next_header = 0, .src = ula_a, .dst = ula_b }).write(&buf, 16 + tcp_len);
+    buf[40] = 60; // next: dest opts
+    buf[41] = 0; // 8 bytes
+    buf[42] = 1; // PadN
+    buf[43] = 4;
+    buf[48] = proto_tcp;
+    buf[49] = 0;
+    const seg = try (Tcp{ .src_port = 1, .dst_port = 2, .seq = 3, .flags = .{ .syn = true }, .window = 1 }).write(.{ .v6 = ula_a }, .{ .v6 = ula_b }, buf[56..]);
+    try std.testing.expectEqual(@as(usize, tcp_len), seg);
+    const ok = try parseTcp(buf[0 .. 56 + tcp_len]);
+    try std.testing.expectEqual(@as(u16, 2), ok.tcp.dst_port);
+
+    var bad: [256]u8 = undefined;
+    // A real (non-padding) option in hop-by-hop: router alert.
+    @memcpy(&bad, &buf);
+    bad[42] = 5;
+    bad[43] = 2;
+    try std.testing.expectError(error.BadExtensionHeader, Ip6.parse(bad[0 .. 56 + tcp_len]));
+    // PadN running past the header.
+    @memcpy(&bad, &buf);
+    bad[43] = 9;
+    try std.testing.expectError(error.BadExtensionHeader, Ip6.parse(bad[0 .. 56 + tcp_len]));
+    // Hop-by-hop that is not first.
+    @memcpy(&bad, &buf);
+    bad[40] = 0;
+    try std.testing.expectError(error.BadExtensionHeader, Ip6.parse(bad[0 .. 56 + tcp_len]));
+    // Fragment, routing, ESP, no-next-header.
+    for ([_]struct { nh: u8, e: Ip6Error }{
+        .{ .nh = 44, .e = error.Fragment },
+        .{ .nh = 43, .e = error.BadExtensionHeader },
+        .{ .nh = 50, .e = error.BadExtensionHeader },
+        .{ .nh = 59, .e = error.BadExtensionHeader },
+    }) |case| {
+        @memcpy(&bad, &buf);
+        bad[6] = case.nh;
+        try std.testing.expectError(case.e, Ip6.parse(bad[0 .. 56 + tcp_len]));
+    }
+    // Chain longer than max_ext_headers (5 destination-option headers).
+    var long: [40 + 5 * 8]u8 = @splat(0);
+    try (Ip6{ .next_header = 60, .src = ula_a, .dst = ula_b }).write(&long, 5 * 8);
+    for (0..5) |k| long[40 + 8 * k] = if (k == 4) proto_tcp else 60;
+    try std.testing.expectError(error.BadExtensionHeader, Ip6.parse(&long));
+    // Extension header longer than the packet / than the byte budget.
+    @memcpy(&bad, &buf);
+    bad[41] = 200;
+    try std.testing.expectError(error.Truncated, Ip6.parse(bad[0 .. 56 + tcp_len]));
+    // Payload length beyond the packet; wrong version.
+    try std.testing.expectError(error.BadTotalLength, Ip6.parse(buf[0 .. 56 + tcp_len - 1]));
+    @memcpy(&bad, &buf);
+    bad[0] = 0x50;
+    try std.testing.expectError(error.BadVersion, parseIp(bad[0 .. 56 + tcp_len]));
+}
+
+test "icmpv6 echo checksum" {
+    var msg = [_]u8{ icmp6_echo_request, 0, 0, 0, 0x12, 0x34, 0, 1, 'p', 'i', 'n', 'g', '6' };
+    std.mem.writeInt(u16, msg[2..4], icmp6Checksum(.{ .v6 = ula_a }, .{ .v6 = ula_b }, &msg), .big);
+    try std.testing.expectEqual(icmp6_echo_request, try icmp6Type(.{ .v6 = ula_a }, .{ .v6 = ula_b }, &msg));
+    try std.testing.expectEqual(@as(u16, 0), referenceSum6(ula_a, ula_b, proto_icmp6, &msg));
+    try std.testing.expectError(error.BadChecksum, icmp6Type(.{ .v6 = ula_b }, .{ .v6 = ula_b }, &msg));
+}
+
+test "sack option: encode / decode, malformed ignored, option space" {
+    var buf: [128]u8 = @splat(0);
+    var s: Sack = .{ .len = 4 };
+    for (0..4) |k| s.blocks[k] = .{ .start = @intCast(1000 * k), .end = @intCast(1000 * k + 500) };
+    const seg: Tcp = .{ .src_port = 1, .dst_port = 2, .seq = 3, .ack = 4, .flags = .{ .ack = true }, .window = 5, .options = .{ .sack = s } };
+    try std.testing.expectEqual(@as(usize, 20 + 36), seg.headerLen());
+    const pkt = try buildTcp4(&buf, .{ .protocol = proto_tcp, .src = .{ 10, 8, 0, 2 }, .dst = .{ 10, 8, 0, 1 } }, seg);
+    const p = try parseTcp4(pkt);
+    try std.testing.expectEqual(@as(usize, 4), p.tcp.options.sack.?.slice().len);
+    try std.testing.expectEqual(@as(u32, 3500), p.tcp.options.sack.?.slice()[3].end);
+    // Malformed SACK lengths: ignored, the rest of the options still parse.
+    for ([_][]const u8{
+        &.{ 5, 2, 2, 4, 5, 0x34 },
+        &.{ 5, 9, 0, 0, 0, 1, 0, 0, 0, 2, 0 },
+        &.{ 5, 42 },
+    }) |area| {
+        const o = TcpOptions.parse(area) catch |e| {
+            // Lengths that leave the area are malformed options as before.
+            try std.testing.expectEqual(error.BadOptions, e);
+            continue;
+        };
+        try std.testing.expectEqual(@as(?Sack, null), o.sack);
+    }
+    // Five blocks (42 bytes) cannot fit: never produced, ignored if seen.
+    var five: [42]u8 = @splat(0);
+    five[0] = 5;
+    five[1] = 42;
+    try std.testing.expectEqual(@as(?Sack, null), (try TcpOptions.parse(&five)).sack);
 }

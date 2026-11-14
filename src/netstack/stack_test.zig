@@ -674,3 +674,230 @@ test "two stacks over a lossy, reordering link: data intact" {
     try lossyTransfer(3, 10_000, 10_000, 1 << 20);
     try lossyTransfer(4, 50_000, 20_000, 256 << 10);
 }
+
+// ---- SACK ------------------------------------------------------------------
+
+/// Passive open where the peer offers SACK (and window scaling).
+fn establishedSack(r: *Rig, l: root.Listener) !struct { st: root.Stream, snd: u32, rcv: u32 } {
+    const iss: u32 = 7000;
+    r.send(.{ .seq = iss, .flags = .{ .syn = true }, .options = .{ .mss = 1380, .window_scale = 7, .sack_permitted = true } });
+    const sa = try r.recv();
+    try t.expect(sa.flags.syn and sa.flags.ack and sa.options.sack_permitted);
+    r.send(.{ .seq = iss + 1, .ack = sa.seq +% 1, .flags = .{ .ack = true }, .window = 4096 });
+    const st = try l.accept();
+    try t.expect(st.debugConn().?.sack_ok);
+    return .{ .st = st, .snd = sa.seq +% 1, .rcv = iss + 1 };
+}
+
+fn sackOf(blocks: []const [2]u32) wire.Sack {
+    var s: wire.Sack = .{ .len = @intCast(blocks.len) };
+    for (blocks, 0..) |b, i| s.blocks[i] = .{ .start = b[0], .end = b[1] };
+    return s;
+}
+
+test "SACK: negotiated only when both SYNs offer it" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try r.established(l); // peer without SACK-permitted
+    try t.expect(!e.st.debugConn().?.sack_ok);
+    r.peer.peer.port = 40001;
+    const s = try establishedSack(&r, l);
+    try t.expect(s.st.debugConn().?.sack_ok);
+    // Our own SYN always offers it.
+    _ = try r.stack.dial(.{ .addr = peer_addr, .port = 9000 });
+    const syn = (try wire.parseTcp4(r.stack.output(&r.out).?)).tcp;
+    try t.expect(syn.options.sack_permitted);
+}
+
+test "SACK: three losses in one window are repaired without an RTO" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try establishedSack(&r, l);
+    const mss = 1380;
+    var data: [10 * mss]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 13);
+    try t.expectEqual(data.len, try e.st.write(&data));
+    var segs: [10]wire.Tcp = undefined;
+    for (&segs) |*sg| sg.* = try r.recv();
+    // Segments 1, 4 and 7 are lost; the peer SACKs what it got after each.
+    const lost = [_]usize{ 1, 4, 7 };
+    var have: [10]bool = @splat(true);
+    for (lost) |i| have[i] = false;
+    // ACK for segment 0, then one SACKing duplicate per later arrival.
+    const a0 = e.snd + mss;
+    r.send(.{ .seq = e.rcv, .ack = a0, .flags = .{ .ack = true }, .window = 4096 });
+    var blocks: [3][2]u32 = undefined;
+    for (2..10) |i| {
+        if (!have[i]) continue;
+        // Received ranges above a0, most recent first (as RFC 2018 says).
+        var nb: usize = 0;
+        var k: usize = i + 1;
+        while (k > 2 and nb < 3) {
+            k -= 1;
+            if (!have[k]) continue;
+            var start = k;
+            while (start > 2 and have[start - 1]) start -= 1;
+            blocks[nb] = .{ e.snd + @as(u32, @intCast(start * mss)), e.snd + @as(u32, @intCast((k + 1) * mss)) };
+            nb += 1;
+            k = start;
+        }
+        r.send(.{ .seq = e.rcv, .ack = a0, .flags = .{ .ack = true }, .window = 4096, .options = .{ .sack = sackOf(blocks[0..nb]) } });
+    }
+    // Holes 1 and 4 have more than 2 segments SACKed above them (RFC 6675
+    // IsLost): they go out at once, in order. Hole 7 has only 2 above it.
+    var resent: [4]u32 = undefined;
+    var n: usize = 0;
+    while (r.stack.output(&r.out)) |p| {
+        const sg = try r.peer.expect(p);
+        if (sg.payload.len == 0) continue;
+        if (n < resent.len) resent[n] = sg.seq;
+        n += 1;
+    }
+    try t.expectEqual(@as(usize, 2), n);
+    try t.expectEqual(segs[1].seq, resent[0]);
+    try t.expectEqual(segs[4].seq, resent[1]);
+    // They arrive: the cumulative ACK moves up to hole 7 (a partial ACK),
+    // which is retransmitted at once, not after an RTO.
+    r.send(.{ .seq = e.rcv, .ack = segs[7].seq, .flags = .{ .ack = true }, .window = 4096, .options = .{ .sack = sackOf(&.{.{ segs[8].seq, e.snd +% @as(u32, data.len) }}) } });
+    n = 0;
+    while (r.stack.output(&r.out)) |p| {
+        const sg = try r.peer.expect(p);
+        if (sg.payload.len == 0) continue;
+        if (n < resent.len) resent[n] = sg.seq;
+        n += 1;
+    }
+    try t.expectEqual(@as(usize, 1), n);
+    try t.expectEqual(segs[7].seq, resent[0]);
+    try t.expectEqual(@as(u64, 0), r.stack.stats().rto_expirations);
+    try t.expectEqual(@as(u64, 1), r.stack.stats().fast_retransmits);
+    // The cumulative ACK ends recovery; nothing is left outstanding.
+    r.send(.{ .seq = e.rcv, .ack = e.snd +% @as(u32, data.len), .flags = .{ .ack = true }, .window = 4096 });
+    const k = e.st.debugConn().?;
+    try t.expect(!k.in_recovery and k.sacked_len == 0 and k.snd_una == k.snd_max);
+}
+
+test "SACK: reneging is survived (data kept until cumulatively ACKed, scoreboard cleared on RTO)" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try establishedSack(&r, l);
+    const mss = 1380;
+    var data: [4 * mss]u8 = undefined;
+    @memset(&data, 'r');
+    _ = try e.st.write(&data);
+    for (0..4) |_| _ = try r.recv();
+    // The peer SACKs segments 2..3, then "forgets" them (reneges): it
+    // never ACKs anything again until our timeout.
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 4096, .options = .{ .sack = sackOf(&.{.{ e.snd + 2 * mss, e.snd + 4 * mss }}) } });
+    while (r.stack.output(&r.out)) |_| {}
+    try t.expect(e.st.debugConn().?.sacked_len == 1);
+    try r.fireNext();
+    const k = e.st.debugConn().?;
+    try t.expectEqual(@as(u8, 0), k.sacked_len);
+    // Go-back-N from snd_una covers the SACKed (reneged) data too: it is
+    // all still in the send buffer.
+    try t.expectEqual(@as(usize, 4 * mss), k.snd.len);
+    var got: usize = 0;
+    var safety: usize = 0;
+    while (got < 4 * mss and safety < 50) : (safety += 1) {
+        while (r.stack.output(&r.out)) |p| {
+            const sg = try r.peer.expect(p);
+            if (sg.payload.len == 0) continue;
+            try t.expectEqual(e.snd +% @as(u32, @intCast(got)), sg.seq);
+            got += sg.payload.len;
+            r.send(.{ .seq = e.rcv, .ack = sg.seq +% @as(u32, @intCast(sg.payload.len)), .flags = .{ .ack = true }, .window = 4096 });
+        }
+    }
+    try t.expectEqual(@as(usize, 4 * mss), got);
+}
+
+test "SACK: malicious blocks are ignored, never trusted" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try establishedSack(&r, l);
+    var data: [3 * 1380]u8 = undefined;
+    @memset(&data, 'm');
+    _ = try e.st.write(&data);
+    for (0..3) |_| _ = try r.recv();
+    const max = e.snd +% @as(u32, data.len);
+    const evil = [_][2]u32{
+        .{ max, max + 1000 }, // beyond snd_max
+        .{ e.snd + 500, e.snd + 100 }, // start after end
+        .{ e.snd -% 5000, e.snd }, // entirely below snd_una (D-SACK)
+        .{ e.snd +% 0x8000_0000, e.snd +% 0x8000_1000 }, // far away
+    };
+    for (evil) |b| r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 4096, .options = .{ .sack = sackOf(&.{b}) } });
+    const k = e.st.debugConn().?;
+    try t.expectEqual(@as(u8, 0), k.sacked_len);
+    try t.expectEqual(e.snd, k.snd_una);
+    try t.expectEqual(@as(u64, evil.len), r.stack.stats().sack_blocks_ignored);
+    // A block partly below snd_una is clipped, not rejected.
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 4096, .options = .{ .sack = sackOf(&.{.{ e.snd -% 10, e.snd + 100 }}) } });
+    const k2 = e.st.debugConn().?;
+    try t.expectEqual(@as(u8, 1), k2.sacked_len);
+    try t.expectEqual(e.snd, k2.sacked[0].start);
+}
+
+test "SACK: scoreboard is capped; past the cap the connection falls back to NewReno" {
+    var r: Rig = undefined;
+    try r.init(.{ .send_buffer = 128 * 1024 });
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try establishedSack(&r, l);
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff });
+    var data: [64 * 1024]u8 = undefined;
+    @memset(&data, 'c');
+    _ = try e.st.write(&data);
+    while (r.stack.output(&r.out)) |_| {}
+    // 4 one-byte blocks per ACK, 2 bytes apart: 40 disjoint ranges wanted.
+    var sent_blocks: usize = 0;
+    var off: u32 = 100;
+    for (0..10) |_| {
+        var bl: [4][2]u32 = undefined;
+        for (&bl) |*b| {
+            b.* = .{ e.snd + off, e.snd + off + 1 };
+            off += 2;
+        }
+        r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff, .options = .{ .sack = sackOf(&bl) } });
+        sent_blocks += 4;
+    }
+    const k = e.st.debugConn().?;
+    try t.expectEqual(@as(u8, tcp.max_sack_ranges), k.sacked_len);
+    try t.expect(k.sack_degraded);
+    try t.expect(!k.sack_recovery); // NewReno for this episode
+    try t.expectEqual(@as(u64, sent_blocks - tcp.max_sack_ranges), r.stack.stats().sack_blocks_ignored);
+    // A full ACK empties the scoreboard and re-enables SACK.
+    r.send(.{ .seq = e.rcv, .ack = k.snd_max, .flags = .{ .ack = true }, .window = 0xffff });
+    const k2 = e.st.debugConn().?;
+    try t.expect(!k2.sack_degraded and k2.sacked_len == 0);
+}
+
+test "SACK: the receiver reports out-of-order data, most recent block first" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try establishedSack(&r, l);
+    r.send(.{ .seq = e.rcv + 10, .ack = e.snd, .flags = .{ .ack = true }, .window = 4096, .payload = "bbbbb" });
+    var a = try r.recv();
+    try t.expectEqual(e.rcv, a.ack);
+    try t.expectEqual(e.rcv + 10, a.options.sack.?.slice()[0].start);
+    r.send(.{ .seq = e.rcv + 20, .ack = e.snd, .flags = .{ .ack = true }, .window = 4096, .payload = "ccccc" });
+    a = try r.recv();
+    const s = a.options.sack.?.slice();
+    try t.expectEqual(@as(usize, 2), s.len);
+    try t.expectEqual(e.rcv + 20, s[0].start); // the newest first
+    try t.expectEqual(e.rcv + 10, s[1].start);
+    // Filling the first gap merges; the remaining hole is still reported.
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 4096, .payload = "aaaaaaaaaa" });
+    a = try r.recv();
+    try t.expectEqual(e.rcv + 15, a.ack);
+    try t.expectEqual(@as(usize, 1), a.options.sack.?.slice().len);
+}
