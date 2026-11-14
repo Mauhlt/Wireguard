@@ -4,9 +4,13 @@
 //! needs a kernel driver, and Windows only loads signed kernel drivers, so a
 //! pure-userspace TUN is impossible. We use Wintun (by the WireGuard project,
 //! https://www.wintun.net/), whose wintun.dll carries the signed driver and
-//! installs it on first use. wintun.dll is loaded at runtime with
-//! LoadLibraryExW restricted to the application directory and System32, so a
-//! planted DLL in the current directory or PATH is never picked up.
+//! installs it on first use. wintun.dll is loaded at runtime by full path
+//! only (next to the executable, else System32; never the current directory
+//! or PATH), and only after its Authenticode signature checks out and is by
+//! "WireGuard LLC" (`openTrusted`): the file is opened denying writes and
+//! deletes, verified through that handle (WinVerifyTrust with hFile), and
+//! held open until LoadLibraryExW has mapped it, so it cannot be swapped
+//! between the check and the load. Its own imports come from System32 only.
 //!
 //! We never ship or commit wintun.dll. To run zwg on Windows:
 //!   1. Download the official signed release zip from https://www.wintun.net/
@@ -58,11 +62,22 @@ pub const wintun_hint =
     "release from https://www.wintun.net/, verify its SHA-256, and copy " ++
     "wintun\\bin\\<arch>\\wintun.dll next to zwg.exe";
 
+/// What to tell the user on `error.WintunUntrusted`.
+pub const untrusted_hint =
+    "wintun.dll is not validly signed by \"WireGuard LLC\" (Authenticode); refusing to load it. " ++
+    "Replace it with wintun\\bin\\<arch>\\wintun.dll from the official release at https://www.wintun.net/";
+
+/// The Authenticode signer every wintun.dll release is signed by (the
+/// certificate subject's CN and O).
+pub const wintun_signer = "WireGuard LLC";
+
 pub const OpenError = error{
     /// The process is not elevated (see the module doc).
     AccessDenied,
     /// wintun.dll is not next to the executable nor in System32.
     WintunNotFound,
+    /// wintun.dll is not validly Authenticode-signed by "WireGuard LLC".
+    WintunUntrusted,
     /// wintun.dll lacks an expected export (too old / not Wintun).
     WintunIncompatible,
     InvalidName,
@@ -99,13 +114,14 @@ const Api = struct {
     AllocateSendPacket: *const fn (session: Session, size: u32) callconv(.winapi) ?[*]u8,
     SendPacket: *const fn (session: Session, packet: [*]const u8) callconv(.winapi) void,
 
-    /// Load wintun.dll from the application directory or System32 only.
-    pub fn load() error{ WintunNotFound, WintunIncompatible }!Api {
-        const dll = k32.LoadLibraryExW(
-            std.unicode.utf8ToUtf16LeStringLiteral("wintun.dll"),
-            null,
-            k32.LOAD_LIBRARY_SEARCH_APPLICATION_DIR | k32.LOAD_LIBRARY_SEARCH_SYSTEM32,
-        ) orelse return error.WintunNotFound;
+    /// Load wintun.dll by full path (next to the executable, else
+    /// System32), verified first and held open while it is mapped.
+    pub fn load() error{ WintunNotFound, WintunUntrusted, WintunIncompatible }!Api {
+        var path_buf: [path_max]u16 = undefined;
+        const path = locate(&path_buf, null) orelse return error.WintunNotFound;
+        const file = try openTrusted(path);
+        defer _ = k32.CloseHandle(file);
+        const dll = k32.LoadLibraryExW(path.ptr, null, k32.LOAD_LIBRARY_SEARCH_SYSTEM32) orelse return error.WintunNotFound;
         errdefer _ = k32.FreeLibrary(dll);
         var api: Api = undefined;
         api.dll = dll;
@@ -136,10 +152,101 @@ fn wintunLogger(level: c_int, timestamp: u64, message: [*:0]const u16) callconv(
 /// Is wintun.dll loadable, and which driver version is running (0 = driver
 /// not loaded yet; it loads when the first adapter is created)? Needs no
 /// privileges; used by diagnostics and tests.
-pub fn probe() error{ WintunNotFound, WintunIncompatible }!u32 {
+pub fn probe() error{ WintunNotFound, WintunUntrusted, WintunIncompatible }!u32 {
     var api = try Api.load();
     defer api.unload();
     return api.GetRunningDriverVersion();
+}
+
+// ---- finding and trusting wintun.dll ------------------------------------------------
+
+pub const path_max = 600;
+
+/// For an elevated process: search only System32 for DLLs loaded without
+/// a full path (and for the imports of those loaded with one), never the
+/// application directory, the current directory or PATH. Call first thing.
+pub fn restrictDllSearch() void {
+    _ = k32.SetDefaultDllDirectories(k32.LOAD_LIBRARY_SEARCH_SYSTEM32);
+}
+
+pub const Location = enum { app_dir, system32 };
+
+/// The full path wintun.dll is loaded from: next to the executable if it is
+/// there, else System32's; null if neither exists. `from` (optional) says
+/// which.
+pub fn locate(buf: *[path_max]u16, from: ?*Location) ?[:0]const u16 {
+    const n = k32.GetModuleFileNameW(null, buf, path_max);
+    if (n != 0 and n < path_max) {
+        const sep = std.mem.lastIndexOfScalar(u16, buf[0..n], '\\') orelse 0;
+        if (appendName(buf, sep)) |p| if (k32.GetFileAttributesW(p.ptr) != k32.INVALID_FILE_ATTRIBUTES) {
+            if (from) |f| f.* = .app_dir;
+            return p;
+        };
+    }
+    const m = k32.GetSystemDirectoryW(buf, path_max);
+    if (m == 0 or m >= path_max) return null;
+    const p = appendName(buf, m) orelse return null;
+    if (k32.GetFileAttributesW(p.ptr) == k32.INVALID_FILE_ATTRIBUTES) return null;
+    if (from) |f| f.* = .system32;
+    return p;
+}
+
+/// `buf[0..dir_len] ++ "\wintun.dll"`, NUL-terminated.
+fn appendName(buf: *[path_max]u16, dir_len: usize) ?[:0]const u16 {
+    const file = std.unicode.utf8ToUtf16LeStringLiteral("\\wintun.dll");
+    if (dir_len + file.len + 1 > path_max) return null;
+    @memcpy(buf[dir_len..][0..file.len], file);
+    buf[dir_len + file.len] = 0;
+    return buf[0 .. dir_len + file.len :0];
+}
+
+/// Open `path` for reading, denying writes and deletes to everyone else
+/// while the handle is open (so the file cannot change or be swapped), and
+/// check through that handle that it is Authenticode-signed by "WireGuard
+/// LLC" with a chain to a trusted root. Caller closes the handle.
+pub fn openTrusted(path: [:0]const u16) error{ WintunNotFound, WintunUntrusted }!HANDLE {
+    const h = k32.CreateFileW(path.ptr, k32.GENERIC_READ, k32.FILE_SHARE_READ, null, k32.OPEN_EXISTING, k32.FILE_ATTRIBUTE_NORMAL, null);
+    if (h == k32.INVALID_HANDLE_VALUE) return error.WintunNotFound;
+    errdefer _ = k32.CloseHandle(h);
+    if (!signedBy(path, h, wintun_signer)) return error.WintunUntrusted;
+    return h;
+}
+
+/// WinVerifyTrust (generic Authenticode policy, no UI, no network: cached
+/// revocation data only) on the open file, then the leaf signer
+/// certificate's CN and O must both be `signer`.
+fn signedBy(path: [:0]const u16, h: HANDLE, signer: []const u8) bool {
+    var file: wt.FILE_INFO = .{ .path = path.ptr, .file = h };
+    var data: wt.DATA = .{ .file = &file, .state_action = wt.STATEACTION_VERIFY };
+    const rc = wt.WinVerifyTrust(null, &wt.ACTION_GENERIC_VERIFY_V2, &data);
+    defer {
+        data.state_action = wt.STATEACTION_CLOSE;
+        _ = wt.WinVerifyTrust(null, &wt.ACTION_GENERIC_VERIFY_V2, &data);
+    }
+    if (rc != 0) {
+        log.info("wintun.dll: WinVerifyTrust: 0x{x}", .{@as(u32, @bitCast(rc))});
+        return false;
+    }
+    const state = data.state_data orelse return false;
+    const prov = wt.WTHelperProvDataFromStateData(state) orelse return false;
+    const sgnr = wt.WTHelperGetProvSignerFromChain(prov, 0, 0, 0) orelse return false;
+    const cert = wt.WTHelperGetProvCertFromChain(sgnr, 0) orelse return false;
+    const ctx = cert.cert orelse return false;
+    inline for (.{ wt.OID_COMMON_NAME, wt.OID_ORGANIZATION_NAME }) |oid| {
+        var name: [128]u16 = undefined;
+        const n = wt.CertGetNameStringW(ctx, wt.CERT_NAME_ATTR_TYPE, 0, oid, &name, name.len);
+        if (n <= 1 or !nameIs(name[0 .. n - 1], signer)) {
+            log.info("wintun.dll: signed, but not by {s}", .{signer});
+            return false;
+        }
+    }
+    return true;
+}
+
+fn nameIs(w: []const u16, ascii: []const u8) bool {
+    if (w.len != ascii.len) return false;
+    for (w, ascii) |a, b| if (a != b) return false;
+    return true;
 }
 
 // ---- the adapter -----------------------------------------------------------
@@ -401,11 +508,77 @@ fn lastError() u32 {
 }
 
 const k32 = struct {
-    const LOAD_LIBRARY_SEARCH_APPLICATION_DIR: u32 = 0x0000_0200;
     const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    const OPEN_EXISTING: u32 = 3;
+    const CREATE_ALWAYS: u32 = 2;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+    const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(~@as(usize, 0));
     extern "kernel32" fn LoadLibraryExW(name: [*:0]const u16, file: ?HANDLE, flags: u32) callconv(.winapi) ?HMODULE;
     extern "kernel32" fn GetProcAddress(module: HMODULE, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
     extern "kernel32" fn FreeLibrary(module: HMODULE) callconv(.winapi) c_int;
+    extern "kernel32" fn SetDefaultDllDirectories(flags: u32) callconv(.winapi) c_int;
+    extern "kernel32" fn GetModuleFileNameW(module: ?HMODULE, buf: [*]u16, len: u32) callconv(.winapi) u32;
+    extern "kernel32" fn GetSystemDirectoryW(buf: [*]u16, len: u32) callconv(.winapi) u32;
+    extern "kernel32" fn GetFileAttributesW(name: [*:0]const u16) callconv(.winapi) u32;
+    extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, disposition: u32, flags: u32, template: ?HANDLE) callconv(.winapi) HANDLE;
+    extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) c_int;
+    extern "kernel32" fn ReadFile(h: HANDLE, buf: [*]u8, len: u32, read: ?*u32, ov: ?*anyopaque) callconv(.winapi) c_int;
+    extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, len: u32, written: ?*u32, ov: ?*anyopaque) callconv(.winapi) c_int;
+    extern "kernel32" fn GetEnvironmentVariableW(name: [*:0]const u16, buf: ?[*]u16, len: u32) callconv(.winapi) u32;
+};
+
+/// wintrust.h / wincrypt.h: Authenticode verification.
+const wt = struct {
+    const GUID = extern struct { a: u32, b: u16, c: u16, d: [8]u8 };
+    /// WINTRUST_ACTION_GENERIC_VERIFY_V2 {00AAC56B-CD44-11D0-8CC2-00C04FC295EE}
+    const ACTION_GENERIC_VERIFY_V2: GUID = .{ .a = 0x00AAC56B, .b = 0xCD44, .c = 0x11D0, .d = .{ 0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE } };
+    const UI_NONE: u32 = 2;
+    const REVOKE_NONE: u32 = 0;
+    const CHOICE_FILE: u32 = 1;
+    const STATEACTION_VERIFY: u32 = 1;
+    const STATEACTION_CLOSE: u32 = 2;
+    const REVOCATION_CHECK_NONE: u32 = 0x10;
+    const CACHE_ONLY_URL_RETRIEVAL: u32 = 0x1000;
+    const DISABLE_MD2_MD4: u32 = 0x2000;
+    const CERT_NAME_ATTR_TYPE: u32 = 3;
+    const OID_COMMON_NAME: [*:0]const u8 = "2.5.4.3";
+    const OID_ORGANIZATION_NAME: [*:0]const u8 = "2.5.4.10";
+
+    /// WINTRUST_FILE_INFO
+    const FILE_INFO = extern struct {
+        size: u32 = @sizeOf(FILE_INFO),
+        path: [*:0]const u16,
+        file: ?HANDLE,
+        known_subject: ?*const GUID = null,
+    };
+    /// WINTRUST_DATA
+    const DATA = extern struct {
+        size: u32 = @sizeOf(DATA),
+        policy_callback_data: ?*anyopaque = null,
+        sip_client_data: ?*anyopaque = null,
+        ui_choice: u32 = UI_NONE,
+        revocation_checks: u32 = REVOKE_NONE,
+        union_choice: u32 = CHOICE_FILE,
+        file: *FILE_INFO,
+        state_action: u32,
+        state_data: ?HANDLE = null,
+        url_reference: ?[*:0]const u16 = null,
+        prov_flags: u32 = REVOCATION_CHECK_NONE | CACHE_ONLY_URL_RETRIEVAL | DISABLE_MD2_MD4,
+        ui_context: u32 = 0,
+        signature_settings: ?*anyopaque = null,
+    };
+    /// CRYPT_PROVIDER_CERT (only the leading fields are read).
+    const PROVIDER_CERT = extern struct { size: u32, cert: ?*const anyopaque };
+
+    extern "wintrust" fn WinVerifyTrust(hwnd: ?*anyopaque, action: *const GUID, data: *DATA) callconv(.winapi) i32;
+    extern "wintrust" fn WTHelperProvDataFromStateData(state: HANDLE) callconv(.winapi) ?*anyopaque;
+    extern "wintrust" fn WTHelperGetProvSignerFromChain(prov: *anyopaque, signer: u32, counter_signer: c_int, counter_index: u32) callconv(.winapi) ?*anyopaque;
+    extern "wintrust" fn WTHelperGetProvCertFromChain(signer: *anyopaque, index: u32) callconv(.winapi) ?*const PROVIDER_CERT;
+    extern "crypt32" fn CertGetNameStringW(cert: *const anyopaque, kind: u32, flags: u32, type_para: ?*const anyopaque, name: [*]u16, len: u32) callconv(.winapi) u32;
 };
 
 const advapi32 = struct {
@@ -534,9 +707,120 @@ test "elevation check runs without privileges" {
 test "wintun.dll probe (skipped when the DLL is not installed)" {
     const version = probe() catch |e| switch (e) {
         error.WintunNotFound => return error.SkipZigTest,
-        error.WintunIncompatible => return e,
+        error.WintunUntrusted, error.WintunIncompatible => return e,
     };
     _ = version;
+}
+
+/// The official signed wintun.dll the owner keeps for builds
+/// (`-Dwintun=%LOCALAPPDATA%\zwg-deps\wintun`), or null.
+fn depsWintun(buf: *[path_max]u16) ?[:0]const u16 {
+    const n = k32.GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA"), buf, path_max);
+    if (n == 0 or n >= path_max) return null;
+    const arch = switch (@import("builtin").cpu.arch) {
+        .x86_64 => "amd64",
+        .aarch64 => "arm64",
+        .x86 => "x86",
+        else => "arm",
+    };
+    inline for (.{ "\\zwg-deps\\wintun\\wintun\\bin\\", "\\zwg-deps\\wintun\\bin\\" }) |mid| {
+        const rest = std.unicode.utf8ToUtf16LeStringLiteral(mid ++ arch ++ "\\wintun.dll");
+        if (n + rest.len + 1 <= path_max) {
+            @memcpy(buf[n..][0..rest.len], rest);
+            buf[n + rest.len] = 0;
+            const p = buf[0 .. n + rest.len :0];
+            if (k32.GetFileAttributesW(p.ptr) != k32.INVALID_FILE_ATTRIBUTES) return p;
+        }
+    }
+    return null;
+}
+
+fn readWhole(gpa: std.mem.Allocator, h: HANDLE) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    var chunk: [65536]u8 = undefined;
+    while (true) {
+        var n: u32 = 0;
+        if (k32.ReadFile(h, &chunk, chunk.len, &n, null) == 0) return error.Unexpected;
+        if (n == 0) break;
+        try list.appendSlice(gpa, chunk[0..n]);
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+fn writeTemp(dir: std.Io.Dir, name: []const u8, data: []const u8, out: *[path_max]u16) ![:0]const u16 {
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = data });
+    var pbuf: [path_max * 3]u8 = undefined;
+    const dn = try dir.realPath(std.testing.io, &pbuf);
+    const full = try std.fmt.bufPrint(pbuf[dn..], "\\{s}", .{name});
+    const len = try std.unicode.utf8ToUtf16Le(out[0 .. path_max - 1], pbuf[0 .. dn + full.len]);
+    out[len] = 0;
+    return out[0..len :0];
+}
+
+test "Authenticode: the official wintun.dll is trusted, a tampered or stripped copy is not" {
+    var buf: [path_max]u16 = undefined;
+    const real = depsWintun(&buf) orelse return error.SkipZigTest;
+    const h = try openTrusted(real);
+    // The open handle denies writes: nobody can change the file meanwhile.
+    const w = k32.CreateFileW(real.ptr, k32.GENERIC_WRITE, 1 | 2 | 4, null, k32.OPEN_EXISTING, k32.FILE_ATTRIBUTE_NORMAL, null);
+    if (w != k32.INVALID_HANDLE_VALUE) {
+        _ = k32.CloseHandle(w);
+        _ = k32.CloseHandle(h);
+        return error.TestUnexpectedResult;
+    }
+    const gpa = std.testing.allocator;
+    const bytes = try readWhole(gpa, h);
+    _ = k32.CloseHandle(h);
+    defer gpa.free(bytes);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "MZ"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A byte-identical copy elsewhere is still the signed file.
+    var p1: [path_max]u16 = undefined;
+    _ = k32.CloseHandle(try openTrusted(try writeTemp(tmp.dir, "copy.dll", bytes, &p1)));
+
+    // Tampered: one byte of the code changed, the signature no longer matches.
+    const tampered = try gpa.dupe(u8, bytes);
+    defer gpa.free(tampered);
+    tampered[0x1000] ^= 0xff;
+    var p2: [path_max]u16 = undefined;
+    try std.testing.expectError(error.WintunUntrusted, openTrusted(try writeTemp(tmp.dir, "tampered.dll", tampered, &p2)));
+
+    // Unsigned: the certificate table removed (security data directory zeroed).
+    const stripped = try gpa.dupe(u8, bytes);
+    defer gpa.free(stripped);
+    const pe = std.mem.readInt(u32, stripped[0x3c..0x40], .little);
+    const magic = std.mem.readInt(u16, stripped[pe + 24 ..][0..2], .little);
+    const dirs_at = pe + 24 + @as(usize, if (magic == 0x20b) 112 else 96);
+    const sec = dirs_at + 4 * 8; // IMAGE_DIRECTORY_ENTRY_SECURITY
+    const cert_off = std.mem.readInt(u32, stripped[sec..][0..4], .little);
+    try std.testing.expect(cert_off != 0 and cert_off < stripped.len);
+    @memset(stripped[sec..][0..8], 0);
+    var p3: [path_max]u16 = undefined;
+    try std.testing.expectError(error.WintunUntrusted, openTrusted(try writeTemp(tmp.dir, "unsigned.dll", stripped[0..cert_off], &p3)));
+
+    // Missing.
+    var p4: [path_max]u16 = undefined;
+    const missing = try writeTemp(tmp.dir, "x", "", &p4);
+    p4[missing.len - 1] = 'y';
+    try std.testing.expectError(error.WintunNotFound, openTrusted(missing));
+}
+
+test "Authenticode: an unsigned executable (this test binary) is refused" {
+    var buf: [path_max]u16 = undefined;
+    const n = k32.GetModuleFileNameW(null, &buf, path_max);
+    try std.testing.expect(n != 0 and n < path_max);
+    buf[n] = 0;
+    try std.testing.expectError(error.WintunUntrusted, openTrusted(buf[0..n :0]));
+}
+
+test "wintun.dll is located by full path only (next to the executable, else System32)" {
+    var buf: [path_max]u16 = undefined;
+    const p = locate(&buf, null) orelse return error.SkipZigTest;
+    try std.testing.expect(p.len > 3 and p[1] == ':' and p[2] == '\\');
+    try std.testing.expect(nameIs(p[p.len - "\\wintun.dll".len ..], "\\wintun.dll"));
 }
 
 test "open refuses cleanly when not elevated" {

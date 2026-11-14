@@ -165,7 +165,7 @@ fn runTunnel(paths: ?*const store.Paths) state.Exit {
     const mtu = c.interface.mtu orelse tun.default_mtu;
     var native = tun.Native.open(g.name, .{ .mtu = mtu }) catch |err| {
         log.print("cannot create the Wintun adapter: {s}", .{@errorName(err)});
-        return if (err == error.WintunNotFound) .wintun_missing else .adapter_failed;
+        return if (err == error.WintunNotFound or err == error.WintunUntrusted) .wintun_missing else .adapter_failed;
     };
     defer native.close();
     const t = native.tun();

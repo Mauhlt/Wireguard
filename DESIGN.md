@@ -138,7 +138,8 @@ A small CLI `zwg` (up/down a .conf, show status like `wg show`, genkey/pubkey).
 `Tun` interface: `open(name, mtu)`, `readable event handle` (for the device's
 wait), `read(buf) ?[]u8`, `write(packet)`, `setAddress(cidr)`, `mtu`, `close`.
 Backends: Windows (Wintun — a signed kernel driver; load wintun.dll at
-runtime, do NOT ship it; document the exception: a userspace TUN on Windows
+runtime by full path after checking its Authenticode signer is WireGuard
+LLC, do NOT ship it; document the exception: a userspace TUN on Windows
 needs a signed driver), Linux (/dev/net/tun), macOS (utun via
 PF_SYSTEM/SYSPROTO_CONTROL), iOS (NEPacketTunnelProvider packetFlow: a
 callback adapter, no fd). Plus the test harness: known-answer tests for every

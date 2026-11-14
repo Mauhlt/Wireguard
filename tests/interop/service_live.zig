@@ -20,7 +20,9 @@
 //!     Administrators), the store opens through the installer's verifying
 //!     `Dirs.openExisting`, the stored file is ciphertext, and an
 //!     ordinary-user token can neither open it nor create anything in the
-//!     store;
+//!     store; the service's zwg.exe is byte-identical to the installing
+//!     one and its wintun.dll (if copied) passes the Authenticode check
+//!     (signed by WireGuard LLC) the service applies before loading it;
 //!  5. AS AN ORDINARY USER (impersonating this user's token with
 //!     Administrators deny-only, medium integrity): reads the status over
 //!     the control pipe until the handshake with the peer shows;
@@ -140,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
     }
     drive.shredFile(io, conf_path, conf.len); // the service has its own (encrypted) copy now
 
-    try checkStore(gpa);
+    try checkStore(gpa, zwg_path);
 
     drive.step("as an ordinary user: status over the control pipe until the handshake shows", .{});
     try waitForHandshake(gpa, io, peer_keys.public);
@@ -303,7 +305,7 @@ fn dataBothWays(io: Io, peer_tun: *tun.UdpTun) !void {
     return drive.fail("the reply pushed into the peer's TUN never reached the socket", .{});
 }
 
-fn checkStore(gpa: std.mem.Allocator) !void {
+fn checkStore(gpa: std.mem.Allocator, zwg_path: []const u8) !void {
     drive.step("the store: under Program Files, plain protected directories, encrypted file, closed to ordinary users", .{});
     const p = try svc.store.Paths.init(name);
     {
@@ -343,6 +345,25 @@ fn checkStore(gpa: std.mem.Allocator) !void {
         }
     }
     std.debug.print("  {s}: protected, {d} bytes of DPAPI ciphertext, ordinary user denied\n", .{ p.conf(), blob.len });
+
+    // What the service runs: the installer's own zwg.exe, byte for byte,
+    // and a wintun.dll that passes the service's signature check.
+    {
+        var b: [400]u8 = undefined;
+        const ours = try svc.store.readAll(gpa, zwg_path, svc.store.max_binary_bytes);
+        defer gpa.free(ours);
+        const theirs = try svc.store.readAll(gpa, try p.inDir(&b, svc.store.exe_file), svc.store.max_binary_bytes);
+        defer gpa.free(theirs);
+        if (!std.mem.eql(u8, ours, theirs)) return drive.fail("the service's zwg.exe differs from {s}", .{zwg_path});
+        const dll = try p.inDir(&b, svc.store.wintun_file);
+        if (svc.store.exists(dll)) {
+            var w: [tun.windows.path_max]u16 = undefined;
+            const dll_w = try win.W(&w, dll);
+            const h = tun.windows.openTrusted(dll_w) catch |err| return drive.fail("the service's wintun.dll: {s}", .{@errorName(err)});
+            _ = win.CloseHandle(h);
+            std.debug.print("  {s}: signed by {s}\n", .{ dll, tun.windows.wintun_signer });
+        } else std.debug.print("  no wintun.dll copied (the service loads System32's, after the same check)\n", .{});
+    }
 }
 
 /// A store directory: a plain directory (not a junction / symlink), owned

@@ -64,6 +64,8 @@ pub const Result = enum(u8) {
     stop_timeout = 14,
     marked_for_delete = 15,
     cancelled = 16,
+    wintun_untrusted = 17,
+    image_changed = 18,
     /// 32 + state.Exit: the service started but stopped with that reason.
     service_exit_base = 32,
     _,
@@ -91,6 +93,8 @@ pub const Result = enum(u8) {
             .stop_timeout => "the service did not stop in time (it is marked for deletion)",
             .marked_for_delete => "a previous service of that name is still being deleted; close Services/sc and retry",
             .cancelled => "the UAC prompt was declined; nothing changed",
+            .wintun_untrusted => tun.windows.untrusted_hint,
+            .image_changed => "zwg.exe on disk is no longer the program that is running (replaced during the install?); nothing installed",
             else => if (@intFromEnum(r) >= 32 and @intFromEnum(r) - 32 <= @intFromEnum(state.Exit.bad_arguments))
                 @as(state.Exit, @enumFromInt(@intFromEnum(r) - 32)).message()
             else
@@ -259,9 +263,26 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
         error.NotInstalled => {},
         else => return .service_failed,
     }
-    // Wintun must be loadable from where the service will look (its own
-    // directory, where we copy the DLL from next to us, or System32).
-    _ = tun.windows.probe() catch return .wintun_missing;
+    // What the service will run, opened now and held, denying writes and
+    // deletes, until copied from these very handles: this process's own
+    // image (the file on disk must still be the one it was started from)
+    // and wintun.dll from where the service will look (next to us: copied
+    // along; else System32's), Authenticode-signed by WireGuard LLC. The
+    // DLL is never loaded here: this process is elevated, and the
+    // directory it came from may be user-writable.
+    const self_file = win.openRunningImage() catch |err| {
+        _ = storeFail("open zwg.exe", err);
+        return if (err == error.NotRunningImage) .image_changed else .failed;
+    };
+    defer _ = win.CloseHandle(self_file);
+    var dll_w: [tun.windows.path_max]u16 = undefined;
+    var dll_from: tun.windows.Location = undefined;
+    const dll_path = tun.windows.locate(&dll_w, &dll_from) orelse return .wintun_missing;
+    const dll_file = tun.windows.openTrusted(dll_path) catch |err| return switch (err) {
+        error.WintunUntrusted => .wintun_untrusted,
+        error.WintunNotFound => .wintun_missing,
+    };
+    defer _ = win.CloseHandle(dll_file);
 
     // Each store directory is opened and verified once, and stays open
     // (not deletable, not renamable) until this function returns; every
@@ -278,22 +299,16 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
         removeFiles(&dirs, &paths);
     };
 
-    // What the service runs: copies in the protected tree.
-    var self_w: [600]u16 = undefined;
-    const self = win.selfExePath(&self_w) catch return .failed;
-    var self_buf: [1800]u8 = undefined;
-    const self_n = std.unicode.utf16LeToUtf8(&self_buf, self) catch return .failed;
-    const self_path = self_buf[0..self_n];
+    // What the service runs: copies in the protected tree, from the held
+    // and verified handles above.
     var exe_buf: [400]u8 = undefined;
     const exe_path = paths.inDir(&exe_buf, store.exe_file) catch return .store_failed;
-    copyFile(gpa, self_path, &dirs, store.exe_file) catch |err| {
+    store.copyInto(gpa, self_file, dirs.dir.?, store.exe_file) catch |err| {
         log.print("copy zwg.exe: {s}", .{@errorName(err)});
         return storeFail("copy zwg.exe", err);
     };
-    var dll_src_buf: [1800]u8 = undefined;
-    const dll_src = std.fmt.bufPrint(&dll_src_buf, "{s}\\" ++ store.wintun_file, .{std.fs.path.dirname(self_path) orelse "."}) catch return .store_failed;
-    if (store.exists(dll_src)) {
-        copyFile(gpa, dll_src, &dirs, store.wintun_file) catch |err| {
+    if (dll_from == .app_dir) {
+        store.copyInto(gpa, dll_file, dirs.dir.?, store.wintun_file) catch |err| {
             log.print("copy wintun.dll: {s}", .{@errorName(err)});
             return storeFail("copy wintun.dll", err);
         };
@@ -404,16 +419,6 @@ fn removeFiles(dirs: *store.Dirs, paths: *const store.Paths) void {
         store.deleteAt(d, store.wintun_file) catch {};
     }
     dirs.remove(paths);
-}
-
-/// Copy `from` (a path outside the store) into the tunnel's open directory.
-fn copyFile(gpa: std.mem.Allocator, from: []const u8, dirs: *const store.Dirs, file: []const u8) store.Error!void {
-    var wbuf: [600]u16 = undefined;
-    const w = win.W(&wbuf, from) catch return error.NameTooLong;
-    const h = win.CreateFileW(w.ptr, win.GENERIC_READ, win.FILE_SHARE_READ, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
-    if (h == win.INVALID_HANDLE_VALUE) return error.NotFound;
-    defer _ = win.CloseHandle(h);
-    try store.copyInto(gpa, h, dirs.dir orelse return error.NotFound, file);
 }
 
 // ---- unelevated: list, show, down, up ----------------------------------------------

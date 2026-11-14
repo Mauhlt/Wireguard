@@ -158,6 +158,16 @@ pub extern "kernel32" fn GetSystemDirectoryW(buf: [*]u16, len: u32) callconv(.wi
 pub extern "kernel32" fn GetFileInformationByHandleEx(h: HANDLE, class: c_int, info: *anyopaque, len: u32) callconv(.winapi) BOOL;
 pub extern "kernel32" fn SetFileInformationByHandle(h: HANDLE, class: c_int, info: *const anyopaque, len: u32) callconv(.winapi) BOOL;
 
+pub extern "kernel32" fn CreateFileMappingW(file: HANDLE, sa: ?*SECURITY_ATTRIBUTES, protect: u32, size_high: u32, size_low: u32, name: ?LPCWSTR) callconv(.winapi) ?HANDLE;
+pub extern "kernel32" fn MapViewOfFile(mapping: HANDLE, access: u32, off_high: u32, off_low: u32, size: usize) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn UnmapViewOfFile(base: *const anyopaque) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetModuleHandleW(name: ?LPCWSTR) callconv(.winapi) ?*anyopaque;
+/// STATUS_SUCCESS (0) when both views are backed by the same file: the
+/// loader's own "is this the file that image came from" check.
+pub extern "ntdll" fn NtAreMappedFilesTheSame(image_view: *const anyopaque, file_view: *const anyopaque) callconv(.winapi) u32;
+pub const PAGE_READONLY: u32 = 0x02;
+pub const FILE_MAP_READ: u32 = 0x04;
+
 pub const FileBasicInfo: c_int = 0;
 pub const FileDispositionInfo: c_int = 4;
 pub const FileAttributeTagInfo: c_int = 9;
@@ -481,6 +491,30 @@ pub fn selfExePath(buf: []u16) error{Unexpected}![:0]u16 {
     return buf[0..n :0];
 }
 
+/// This process's executable, opened for reading while denying writes and
+/// deletes to everyone else, and verified to be the very file the running
+/// image was mapped from (not something put at the same path since: a
+/// running .exe can be renamed away). Caller closes.
+pub fn openRunningImage() error{ Unexpected, NotRunningImage }!HANDLE {
+    var buf: [600]u16 = undefined;
+    const path = try selfExePath(&buf);
+    const h = CreateFileW(path.ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    if (h == INVALID_HANDLE_VALUE) return error.NotRunningImage;
+    errdefer _ = CloseHandle(h);
+    if (!isRunningImage(h)) return error.NotRunningImage;
+    return h;
+}
+
+/// Is the open file `h` the one this process's image was loaded from?
+pub fn isRunningImage(h: HANDLE) bool {
+    const mapping = CreateFileMappingW(h, null, PAGE_READONLY, 0, 0, null) orelse return false;
+    defer _ = CloseHandle(mapping);
+    const view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) orelse return false;
+    defer _ = UnmapViewOfFile(view);
+    const image = GetModuleHandleW(null) orelse return false;
+    return NtAreMappedFilesTheSame(image, view) == 0;
+}
+
 /// True when the process token is elevated.
 pub fn isElevated() bool {
     var token: HANDLE = undefined;
@@ -632,6 +666,46 @@ pub fn runAsToken(token: HANDLE, cmdline: []const u8, out: []u8, timeout_ms: u32
     var code: u32 = 0;
     if (GetExitCodeProcess(pi.process.?, &code) == 0) return error.Unexpected;
     return .{ .exit_code = code, .output = out[0..n] };
+}
+
+test "the running image is recognised; a byte-identical copy is not it" {
+    const h = try openRunningImage();
+    defer _ = CloseHandle(h);
+    try std.testing.expect(isRunningImage(h));
+    // Writes are denied while it is held.
+    var buf: [600]u16 = undefined;
+    const self = try selfExePath(&buf);
+    const w = CreateFileW(self.ptr, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    if (w != INVALID_HANDLE_VALUE) {
+        _ = CloseHandle(w);
+        return error.TestUnexpectedResult;
+    }
+
+    // A copy: same bytes, another file.
+    var size: i64 = 0;
+    try std.testing.expect(GetFileSizeEx(h, &size) != 0);
+    const gpa = std.testing.allocator;
+    const data = try gpa.alloc(u8, @intCast(size));
+    defer gpa.free(data);
+    var got: usize = 0;
+    while (got < data.len) {
+        var n: u32 = 0;
+        var ov: OVERLAPPED = .{ .offset = @truncate(got), .offset_high = @truncate(@as(u64, got) >> 32) };
+        try std.testing.expect(ReadFile(h, data.ptr + got, @intCast(@min(data.len - got, 1 << 20)), &n, &ov) != 0 and n != 0);
+        got += n;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "copy.exe", .data = data });
+    var pbuf: [600]u8 = undefined;
+    const dn = try tmp.dir.realPath(std.testing.io, &pbuf);
+    var cw: [700]u16 = undefined;
+    var full: [700]u8 = undefined;
+    const copy_path = try std.fmt.bufPrint(&full, "{s}\\copy.exe", .{pbuf[0..dn]});
+    const c = CreateFileW((try W(&cw, copy_path)).ptr, GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    try std.testing.expect(c != INVALID_HANDLE_VALUE);
+    defer _ = CloseHandle(c);
+    try std.testing.expect(!isRunningImage(c));
 }
 
 test "runAsToken: a child under a restricted token, exit code and output" {

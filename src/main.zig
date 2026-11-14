@@ -35,6 +35,10 @@ const usage =
 ++ (if (is_windows) "\nInstalled tunnels (Windows service; nothing else runs elevated):\n" ++ wg.service.cli.usage else "");
 
 pub fn main(init: std.process.Init) !void {
+    // zwg runs elevated (installer, `zwg up`) and as SYSTEM (the service):
+    // DLLs loaded without a full path come from System32 only, never from
+    // the (possibly user-writable) application or current directory.
+    if (is_windows) wg.tun.windows.restrictDllSearch();
     const gpa = init.gpa;
     const io = init.io;
     var args: std.ArrayList([]const u8) = .empty;
@@ -209,6 +213,8 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
                 else => if (comptime builtin.os.tag == .windows and @hasDecl(tun.windows, "wintun_hint")) {
                     if (err == error.WintunNotFound) {
                         try errw.print("zwg: {s}\n", .{tun.windows.wintun_hint});
+                    } else if (err == error.WintunUntrusted) {
+                        try errw.print("zwg: {s}\n", .{tun.windows.untrusted_hint});
                     } else try errw.print("zwg: cannot create the TUN interface: {s}\n", .{@errorName(err)});
                 } else try errw.print("zwg: cannot create the TUN interface: {s}\n", .{@errorName(err)}),
             }

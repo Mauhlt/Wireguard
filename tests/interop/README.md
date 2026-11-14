@@ -174,9 +174,16 @@ One process per target (`-Dtest-filter`) gives per-target coverage numbers.
 
 The one non-Zig runtime component: a layer-3 adapter on Windows needs a signed
 kernel driver, so zwg uses Wintun (WireGuard LLC). `src/tun/windows.zig` loads
-`wintun.dll` at runtime from the application directory or System32 only
-(`LoadLibraryExW` with `LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
-LOAD_LIBRARY_SEARCH_SYSTEM32`). It is never committed or shipped: download the
+`wintun.dll` at runtime by full path only: next to `zwg.exe`, else System32's
+(never the current directory or PATH). Before loading, it opens the file
+denying writes and deletes, checks its Authenticode signature through that
+handle (`WinVerifyTrust`, generic policy, no network: cached revocation data
+only) and requires the signer certificate's CN and O to be `WireGuard LLC`;
+the handle stays open until `LoadLibraryExW` has mapped the file, so it cannot
+be swapped in between. zwg calls `SetDefaultDllDirectories(System32)` first
+thing, so nothing else is ever loaded from the (possibly user-writable)
+application directory either. A tampered or unsigned DLL fails with
+`error.WintunUntrusted`. It is never committed or shipped: download the
 signed release from <https://www.wintun.net/> (wintun-0.14.1.zip), check the
 SHA-256 published there, and copy `wintun\bin\<arch>\wintun.dll` next to `zwg.exe`.
 
@@ -215,7 +222,13 @@ verb (`/installtunnel-elevated <abs path> <user SID> <auto>` or
 `/uninstalltunnel-elevated <name>`), hidden, and waits on the child's process
 handle for its exit code (mapped to a message, including the service's own
 failure reason). From an already elevated prompt the same code runs in-process.
-The elevated child re-reads and re-validates everything it is handed.
+The elevated child re-reads and re-validates everything it is handed, and
+copies the service's binaries only from handles it holds open denying writes
+and deletes: its own zwg.exe, verified to be the very file its running image
+was mapped from (`NtAreMappedFilesTheSame`; a running .exe can be renamed
+away and replaced), and wintun.dll, verified as above but never loaded by the
+elevated installer (the directory it comes from, e.g. zig-out\bin, is
+user-writable). The service verifies wintun.dll again before loading it.
 
 **Storage** (`store.zig`):
 
