@@ -76,7 +76,7 @@ pub const threaded_api: []const []const u8 = &.{
 const tcp_src = @embedFile("netstack_tcp_src");
 
 /// RACK loss detection (RFC 8985 6, a reordering window).
-pub const has_rack = srcHas("reo_wnd");
+pub const has_rack = srcHas("reo_wnd") or @hasField(ns.Stats, "rack_losses");
 /// D-SACK (RFC 2883) generation / use.
 pub const has_dsack = srcHas("RFC 2883");
 
