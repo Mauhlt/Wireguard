@@ -1,6 +1,6 @@
 //! Test helpers shared by the unit tests, tests/netstack and the fuzz
 //! targets: the one packet-crafting helper (a fake peer that builds and
-//! parses IPv4/TCP packets with wire.zig) and `ImpairedTun`, a Tun
+//! parses IPv4 or IPv6 TCP packets with wire.zig) and `ImpairedTun`, a Tun
 //! wrapper that drops / reorders / duplicates packets (seeded, so a run
 //! is reproducible). Not used by the stack itself.
 const std = @import("std");
@@ -27,15 +27,11 @@ pub const Peer = struct {
         payload: []const u8 = &.{},
     };
 
-    /// A complete, valid IPv4/TCP packet peer -> stack in `out`.
+    /// A complete, valid TCP packet peer -> stack in `out`, IPv4 or IPv6
+    /// by the endpoints' family (both endpoints must be of the same one).
     pub fn packet(p: *Peer, out: []u8, s: Seg) []u8 {
         p.ip_id +%= 1;
-        return wire.buildTcp4(out, .{
-            .protocol = wire.proto_tcp,
-            .id = p.ip_id,
-            .src = p.peer.addr.v4,
-            .dst = p.stack.addr.v4,
-        }, .{
+        return wire.buildTcp(out, p.peer.addr, p.stack.addr, p.ip_id, .{
             .src_port = p.peer.port,
             .dst_port = p.stack.port,
             .seq = s.seq,
@@ -44,15 +40,26 @@ pub const Peer = struct {
             .window = s.window,
             .options = s.options,
             .payload = s.payload,
-        }) catch @panic("testing.Peer.packet: buffer too small");
+        }) catch @panic("testing.Peer.packet: buffer too small or mixed address families");
     }
 
-    /// Parses a packet the stack sent and checks it is stack -> peer.
+    /// Parses a packet the stack sent (either family) and checks it is
+    /// stack -> peer.
     pub fn expect(p: *const Peer, pkt: []const u8) !wire.Tcp {
-        const t = try wire.parseTcp4(pkt);
-        try std.testing.expectEqual(p.stack.addr.v4, t.ip.header.src);
-        try std.testing.expectEqual(p.peer.addr.v4, t.ip.header.dst);
+        const t = try wire.parseTcp(pkt);
+        try std.testing.expectEqual(p.stack.addr, t.ip.src);
+        try std.testing.expectEqual(p.peer.addr, t.ip.dst);
         try std.testing.expectEqual(p.stack.port, t.tcp.src_port);
+        try std.testing.expectEqual(p.peer.port, t.tcp.dst_port);
+        return t.tcp;
+    }
+
+    /// Like `expect`, but any source port (the SYN of a dial, from an
+    /// ephemeral port the test learns from it).
+    pub fn expectAnyPort(p: *const Peer, pkt: []const u8) !wire.Tcp {
+        const t = try wire.parseTcp(pkt);
+        try std.testing.expectEqual(p.stack.addr, t.ip.src);
+        try std.testing.expectEqual(p.peer.addr, t.ip.dst);
         try std.testing.expectEqual(p.peer.port, t.tcp.dst_port);
         return t.tcp;
     }
@@ -85,7 +92,7 @@ pub const Impairment = struct {
 
     fn applies(i: Impairment, packet: []const u8) bool {
         const port = i.only_port orelse return true;
-        const p = wire.parseTcp4(packet) catch return false;
+        const p = wire.parseTcp(packet) catch return false;
         return p.tcp.src_port == port or p.tcp.dst_port == port;
     }
 };
