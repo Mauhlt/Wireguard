@@ -1,0 +1,261 @@
+//! Test helpers shared by the unit tests, tests/netstack and the fuzz
+//! targets: the one packet-crafting helper (a fake peer that builds and
+//! parses IPv4 or IPv6 TCP packets with wire.zig) and `ImpairedTun`, a Tun
+//! wrapper that drops / reorders / duplicates packets (seeded, so a run
+//! is reproducible). Not used by the stack itself.
+const std = @import("std");
+const root = @import("root.zig");
+const wire = @import("wire.zig");
+const wg_tun = @import("../tun/root.zig");
+
+const Endpoint = root.Endpoint;
+
+/// A fake TCP peer: crafts packets from `peer` to `stack` (the stack under
+/// test) and parses what the stack sends back.
+pub const Peer = struct {
+    peer: Endpoint,
+    stack: Endpoint,
+    ip_id: u16 = 0,
+
+    /// Fields of a segment the test chooses; ports come from the endpoints.
+    pub const Seg = struct {
+        seq: u32,
+        ack: u32 = 0,
+        flags: wire.Flags,
+        window: u16 = 65535,
+        options: wire.TcpOptions = .{},
+        payload: []const u8 = &.{},
+    };
+
+    /// A complete, valid TCP packet peer -> stack in `out`, IPv4 or IPv6
+    /// by the endpoints' family (both endpoints must be of the same one).
+    pub fn packet(p: *Peer, out: []u8, s: Seg) []u8 {
+        p.ip_id +%= 1;
+        return wire.buildTcp(out, p.peer.addr, p.stack.addr, p.ip_id, .{
+            .src_port = p.peer.port,
+            .dst_port = p.stack.port,
+            .seq = s.seq,
+            .ack = s.ack,
+            .flags = s.flags,
+            .window = s.window,
+            .options = s.options,
+            .payload = s.payload,
+        }) catch @panic("testing.Peer.packet: buffer too small or mixed address families");
+    }
+
+    /// Parses a packet the stack sent (either family) and checks it is
+    /// stack -> peer.
+    pub fn expect(p: *const Peer, pkt: []const u8) !wire.Tcp {
+        const t = try wire.parseTcp(pkt);
+        try std.testing.expectEqual(p.stack.addr, t.ip.src);
+        try std.testing.expectEqual(p.peer.addr, t.ip.dst);
+        try std.testing.expectEqual(p.stack.port, t.tcp.src_port);
+        try std.testing.expectEqual(p.peer.port, t.tcp.dst_port);
+        return t.tcp;
+    }
+
+    /// Like `expect`, but any source port (the SYN of a dial, from an
+    /// ephemeral port the test learns from it).
+    pub fn expectAnyPort(p: *const Peer, pkt: []const u8) !wire.Tcp {
+        const t = try wire.parseTcp(pkt);
+        try std.testing.expectEqual(p.stack.addr, t.ip.src);
+        try std.testing.expectEqual(p.peer.addr, t.ip.dst);
+        try std.testing.expectEqual(p.peer.port, t.tcp.dst_port);
+        return t.tcp;
+    }
+};
+
+/// An ICMPv4 or ICMPv6 message (by `src`'s family) of type `kind` from
+/// `src` to `dst` in `buf`: identifier 0x1234, sequence 1, then `data`;
+/// IP header and checksum valid (ICMPv6 over the pseudo-header).
+pub fn icmpPacket(buf: []u8, src: root.Addr, dst: root.Addr, kind: u8, data: []const u8) []u8 {
+    const v6 = src == .v6;
+    const hl = wire.ipHeaderLen(src);
+    const msg = buf[hl..][0 .. 8 + data.len];
+    msg[0..8].* = .{ kind, 0, 0, 0, 0x12, 0x34, 0, 1 };
+    @memcpy(msg[8..], data);
+    const sum = if (v6) wire.icmp6Checksum(src, dst, msg) else wire.checksum(msg);
+    std.mem.writeInt(u16, msg[2..4], sum, .big);
+    _ = wire.writeIpHeader(buf, src, dst, if (v6) wire.proto_icmp6 else wire.proto_icmp, 1, msg.len) catch
+        @panic("testing.icmpPacket: buffer too small or mixed address families");
+    return buf[0 .. hl + msg.len];
+}
+
+/// Rebuilds the IPv6 packet `pkt` (40-byte header, no extension headers)
+/// in `out` with one 8-byte extension header per entry of `kinds` (at
+/// least one) in front of its upper layer: hop-by-hop (0) and destination
+/// options (60) hold one PadN; any other kind is zero-filled (a fragment
+/// header is then an atomic fragment). `out` must hold the result.
+pub fn withExtHeaders6(out: []u8, pkt: []const u8, kinds: []const u8) []u8 {
+    const hl = wire.ip6_header_len;
+    const upper = pkt[hl..];
+    const ext = 8 * kinds.len;
+    @memcpy(out[0..hl], pkt[0..hl]);
+    std.mem.writeInt(u16, out[4..6], @intCast(ext + upper.len), .big);
+    out[6] = kinds[0];
+    for (kinds, 0..) |k, i| {
+        const h = out[hl + 8 * i ..][0..8];
+        @memset(h, 0);
+        h[0] = if (i + 1 < kinds.len) kinds[i + 1] else pkt[6];
+        if (k == 0 or k == 60) {
+            h[2] = 1; // PadN covering the remaining 6 bytes
+            h[3] = 4;
+        }
+    }
+    @memcpy(out[hl + ext ..][0..upper.len], upper);
+    return out[0 .. hl + ext + upper.len];
+}
+
+/// Prints a stream's TCP state (diagnostics for failing tests).
+pub fn dumpStream(name: []const u8, s: root.Stream) void {
+    const k = s.debugConn() orelse {
+        std.debug.print("  {s}: (stale handle)\n", .{name});
+        return;
+    };
+    std.debug.print("  {s}: {t} una={d} nxt={d} max={d} base={d} wnd={d} cwnd={d} ssthresh={d} recovery={} dupacks={d}\n" ++
+        "      rcv_nxt={d} rcv_len={d} ooo={d} fin_seq={?d} eof={} unsent={d} snd_len={d} fin_queued={}\n" ++
+        "      rto_at={?d} persist_at={?d} delack_at={?d} rto={d} backoff={d} ack_now={} probe={} err={?}\n", .{
+        name,      k.state,     k.snd_una,  k.snd_nxt,   k.snd_max,    k.snd_base, k.snd_wnd, k.cwnd, k.ssthresh, k.in_recovery, k.dupacks,
+        k.rcv_nxt, k.rcv.len,   k.ooo_len,  k.fin_seq,   k.eof,        k.unsent(), k.snd.len, k.fin_queued,
+        k.rto_at,  k.persist_at, k.delack_at, k.rto,     k.backoff,    k.ack_now,  k.probe_now, k.err,
+    });
+}
+
+/// Seeded per-direction impairment, in parts per million.
+pub const Impairment = struct {
+    loss_ppm: u32 = 0,
+    /// Hold a packet back and release it after the next one.
+    reorder_ppm: u32 = 0,
+    duplicate_ppm: u32 = 0,
+    /// Impair only TCP packets with this source or destination port
+    /// (null: every packet).
+    only_port: ?u16 = null,
+
+    fn applies(i: Impairment, packet: []const u8) bool {
+        const port = i.only_port orelse return true;
+        const p = wire.parseTcp(packet) catch return false;
+        return p.tcp.src_port == port or p.tcp.dst_port == port;
+    }
+};
+
+/// Wraps a Tun (normally `Stack.tun()`) and impairs both directions:
+/// `inbound` applies to device -> stack (write), `outbound` to stack ->
+/// device (read). Holds at most one packet per direction; event-driven
+/// like the wrapped Tun (same wait handle).
+pub const ImpairedTun = struct {
+    inner: wg_tun.Tun,
+    inbound: Impairment,
+    outbound: Impairment,
+    prng: std.Random.DefaultPrng,
+    held_in: Held = .{},
+    held_out: Held = .{},
+    counts: Counts = .{},
+
+    pub const Counts = struct { dropped: u64 = 0, reordered: u64 = 0, duplicated: u64 = 0, passed: u64 = 0 };
+
+    const Held = struct {
+        buf: [wg_tun.max_packet_size]u8 = undefined,
+        len: ?usize = null,
+    };
+
+    pub fn init(inner: wg_tun.Tun, seed: u64, inbound: Impairment, outbound: Impairment) ImpairedTun {
+        return .{ .inner = inner, .inbound = inbound, .outbound = outbound, .prng = .init(seed) };
+    }
+
+    pub fn tun(t: *ImpairedTun) wg_tun.Tun {
+        return .{ .ptr = t, .vtable = &vtable };
+    }
+
+    fn hit(t: *ImpairedTun, ppm: u32) bool {
+        return ppm != 0 and t.prng.random().uintLessThan(u32, 1_000_000) < ppm;
+    }
+
+    const vtable: wg_tun.Tun.VTable = .{
+        .waitHandle = waitHandle,
+        .read = read,
+        .write = write,
+        .mtu = mtu,
+        .setAddress = setAddress,
+        .addRoute = addRoute,
+    };
+
+    fn self(ptr: *anyopaque) *ImpairedTun {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn waitHandle(ptr: *anyopaque) wg_tun.WaitHandle {
+        return self(ptr).inner.waitHandle();
+    }
+
+    fn mtu(ptr: *anyopaque) u16 {
+        return self(ptr).inner.mtu();
+    }
+
+    fn setAddress(ptr: *anyopaque, c: wg_tun.Cidr) wg_tun.ConfigError!void {
+        return self(ptr).inner.setAddress(c);
+    }
+
+    fn addRoute(ptr: *anyopaque, c: wg_tun.Cidr) wg_tun.ConfigError!void {
+        return self(ptr).inner.addRoute(c);
+    }
+
+    fn write(ptr: *anyopaque, packet: []const u8) wg_tun.WriteError!void {
+        const t = self(ptr);
+        if (!t.inbound.applies(packet)) {
+            t.counts.passed += 1;
+            return t.inner.write(packet);
+        }
+        if (t.hit(t.inbound.loss_ppm)) {
+            t.counts.dropped += 1;
+            return;
+        }
+        if (t.held_in.len == null and packet.len <= t.held_in.buf.len and t.hit(t.inbound.reorder_ppm)) {
+            @memcpy(t.held_in.buf[0..packet.len], packet);
+            t.held_in.len = packet.len;
+            t.counts.reordered += 1;
+            return;
+        }
+        t.counts.passed += 1;
+        t.inner.write(packet) catch {};
+        if (t.hit(t.inbound.duplicate_ppm)) {
+            t.counts.duplicated += 1;
+            t.inner.write(packet) catch {};
+        }
+        if (t.held_in.len) |n| {
+            t.held_in.len = null;
+            t.inner.write(t.held_in.buf[0..n]) catch {};
+        }
+    }
+
+    fn read(ptr: *anyopaque, buf: []u8) wg_tun.ReadError!?[]u8 {
+        const t = self(ptr);
+        while (true) {
+            const p = (try t.inner.read(buf)) orelse {
+                // Nothing new: release a held packet rather than sit on it.
+                if (t.held_out.len) |n| {
+                    t.held_out.len = null;
+                    if (n > buf.len) return error.BufferTooSmall;
+                    @memcpy(buf[0..n], t.held_out.buf[0..n]);
+                    return buf[0..n];
+                }
+                return null;
+            };
+            if (!t.outbound.applies(p)) {
+                t.counts.passed += 1;
+                return p;
+            }
+            if (t.hit(t.outbound.loss_ppm)) {
+                t.counts.dropped += 1;
+                continue;
+            }
+            if (t.held_out.len == null and t.hit(t.outbound.reorder_ppm)) {
+                @memcpy(t.held_out.buf[0..p.len], p);
+                t.held_out.len = p.len;
+                t.counts.reordered += 1;
+                continue;
+            }
+            t.counts.passed += 1;
+            return p;
+        }
+    }
+};

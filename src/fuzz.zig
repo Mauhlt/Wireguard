@@ -56,7 +56,7 @@ const interesting_bytes: []const Weight = &.{
 };
 
 /// A few random edits (bit flip, byte set, truncate) to `buf[0..len]`.
-fn mutate(s: *Smith, buf: []u8, len: usize) usize {
+pub fn mutate(s: *Smith, buf: []u8, len: usize) usize {
     var n = len;
     var edits: usize = 0;
     while (edits < 4 and s.boolWeighted(3, 1)) : (edits += 1) {

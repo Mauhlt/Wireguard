@@ -33,6 +33,28 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tests).step);
     test_step.dependOn(&exe.step);
 
+    // netstack end to end: two Devices over 127.0.0.1 UDP, each with a
+    // userspace TCP stack as its Tun, 50 MiB each way under loss. Always
+    // ReleaseSafe (Debug-mode crypto would take minutes); safety checks stay on.
+    const e2e_wg = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    const e2e = b.addTest(.{
+        .name = "netstack-e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/netstack/e2e.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "WireGuard", .module = e2e_wg }},
+        }),
+        .filters = if (test_filter) |f| b.dupeStrings(&.{f}) else &.{},
+    });
+    const e2e_step = b.step("netstack-e2e", "Run only the netstack end-to-end tests (ReleaseSafe)");
+    e2e_step.dependOn(&b.addRunArtifact(e2e).step);
+    test_step.dependOn(&b.addRunArtifact(e2e).step);
+
     // TUN backends for OSes we cannot run here: analysis-only cross builds of
     // src/tun (nothing is linked or run; see src/tun/root.zig).
     const tun_check = b.step("tun-check", "Cross-compile check the Linux/macOS/iOS TUN backends");
