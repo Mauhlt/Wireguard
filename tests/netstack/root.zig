@@ -9,4 +9,5 @@ test {
     _ = @import("priority.zig");
     _ = @import("concurrency.zig");
     _ = @import("sack.zig");
+    _ = @import("ipv6.zig");
 }

@@ -196,3 +196,10 @@ test "priority: bulk on max_connections - 1 streams + interactive, 0% loss" {
     const r = try run(.{ .limits = limits }, limits.max_connections - 1, perStream(8), "priority 7 bulk (max_connections 8)");
     try t.expect(r.p99 <= 150 * hz.ms);
 }
+test "priority: IPv6: 1 bulk stream + interactive, 0% and 1% loss" {
+    try needPriority();
+    const r0 = try run(.{ .v6 = true }, 1, mib * 1024 * 1024, "priority IPv6 0% loss");
+    try t.expect(r0.p99 <= 100 * hz.ms);
+    const r1 = try run(.{ .v6 = true, .impairment = .{ .loss_ppm = 10_000 }, .seed = 29 }, 1, mib * 1024 * 1024, "priority IPv6 1% loss");
+    try t.expect(r1.p99 <= 1500 * hz.ms);
+}

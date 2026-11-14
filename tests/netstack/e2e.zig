@@ -132,6 +132,23 @@ test "e2e: 5% loss + 2% reorder + 0.5% duplication: full duplex, SHA-256 both wa
     printReport("5% loss", p, total, r);
 }
 
+test "e2e: IPv6 inside the tunnel, 0% and 1% loss: full duplex, SHA-256 both ways" {
+    {
+        const p = try Pair.create(gpa, .{ .v6 = true });
+        defer p.destroy();
+        const total = mib * 1024 * 1024;
+        const r = try duplex(p, total, .interactive);
+        printReport("IPv6 0% loss", p, total, r);
+    }
+    {
+        const p = try Pair.create(gpa, .{ .v6 = true, .impairment = .{ .loss_ppm = 10_000, .reorder_ppm = 10_000 }, .seed = 17 });
+        defer p.destroy();
+        const total = mib * 1024 * 1024;
+        const r = try duplex(p, total, .interactive);
+        printReport("IPv6 1% loss", p, total, r);
+    }
+}
+
 test "e2e: TLS smoke test through Stream.reader / writer" {
     // std.crypto.tls has only a Client in this Zig, and the repo has no
     // TLS server to test against.

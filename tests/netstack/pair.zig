@@ -13,11 +13,15 @@ const dev = wg.device;
 
 pub const hub_addr: ns.Addr = .{ .v4 = .{ 10, 8, 0, 1 } };
 pub const dev_addr: ns.Addr = .{ .v4 = .{ 10, 8, 0, 2 } };
+pub const hub_addr6: ns.Addr = hz.stack_addr6; // fd0a:8::1
+pub const dev_addr6: ns.Addr = hz.peer_addr6; // fd0a:8::2
 
 pub const Options = struct {
     impairment: ?ns.testing.Impairment = null,
     seed: u64 = 1,
     limits: ns.Limits = .{},
+    /// Both stacks get an IPv6 address too; `connect` dials over IPv6.
+    v6: bool = false,
 };
 
 pub const Pair = struct {
@@ -31,6 +35,7 @@ pub const Pair = struct {
     device: ?*dev.Device = null,
     impaired: ?*ns.testing.ImpairedTun = null,
     device_thread: ?std.Thread = null,
+    v6: bool = false,
 
     fn keyPair() struct { priv: crypto.PrivateKey, public: crypto.PublicKey } {
         var priv: crypto.PrivateKey = undefined;
@@ -44,16 +49,23 @@ pub const Pair = struct {
         try hz.need(hz.threaded_api);
         const p = try gpa.create(Pair);
         errdefer gpa.destroy(p);
-        p.* = .{ .gpa = gpa, .clock = .{ .io = std.testing.io }, .hub = undefined, .stack = undefined };
+        if (o.v6 and !hz.has_ipv6) return hz.skip("IPv6 (Options.address6) not on feat/netstack yet");
+        p.* = .{ .gpa = gpa, .clock = .{ .io = std.testing.io }, .hub = undefined, .stack = undefined, .v6 = o.v6 };
         const kh = keyPair();
         const kd = keyPair();
-        const hub_cidr = try dev.ip.Cidr.parse("10.8.0.1/32");
-        const dev_cidr = try dev.ip.Cidr.parse("10.8.0.2/32");
+        const hub_cidrs = [_]dev.ip.Cidr{ try dev.ip.Cidr.parse("10.8.0.1/32"), try dev.ip.Cidr.parse("fd0a:8::1/128") };
+        const dev_cidrs = [_]dev.ip.Cidr{ try dev.ip.Cidr.parse("10.8.0.2/32"), try dev.ip.Cidr.parse("fd0a:8::2/128") };
+        var hub_opts: ns.Options = .{ .address = hub_addr, .limits = o.limits };
+        var stack_opts: ns.Options = .{ .address = dev_addr, .limits = o.limits };
+        if (comptime hz.has_ipv6) if (o.v6) {
+            hub_opts.address6 = hub_addr6;
+            stack_opts.address6 = dev_addr6;
+        };
         p.hub = try ns.Node.start(gpa, &p.clock, .{
             .private_key = kh.priv,
             .loopback_only = true,
-            .peers = &.{.{ .public_key = kd.public, .allowed_ips = &.{dev_cidr} }},
-        }, .{ .address = hub_addr, .limits = o.limits });
+            .peers = &.{.{ .public_key = kd.public, .allowed_ips = &dev_cidrs }},
+        }, hub_opts);
         errdefer p.hub.destroy();
         const dev_opts: dev.device.Options = .{
             .private_key = kd.priv,
@@ -61,10 +73,9 @@ pub const Pair = struct {
             .peers = &.{.{
                 .public_key = kh.public,
                 .endpoint = .{ .ip4 = .loopback(p.hub.device.listen_port) },
-                .allowed_ips = &.{hub_cidr},
+                .allowed_ips = &hub_cidrs,
             }},
         };
-        const stack_opts: ns.Options = .{ .address = dev_addr, .limits = o.limits };
         if (o.impairment) |imp| {
             p.stack = try ns.Stack.create(gpa, &p.clock, stack_opts);
             errdefer p.stack.destroy();
@@ -111,7 +122,7 @@ pub const Pair = struct {
 
     /// Device side dials hub:port (priority as given); the hub accepts.
     pub fn connect(p: *Pair, l: ns.Listener, prio: ns.Priority) !struct { dev: ns.Stream, hub: ns.Stream } {
-        const d = try p.stack.dialWith(.{ .addr = hub_addr, .port = l.port() }, prio);
+        const d = try p.stack.dialWith(.{ .addr = if (p.v6) hub_addr6 else hub_addr, .port = l.port() }, prio);
         errdefer d.abort();
         try d.waitConnected(20 * hz.sec);
         const h = try l.acceptWait(20 * hz.sec);

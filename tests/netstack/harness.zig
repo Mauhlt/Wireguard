@@ -71,6 +71,14 @@ pub const threaded_api: []const []const u8 = &.{
     "Stack.start",     "Stack.stop",
 };
 
+/// IPv6 in the stack (Options.address6).
+pub const has_ipv6 = @hasField(ns.Options, "address6");
+
+pub const stack_ip6: [16]u8 = .{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+pub const peer_ip6: [16]u8 = .{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+pub const stack_addr6: ns.Addr = .{ .v6 = stack_ip6 };
+pub const peer_addr6: ns.Addr = .{ .v6 = peer_ip6 };
+
 /// The per-stream priority feature (interactive-first output scheduler).
 pub const has_priority = @hasDecl(ns.Stream, "setPriority");
 
@@ -78,6 +86,9 @@ pub const has_priority = @hasDecl(ns.Stream, "setPriority");
 
 pub const Config = struct {
     address: ns.Addr = stack_addr,
+    /// IPv6 address next to the IPv4 one (Options.address6, when the
+    /// stack has it).
+    address6: ?ns.Addr = null,
     limits: ns.Limits = .{},
     mtu: u16 = 1420,
     icmp_echo: bool = true,
@@ -100,13 +111,15 @@ pub const H = struct {
         const h = try gpa.create(H);
         errdefer gpa.destroy(h);
         h.* = .{ .gpa = gpa, .fa = .init(gpa, .{}), .clock = .{ .io = std.testing.io }, .stack = undefined, .cfg = cfg };
-        h.stack = try ns.Stack.create(h.fa.allocator(), &h.clock, .{
+        var opts: ns.Options = .{
             .address = cfg.address,
             .mtu = cfg.mtu,
             .limits = cfg.limits,
             .icmp_echo = cfg.icmp_echo,
             .keepalive_idle_ns = cfg.keepalive_idle_ns,
-        });
+        };
+        if (comptime has_ipv6) opts.address6 = cfg.address6 else if (cfg.address6 != null) return skip("IPv6 (Options.address6) not on feat/netstack yet");
+        h.stack = try ns.Stack.create(h.fa.allocator(), &h.clock, opts);
         return h;
     }
 
@@ -285,11 +298,14 @@ pub const PassiveOpts = struct {
     syn_options: wire.TcpOptions = .{ .mss = 1380 },
     /// Accept the connection (else `stream` is undefined).
     accept: bool = true,
+    /// IPv6: peer_addr6 / stack_addr6.
+    peer_addr: ns.Addr = peer_addr,
+    stack_addr: ns.Addr = stack_addr,
 };
 
 /// Peer -> SYN, stack -> SYN-ACK, peer -> ACK, then accept.
 pub fn openPassive(h: *H, l: ns.Listener, o: PassiveOpts) !Conn {
-    var p: Peer = .{ .peer = .{ .addr = peer_addr, .port = o.peer_port }, .stack = .{ .addr = stack_addr, .port = l.port() } };
+    var p: Peer = .{ .peer = .{ .addr = o.peer_addr, .port = o.peer_port }, .stack = .{ .addr = o.stack_addr, .port = l.port() } };
     h.send(&p, .{ .seq = o.isn, .flags = .{ .syn = true }, .window = o.window, .options = o.syn_options });
     const sa = (try h.seg(&p)) orelse return error.NoSynAck;
     try std.testing.expect(sa.flags.syn and sa.flags.ack and !sa.flags.rst);
@@ -305,16 +321,19 @@ pub const ActiveOpts = struct {
     isn: u32 = 7_000_000,
     window: u16 = 65535,
     synack_options: wire.TcpOptions = .{ .mss = 1380 },
+    /// The peer to dial (peer_addr6 for IPv6); the stack picks its source.
+    peer_addr: ns.Addr = peer_addr,
 };
 
 /// stack.dial -> SYN, peer -> SYN-ACK, stack -> ACK.
 pub fn openActive(h: *H, o: ActiveOpts) !Conn {
-    const st = try h.stack.dial(.{ .addr = peer_addr, .port = o.port });
+    const st = try h.stack.dial(.{ .addr = o.peer_addr, .port = o.port });
     const pkt = h.out() orelse return error.NoSyn;
-    const t = try wire.parseTcp4(pkt);
+    const tp = try wire.parseTcp(pkt);
+    const t = .{ .tcp = tp.tcp };
     try std.testing.expect(t.tcp.flags.syn and !t.tcp.flags.ack);
     var c: Conn = .{
-        .peer = .{ .peer = .{ .addr = peer_addr, .port = o.port }, .stack = .{ .addr = stack_addr, .port = t.tcp.src_port } },
+        .peer = .{ .peer = .{ .addr = o.peer_addr, .port = o.port }, .stack = .{ .addr = tp.ip.src, .port = t.tcp.src_port } },
         .stream = st,
         .snd_nxt = o.isn +% 1,
         .rcv_nxt = t.tcp.seq +% 1,
