@@ -601,7 +601,8 @@ fn netnsTest(e: *Env, quick: bool, out_path: []const u8) !bool {
     try w.print("zwg live test, WSL/Linux internal (netns), started {d} (unix), {d} s\n", .{ started, nowS(e.io) - started });
     try w.print("host: {s}", .{if (uname) |u| u.stdout else "?\n"});
     try w.print("official peer: Linux kernel WireGuard ({s})\n", .{if (wgv) |v| std.mem.trim(u8, v.stdout, " \r\n") else "?"});
-    try w.print("our peer: {s} (Linux /dev/net/tun backend)\n", .{e.zwg orelse "?"});
+    // Only the file name: a full path would carry the user's folders.
+    try w.print("our peer: {s} (Linux /dev/net/tun backend)\n", .{if (e.zwg) |p| std.fs.path.basenamePosix(p) else "?"});
     try w.print("topology: netns {s} [{s} 10.99.0.1, zwgk0 10.88.0.1] <-veth-> netns {s} [{s} 10.99.0.2, zwgz0 10.88.0.2], MTU {d}\n\n", .{ ns_kernel, veth_k, ns_zwg, veth_z, mtu });
     try report.write(w, "RESULT", if (kernel_show.len != 0) e.print("kernel `wg show` before teardown (keys are throwaway):\n{s}", .{kernel_show}) else "");
     Io.Dir.cwd().writeFile(e.io, .{ .sub_path = out_path, .data = text.written() }) catch |err| std.debug.print("cannot write {s}: {t}\n", .{ out_path, err });
