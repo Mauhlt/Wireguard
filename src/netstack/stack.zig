@@ -94,6 +94,9 @@ fn handleId(index: usize, gen: u16) u32 {
     return (@as(u32, gen) << 16) | @as(u32, @intCast(index));
 }
 
+/// How long the stack loop waits per pass after its event wait failed.
+const wait_failed_pace_ns: u64 = 20 * std.time.ns_per_ms;
+
 fn timeoutFrom(io: std.Io, timeout_ns: ?u64) std.Io.Timeout {
     const ns = timeout_ns orelse return .none;
     const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@intCast(@min(ns, std.math.maxInt(i64)))), .clock = .awake } };
@@ -126,6 +129,8 @@ pub const Stack = struct {
 
     thread: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
+    /// The loop's wait failed once (logged; see `loop`).
+    wait_failed: bool = false,
 
     isn_key: [SipHash.key_length]u8,
     ip_id: u16 = 0,
@@ -396,7 +401,16 @@ pub const Stack = struct {
                 if (deadline) |d| s.timer.arm(@intCast(@max(d - now, 0))) else s.timer.disarm();
                 s.armed = deadline;
             }
-            const r = os.wait(handles[0..hn], timeout) catch null;
+            const r = os.wait(handles[0..hn], timeout) catch blk: {
+                // Only a broken handle makes the wait fail, and it stays
+                // broken: say so once, then pace the loop to its deadline
+                // (at most 20 ms) instead of spinning a core.
+                if (!s.wait_failed) std.log.scoped(.netstack).err("stack wait failed; pacing the loop to its deadlines", .{});
+                s.wait_failed = true;
+                const pace: u64 = @min(timeout orelse wait_failed_pace_ns, wait_failed_pace_ns);
+                if (pace > 0) s.io.sleep(.fromNanoseconds(@intCast(pace)), .awake) catch {};
+                break :blk null;
+            };
             if (r) |i| if (i == timer_index and hn > timer_index) {
                 s.timer.clear();
                 s.armed = null;
