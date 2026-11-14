@@ -4,4 +4,7 @@ test {
     _ = @import("conformance.zig");
     _ = @import("hostile.zig");
     _ = @import("fuzz.zig");
+    _ = @import("e2e.zig");
+    _ = @import("vlink.zig");
+    _ = @import("priority.zig");
 }

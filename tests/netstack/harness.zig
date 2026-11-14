@@ -77,6 +77,7 @@ pub const has_priority = @hasDecl(ns.Stream, "setPriority");
 // ---- manual-mode harness ---------------------------------------------------
 
 pub const Config = struct {
+    address: ns.Addr = stack_addr,
     limits: ns.Limits = .{},
     mtu: u16 = 1420,
     icmp_echo: bool = true,
@@ -100,7 +101,7 @@ pub const H = struct {
         errdefer gpa.destroy(h);
         h.* = .{ .gpa = gpa, .fa = .init(gpa, .{}), .clock = .{ .io = std.testing.io }, .stack = undefined, .cfg = cfg };
         h.stack = try ns.Stack.create(h.fa.allocator(), &h.clock, .{
-            .address = stack_addr,
+            .address = cfg.address,
             .mtu = cfg.mtu,
             .limits = cfg.limits,
             .icmp_echo = cfg.icmp_echo,
