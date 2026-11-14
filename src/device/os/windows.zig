@@ -26,6 +26,11 @@ const IPV6_V6ONLY: c_int = 27;
 const SOL_SOCKET: c_int = 0xffff;
 const SO_RCVBUF: c_int = 0x1002;
 const SO_SNDBUF: c_int = 0x1001;
+const SO_REUSEADDR: c_int = 0x0004;
+/// ~SO_REUSEADDR: nobody else may bind this address and port, not even
+/// with SO_REUSEADDR (which on Windows would let another, unprivileged
+/// process steal the port's incoming datagrams).
+const SO_EXCLUSIVEADDRUSE: c_int = ~SO_REUSEADDR;
 const FD_READ: c_long = 1;
 const SIO_UDP_CONNRESET: u32 = 0x9800000C;
 
@@ -66,6 +71,7 @@ extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
 extern "ws2_32" fn bind(s: SOCKET, addr: *const anyopaque, len: c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn getsockname(s: SOCKET, addr: *anyopaque, len: *c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, name: c_int, val: *const anyopaque, len: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn getsockopt(s: SOCKET, level: c_int, name: c_int, val: *anyopaque, len: *c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn recvfrom(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int, from: *anyopaque, fromlen: *c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn sendto(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int, to: *const anyopaque, tolen: c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn WSAEventSelect(s: SOCKET, event: HANDLE, mask: c_long) callconv(.winapi) c_int;
@@ -129,6 +135,11 @@ pub const Udp = struct {
         if (family == .v6) {
             const one: u32 = 1;
             _ = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, 4);
+        }
+        {
+            // Before bind (it only applies to the bind that follows).
+            const one: u32 = 1;
+            if (setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &one, 4) == SOCKET_ERROR) return error.Unexpected;
         }
         // Larger buffers absorb bursts (wireguard-go asks for 7 MiB; the
         // OS clamps). Failure is harmless.
@@ -401,4 +412,27 @@ fn ctrlHandler(kind: u32) callconv(.winapi) c_int {
 pub fn stopOnInterrupt(stop: *const StopSignal) void {
     ctrl_c_target = stop.handle;
     _ = SetConsoleCtrlHandler(&ctrlHandler, 1);
+}
+
+test "the device's port cannot be taken over with SO_REUSEADDR (SO_EXCLUSIVEADDRUSE)" {
+    var u = try Udp.open(.v4, 0); // loopback in tests
+    defer u.close();
+    const port = u.localPort();
+    // The option is set on the device's socket.
+    var val: u32 = 0;
+    var len: c_int = 4;
+    try std.testing.expect(getsockopt(u.sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &val, &len) == 0);
+    try std.testing.expectEqual(@as(u32, 1), val);
+    // Another socket, as a hijacking process would: SO_REUSEADDR, same address and port.
+    const s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    try std.testing.expect(s != INVALID_SOCKET);
+    defer _ = closesocket(s);
+    const one: u32 = 1;
+    try std.testing.expect(setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, 4) == 0);
+    const sa: sockaddr_in = .{ .family = AF_INET, .port = std.mem.nativeToBig(u16, port), .addr = bindAddr4(.loopback) };
+    try std.testing.expectEqual(SOCKET_ERROR, bind(s, &sa, @sizeOf(sockaddr_in)));
+    const e = WSAGetLastError();
+    try std.testing.expect(e == WSAEACCES or e == WSAEADDRINUSE);
+    // A plain second open of the same port is refused as well.
+    try std.testing.expectError(error.AddressInUse, Udp.openScoped(.v4, port, .loopback));
 }
