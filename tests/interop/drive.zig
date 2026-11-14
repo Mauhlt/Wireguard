@@ -87,8 +87,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, argv: []const []const u8) !RunOutput 
         .stdout_limit = .limited(1 << 20),
         .stderr_limit = .limited(1 << 20),
     });
-    if (!r.term.success()) std.debug.print("    -> {f}\n{s}{s}", .{ r.term, r.stdout, r.stderr });
-    return .{ .ok = r.term.success(), .stdout = r.stdout, .stderr = r.stderr };
+    if (!r.term.eql(.success)) std.debug.print("    -> {f}\n{s}{s}", .{ r.term, r.stdout, r.stderr });
+    return .{ .ok = r.term.eql(.success), .stdout = r.stdout, .stderr = r.stderr };
 }
 
 pub fn sleepMs(io: Io, ms: i64) void {

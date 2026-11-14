@@ -886,11 +886,11 @@ pub const Device = struct {
     fn drainTun(d: *Device, now: i64) RunError!bool {
         var count: usize = 0;
         while (count < batch_limit) : (count += 1) {
-            const pkt = d.tun.read(d.pkt_buf) catch |err| switch (err) {
+            const pkt = (d.tun.read(d.pkt_buf) catch |err| switch (err) {
                 error.BufferTooSmall => continue,
                 error.Closed => return error.TunClosed,
                 error.Unexpected => return error.Unexpected,
-            } orelse return false;
+            }) orelse return false;
             d.routePacket(pkt, now);
         }
         return true;

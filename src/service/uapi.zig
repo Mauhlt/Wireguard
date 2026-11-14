@@ -233,7 +233,7 @@ fn hexKey(val: []const u8) DecodeError![32]u8 {
         const hi = std.fmt.charToDigit(val[2 * i], 16) catch return error.InvalidResponse;
         const lo = std.fmt.charToDigit(val[2 * i + 1], 16) catch return error.InvalidResponse;
         if (std.ascii.isUpper(val[2 * i]) or std.ascii.isUpper(val[2 * i + 1])) return error.InvalidResponse;
-        b.* = hi << 4 | lo;
+        b.* = (hi << 4) | lo;
     }
     return k;
 }

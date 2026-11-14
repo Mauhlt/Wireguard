@@ -313,7 +313,7 @@ const ext_shim6: u8 = 140;
 
 // ---- TCP ---------------------------------------------------------------
 
-pub const Flags = packed struct(u8) {
+pub const Flags = bitpack struct(u8) {
     fin: bool = false,
     syn: bool = false,
     rst: bool = false,

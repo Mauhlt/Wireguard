@@ -39,7 +39,7 @@ fn runWg(gpa: std.mem.Allocator, wg: []const u8, arg: []const u8, input: []const
     const out = try r.interface.allocRemaining(gpa, .limited(4096));
     errdefer gpa.free(out);
     const term = try child.wait(io);
-    if (!term.success()) return error.WgFailed;
+    if (!term.eql(.success)) return error.WgFailed;
     const t = std.mem.trimEnd(u8, out, "\r\n");
     return gpa.realloc(out, t.len);
 }

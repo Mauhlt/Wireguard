@@ -98,7 +98,7 @@ pub const Event = enum {
 /// (Cookie replies are not authenticated packets and touch no timers.)
 pub const PacketKind = enum { handshake_initiation, handshake_response, keepalive, data };
 
-pub const Actions = packed struct {
+pub const Actions = bitpack struct {
     /// Send a keepalive (empty transport message). If no key is usable, the
     /// device queues it and requests a handshake, as the kernel does.
     send_keepalive: bool = false,
