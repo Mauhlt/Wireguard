@@ -183,7 +183,10 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
 
     // Resolve endpoints first: a typo should fail before an adapter appears.
     const peers = try gpa.alloc(dev.device.PeerConfig, c.peers.len);
-    defer gpa.free(peers);
+    defer {
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(peers)); // preshared keys
+        gpa.free(peers);
+    }
     for (c.peers, peers) |*p, *pc| {
         pc.* = .{
             .public_key = p.public_key,
@@ -241,12 +244,14 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
         try errw.writeAll("zwg: warning: DNS is not configured by zwg yet; set it on the interface yourself\n");
 
     var clock: dev.device.Clock = .{ .io = io };
-    const d = try dev.Device.create(gpa, &clock, t, .{
+    var options: dev.device.Options = .{
         .private_key = c.interface.private_key,
         .listen_port = c.interface.listen_port,
         .peers = peers,
         .loopback_only = test_tun != null,
-    });
+    };
+    defer std.crypto.secureZero(u8, &options.private_key);
+    const d = try dev.Device.create(gpa, &clock, t, options);
     defer d.destroy();
     d.external_stop = stop.waitHandle();
     dev.os.stopOnInterrupt(&stop);

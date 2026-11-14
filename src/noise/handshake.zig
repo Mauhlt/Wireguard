@@ -73,6 +73,7 @@ pub const Local = struct {
 
     pub fn init(private: PrivateKey) Local {
         var k = private;
+        defer crypto.wipe(&k);
         crypto.clampPrivateKey(&k);
         return .{ .private = k, .public = crypto.publicKey(k) };
     }

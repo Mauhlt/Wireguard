@@ -126,7 +126,9 @@ pub fn kdf(comptime n: comptime_int, key: *const [key_len]u8, input: []const u8)
 }
 
 pub fn kdf1(key: *const [key_len]u8, input: []const u8) [key_len]u8 {
-    return kdf(1, key, input)[0];
+    var out = kdf(1, key, input);
+    defer wipe(&out); // runs after the result is copied out
+    return out[0];
 }
 pub fn kdf2(key: *const [key_len]u8, input: []const u8) [2][key_len]u8 {
     return kdf(2, key, input);

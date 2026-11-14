@@ -244,6 +244,8 @@ pub const Device = struct {
         for (d.peers.items) |p| {
             _ = p.sess.deinit();
             p.hs.wipe();
+            // Staged plaintext packets waiting for a handshake.
+            std.crypto.secureZero(u8, p.staged.storage);
             p.staged.deinit(d.gpa);
             d.gpa.destroy(p);
         }
@@ -259,10 +261,11 @@ pub const Device = struct {
         d.checker.wipe();
         std.crypto.secureZero(u8, std.mem.asBytes(&d.csprng));
         d.gpa.destroy(d.limiter);
-        d.gpa.free(d.rx_buf);
-        d.gpa.free(d.tx_buf);
-        d.gpa.free(d.pkt_buf);
-        d.gpa.free(d.flush_buf);
+        // Plaintext packets and ciphertext in flight: zeroed, not just freed.
+        for ([_][]u8{ d.rx_buf, d.tx_buf, d.pkt_buf, d.flush_buf }) |b| {
+            std.crypto.secureZero(u8, b);
+            d.gpa.free(b);
+        }
     }
 
     fn bind(d: *Device, port: u16) InitError!void {

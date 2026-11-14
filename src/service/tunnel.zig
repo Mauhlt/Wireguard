@@ -147,7 +147,10 @@ fn runTunnel(paths: ?*const store.Paths) state.Exit {
 
     // Endpoints first: a DNS failure should not leave an adapter behind.
     const peers = gpa.alloc(device.device.PeerConfig, c.peers.len) catch return .device_failed;
-    defer gpa.free(peers);
+    defer {
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(peers)); // preshared keys
+        gpa.free(peers);
+    }
     for (c.peers, peers) |*cp, *pc| {
         pc.* = .{
             .public_key = cp.public_key,
@@ -181,11 +184,13 @@ fn runTunnel(paths: ?*const store.Paths) state.Exit {
     locked(state.Machine.starting, .{});
 
     var clock: device.device.Clock = .{ .io = g.io };
-    const d = device.Device.create(gpa, &clock, t, .{
+    var options: device.device.Options = .{
         .private_key = c.interface.private_key,
         .listen_port = c.interface.listen_port,
         .peers = peers,
-    }) catch |err| {
+    };
+    defer std.crypto.secureZero(u8, &options.private_key);
+    const d = device.Device.create(gpa, &clock, t, options) catch |err| {
         log.print("cannot create the device: {s}", .{@errorName(err)});
         return .device_failed;
     };
