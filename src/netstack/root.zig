@@ -73,7 +73,19 @@ pub const Limits = struct {
     /// A connect or a retransmission that gets no answer for this long
     /// fails the connection with error.ConnectionTimedOut.
     user_timeout_ns: u64 = 60 * std.time.ns_per_s,
+    /// A bulk stream accepts writes only while it has fewer unsent bytes
+    /// than this (like TCP_NOTSENT_LOWAT): its backlog stays in the
+    /// application, not in front of other traffic.
+    bulk_unsent_lowat: u32 = 64 * 1024,
 };
+
+/// Scheduling class of a stream. Interactive segments (data, ACKs,
+/// retransmissions) always go out before any bulk data; bulk data may
+/// fill at most half of the stack -> device ring; bulk control segments
+/// (ACKs, window updates, SYN, FIN) are never queued behind bulk data.
+/// Within one stream bytes stay ordered: put keystrokes and bulk
+/// transfers on separate connections.
+pub const Priority = enum { interactive, bulk };
 
 pub const Options = struct {
     /// The stack's own tunnel address (e.g. 10.8.0.1). Listeners bind to
@@ -88,7 +100,7 @@ pub const Options = struct {
     icmp_echo: bool = true,
 };
 
-pub const CreateError = error{ OutOfMemory, SystemResources, AddressFamilyUnsupported, InvalidMtu };
+pub const CreateError = error{ OutOfMemory, SystemResources, AddressFamilyUnsupported, InvalidMtu, InvalidLimits };
 pub const StartError = error{ SystemResources, AlreadyStarted };
 pub const ListenError = error{ AddressInUse, TooManyListeners, Closed };
 pub const DialError = error{ TooManyConnections, NoPortsAvailable, AddressFamilyUnsupported, Closed };
@@ -162,4 +174,6 @@ test {
     _ = wire;
     _ = testing;
     _ = stack_impl;
+    _ = @import("tcp.zig");
+    _ = @import("stack_test.zig");
 }
