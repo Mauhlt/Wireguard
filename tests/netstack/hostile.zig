@@ -86,7 +86,8 @@ test "hostile: malformed IPv4 (version, IHL, total length, checksum, fragments, 
         try h.expectSilent();
     }
     expected_drops += good.len;
-    try t.expect(h.stats().dropped_malformed >= expected_drops);
+    // (A version-6 nibble now goes to the IPv6 parser: it may count as not-for-us.)
+    try t.expect(h.stats().dropped_malformed + h.stats().dropped_not_for_us >= expected_drops);
     try t.expectEqual(@as(u16, 0), h.stats().connections);
     try expectStillServes(h, 40001);
 }
@@ -640,8 +641,15 @@ test "hostile: too many listeners / port in use" {
 
 test "hostile: invalid options are refused at create" {
     var clock: ns.Clock = .{ .io = t.io };
-    try t.expectError(error.AddressFamilyUnsupported, ns.Stack.create(gpa, &clock, .{ .address = .{ .v6 = @splat(0) } }));
-    try t.expectError(error.InvalidMtu, ns.Stack.create(gpa, &clock, .{ .address = hz.stack_addr, .mtu = 40 }));
+    // A v4-mapped IPv6 address is never ours; a v6 address6 next to a v6 address neither.
+    if (ns.Stack.create(gpa, &clock, .{ .address = .{ .v6 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 8, 0, 1 } } })) |s| {
+        s.destroy();
+        return error.AcceptedV4MappedAddress;
+    } else |_| {}
+    if (ns.Stack.create(gpa, &clock, .{ .address = hz.stack_addr, .mtu = 40 })) |s| {
+        s.destroy();
+        return error.AcceptedMtu40;
+    } else |e| try t.expectEqual(error.InvalidMtu, e);
     var limits: ns.Limits = .{};
     limits.max_connections = 0;
     if (ns.Stack.create(gpa, &clock, .{ .address = hz.stack_addr, .limits = limits })) |s| {

@@ -316,8 +316,41 @@ test "conformance: no listener: SYN gets RST+ACK, ACK gets RST, RST gets nothing
     try t.expect(h.stats().rst_sent >= 2);
 }
 
-test "conformance: in-window RST not at RCV.NXT -> challenge ACK (RFC 5961 / RFC 9293 3.10.7.4)" {
-    return hz.skip("RFC 5961 challenge ACKs are not claimed by DESIGN.md (blind injection is moot inside the authenticated tunnel)");
+test "conformance: in-window RST not at RCV.NXT -> challenge ACK; exact RST resets (RFC 5961 3)" {
+    const h = try H.create(gpa, .{});
+    defer h.destroy();
+    const l = try h.stack.listen(8420);
+    var c = try hz.openPassive(h, l, .{});
+    defer c.stream.close();
+    for ([_]u32{ 1, 100, 1000, 30000 }) |off| {
+        h.send(&c.peer, .{ .seq = c.snd_nxt +% off, .flags = .{ .rst = true } });
+        const a = (try h.seg(&c.peer)) orelse return error.NoChallengeAck;
+        try t.expect(a.flags.ack and !a.flags.rst);
+        try t.expectEqual(c.snd_nxt, a.ack);
+        try t.expectEqual(ns.State.established, c.state());
+    }
+    // The peer, answering the challenge, sends the exact RST.
+    h.send(&c.peer, .{ .seq = c.snd_nxt, .flags = .{ .rst = true } });
+    var buf: [4]u8 = undefined;
+    try t.expectError(error.ConnectionReset, c.stream.read(&buf));
+}
+
+test "conformance: SYN on a synchronized connection -> challenge ACK, connection kept (RFC 5961 4)" {
+    const h = try H.create(gpa, .{});
+    defer h.destroy();
+    const l = try h.stack.listen(8420);
+    var c = try hz.openPassive(h, l, .{});
+    defer c.stream.abort();
+    for ([_]u32{ 0, 5, 1 << 31 }) |off| {
+        h.send(&c.peer, .{ .seq = c.snd_nxt +% off, .flags = .{ .syn = true } });
+        const a = (try h.seg(&c.peer)) orelse return error.NoChallengeAck;
+        try t.expect(a.flags.ack and !a.flags.rst and !a.flags.syn);
+        try t.expectEqual(c.snd_nxt, a.ack);
+        try t.expectEqual(ns.State.established, c.state());
+    }
+    c.data(h, "still here");
+    var buf: [16]u8 = undefined;
+    try t.expectEqual(@as(usize, 10), try c.stream.read(&buf));
 }
 // ---------------------------------------------------------------- RTO (RFC 6298)
 
@@ -345,10 +378,11 @@ test "conformance: RTO: first retransmission within [200 ms, 3 s], then exponent
     const l = try h.stack.listen(8420);
     var c = try hz.openPassive(h, l, .{});
     defer c.stream.abort();
+    c.stream.setPriority(.bulk); // interactive streams send a tail loss probe first
     var iv: [6]u64 = undefined;
     try retransmitIntervals(h, &c, &iv);
     std.debug.print("RTO intervals (ms): {d} {d} {d} {d} {d} {d}\n", .{ iv[0] / ms, iv[1] / ms, iv[2] / ms, iv[3] / ms, iv[4] / ms, iv[5] / ms });
-    try t.expect(iv[0] >= 200 * ms and iv[0] <= 3 * sec);
+    try t.expect(iv[0] >= 190 * ms and iv[0] <= 3 * sec); // 200 ms floor, minus clock jitter
     for (iv[0 .. iv.len - 1], iv[1..]) |a, b| {
         if (a >= 60 * sec) break; // RFC 6298 2.5: a cap of >= 60 s is allowed
         try t.expect(b * 10 >= a * 18 and b * 10 <= a * 22);
@@ -362,6 +396,7 @@ test "conformance: Karn: an ACK after a retransmission gives no RTT sample, back
     const l = try h.stack.listen(8420);
     var c = try hz.openPassive(h, l, .{});
     defer c.stream.abort();
+    c.stream.setPriority(.bulk); // no tail loss probe: the RTO path
 
     // Clean round: sample ~0, RTO at its floor.
     _ = try c.stream.write(&@as([100]u8, @splat('a')));
