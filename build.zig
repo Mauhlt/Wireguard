@@ -96,6 +96,7 @@ pub fn build(b: *std.Build) void {
                 });
                 m.addOptions("netstack_test_options", op);
                 m.addAnonymousImport("netstack_stack_src", .{ .root_source_file = bb.path("src/netstack/stack.zig") });
+                m.addAnonymousImport("netstack_tcp_src", .{ .root_source_file = bb.path("src/netstack/tcp.zig") });
                 return bb.addRunArtifact(bb.addTest(.{ .name = "netstack-tests", .root_module = m, .filters = filters }));
             }
         };

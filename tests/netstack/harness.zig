@@ -71,6 +71,20 @@ pub const threaded_api: []const []const u8 = &.{
     "Stack.start",     "Stack.stop",
 };
 
+/// src/netstack/tcp.zig as built: features without a public API of their
+/// own (RACK, D-SACK) are detected by the RFC they cite.
+const tcp_src = @embedFile("netstack_tcp_src");
+
+/// RACK loss detection (RFC 8985 6, a reordering window).
+pub const has_rack = srcHas("reo_wnd");
+/// D-SACK (RFC 2883) generation / use.
+pub const has_dsack = srcHas("RFC 2883");
+
+fn srcHas(comptime needle: []const u8) bool {
+    @setEvalBranchQuota(100_000_000);
+    return comptime std.mem.indexOf(u8, tcp_src, needle) != null;
+}
+
 /// IPv6 in the stack (Options.address6).
 pub const has_ipv6 = @hasField(ns.Options, "address6");
 

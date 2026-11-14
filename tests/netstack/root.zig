@@ -10,4 +10,5 @@ test {
     _ = @import("concurrency.zig");
     _ = @import("sack.zig");
     _ = @import("ipv6.zig");
+    _ = @import("recovery.zig");
 }

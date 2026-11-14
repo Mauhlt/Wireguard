@@ -79,7 +79,7 @@ test "sack: as receiver, duplicate ACKs carry correct SACK blocks (most recent f
 
 // ---------------------------------------------------------------- sender vs SACK peers
 
-const Strategy = enum {
+pub const Strategy = enum {
     /// Real blocks for what arrived past the cumulative ACK.
     honest,
     /// Blocks beyond SND.MAX or below SND.UNA.
@@ -99,7 +99,7 @@ const Strategy = enum {
     many_holes,
 };
 
-const RunOpts = struct {
+pub const RunOpts = struct {
     strategy: Strategy,
     total: usize = 256 * 1024,
     loss_ppm: u32 = 30_000,
@@ -108,11 +108,24 @@ const RunOpts = struct {
     budget_ns: u64 = 900 * sec,
     /// false: the peer does not offer SACK (NewReno baseline).
     offer_sack: bool = true,
+    /// Virtual time between the stack's burst and the peer's ACKs.
+    rtt_ns: u64 = 0,
+    /// Per-segment fate by (segment index, transmission number from 1);
+    /// overrides `loss_ppm` / many_holes when set.
+    fate: ?*const fn (index: usize, nth: u32) Fate = null,
+    /// Delayed segments arrive this long after the rest of their burst.
+    delay_ns: u64 = 2 * ms,
+    /// Use a bulk stream (no tail loss probes).
+    bulk: bool = false,
+    /// Label for the report line.
+    label: []const u8 = "",
 };
 
-const RunResult = struct { virtual_ns: u64, max_out_per_ack: usize, stats: ns.Stats };
+pub const Fate = enum { deliver, drop, delay };
 
-fn runSender(o: RunOpts) !RunResult {
+pub const RunResult = struct { virtual_ns: u64, max_out_per_ack: usize, stats: ns.Stats };
+
+pub fn runSender(o: RunOpts) !RunResult {
     if (comptime !has_sack) unreachable;
     var limits: ns.Limits = .{};
     limits.user_timeout_ns = 600 * sec;
@@ -122,14 +135,18 @@ fn runSender(o: RunOpts) !RunResult {
     var c = try hz.openPassive(h, l, .{ .syn_options = .{ .mss = o.peer_mss, .sack_permitted = o.offer_sack } });
     defer c.stream.abort();
     try t.expectEqual(o.offer_sack, c.syn_options.sack_permitted);
+    if (o.bulk) c.stream.setPriority(.bulk);
     const base = c.rcv_nxt; // stack's first data byte
     var prng: std.Random.DefaultPrng = .init(o.seed);
     const rnd = prng.random();
 
     var got = try std.DynamicBitSetUnmanaged.initEmpty(gpa, o.total);
     defer got.deinit(gpa);
-    var seen_once = try std.DynamicBitSetUnmanaged.initEmpty(gpa, o.total);
-    defer seen_once.deinit(gpa);
+    const sends = try gpa.alloc(u8, o.total / o.peer_mss + 1);
+    defer gpa.free(sends);
+    @memset(sends, 0);
+    var held: std.ArrayList([2]usize) = .empty; // delayed (offset, length)
+    defer held.deinit(gpa);
     var cum: usize = 0;
     var highest: usize = 0;
     var written: usize = 0;
@@ -167,6 +184,7 @@ fn runSender(o: RunOpts) !RunResult {
         // The peer takes the whole burst first, then ACKs each segment (a
         // link with an RTT, so the flight can grow past a few segments).
         acks.clearRetainingCapacity();
+        held.clearRetainingCapacity();
         var burst: usize = 0;
         while (pkt_opt) |raw| : (pkt_opt = h.out()) {
             burst += 1;
@@ -175,18 +193,22 @@ fn runSender(o: RunOpts) !RunResult {
             try t.expect(s.payload.len <= o.peer_mss);
             const off: usize = s.seq -% base;
             if (off >= o.total or off + s.payload.len > o.total) return error.DataBeyondWritten;
-            // Loss: random, or every other first transmission (many_holes).
-            const first = !seen_once.isSet(off);
-            seen_once.set(off);
-            const lost = if (o.strategy == .many_holes)
-                first and off >= o.total / 2 and (off / o.peer_mss) % 2 == 1
-            else
-                o.loss_ppm != 0 and rnd.uintLessThan(u32, 1_000_000) < o.loss_ppm;
-            if (lost) continue;
-            for (s.payload, 0..) |b, i| {
-                if (b != hz.patternByte(55, off + i)) return error.CorruptData;
-                got.set(off + i);
+            for (s.payload, 0..) |b, i| if (b != hz.patternByte(55, off + i)) return error.CorruptData;
+            const idx = off / o.peer_mss;
+            sends[idx] +|= 1;
+            const first = sends[idx] == 1;
+            const fate: Fate = if (o.fate) |f| f(idx, sends[idx]) else if (o.strategy == .many_holes)
+                (if (first and off >= o.total / 2 and idx % 2 == 1) .drop else .deliver)
+            else if (o.loss_ppm != 0 and rnd.uintLessThan(u32, 1_000_000) < o.loss_ppm) .drop else .deliver;
+            switch (fate) {
+                .drop => continue,
+                .delay => {
+                    try held.append(gpa, .{ off, s.payload.len });
+                    continue;
+                },
+                .deliver => {},
             }
+            for (0..s.payload.len) |i| got.set(off + i);
             highest = @max(highest, off + s.payload.len);
             while (cum < o.total and got.isSet(cum)) cum += 1;
             c.rcv_nxt = base +% @as(u32, @intCast(cum));
@@ -194,12 +216,24 @@ fn runSender(o: RunOpts) !RunResult {
             try acks.append(gpa, .{ .ack = c.rcv_nxt, .sack = sack });
         }
         max_out = @max(max_out, burst / @max(acks.items.len, 1));
+        if (o.rtt_ns != 0) h.advance(o.rtt_ns);
         for (acks.items) |a| h.send(&c.peer, .{ .seq = c.snd_nxt, .ack = a.ack, .flags = .{ .ack = true }, .options = .{ .sack = a.sack } });
+        if (held.items.len != 0) {
+            h.advance(o.delay_ns);
+            for (held.items) |hd| {
+                for (0..hd[1]) |i| got.set(hd[0] + i);
+                highest = @max(highest, hd[0] + hd[1]);
+                while (cum < o.total and got.isSet(cum)) cum += 1;
+                c.rcv_nxt = base +% @as(u32, @intCast(cum));
+                const sack = if (o.offer_sack) blocksFor(o.strategy, rnd, &got, base, cum, highest, o.total) else null;
+                h.send(&c.peer, .{ .seq = c.snd_nxt, .ack = c.rcv_nxt, .flags = .{ .ack = true }, .options = .{ .sack = sack } });
+            }
+        }
     }
     const virt: u64 = @intCast(h.now() - t0);
     const st = h.stats();
-    std.debug.print("sack {t}{s}: {d} KiB intact in {d:.2} virtual s; retransmits {d} (RTO {d}, fast {d}); SACK blocks ignored {d}; max {d} packets per ACK (burst average)\n", .{
-        o.strategy, if (o.offer_sack) "" else " (no SACK)", o.total / 1024, @as(f64, @floatFromInt(virt)) / 1e9, st.retransmits, st.rto_expirations, st.fast_retransmits, st.sack_blocks_ignored, max_out,
+    std.debug.print("sack {t}{s}{s}: {d} KiB intact in {d:.2} virtual s; retransmits {d} (RTO {d}, fast {d}); SACK blocks ignored {d}; max {d} packets per ACK (burst average)\n", .{
+        o.strategy, if (o.offer_sack) "" else " (no SACK)", o.label, o.total / 1024, @as(f64, @floatFromInt(virt)) / 1e9, st.retransmits, st.rto_expirations, st.fast_retransmits, st.sack_blocks_ignored, max_out,
     });
     // Network input after establishment allocates nothing.
     try t.expectEqual(allocs0, h.fa.allocations);

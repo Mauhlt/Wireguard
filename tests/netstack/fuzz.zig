@@ -143,8 +143,27 @@ fn craft(m: *Model, s: *Src, pi: usize) []u8 {
     var opts: wire.TcpOptions = .{};
     if (s.boolWeighted(1, 1)) opts.mss = if (s.value(bool)) 1380 else s.value(u16);
     if (s.boolWeighted(2, 1)) opts.window_scale = s.valueRangeAtMost(u8, 0, 20);
-    opts.sack_permitted = s.boolWeighted(3, 1);
+    opts.sack_permitted = s.boolWeighted(1, 1);
     if (s.boolWeighted(4, 1)) opts.timestamp = .{ s.value(u32), s.value(u32) };
+    // SACK / D-SACK blocks: near the stack's sequence space (valid, stale,
+    // overlapping, inverted) or anywhere.
+    if (comptime @hasField(wire.TcpOptions, "sack")) if (s.boolWeighted(2, 1)) {
+        var sk: wire.Sack = .{ .len = s.valueRangeAtMost(u8, 1, wire.max_sack_blocks) };
+        for (sk.blocks[0..sk.len]) |*b| {
+            const anchor = m.ack_hint[pi];
+            b.start = if (s.boolWeighted(1, 3)) s.value(u32) else anchor +% @as(u32, s.valueRangeAtMost(u16, 0, 60000)) -% 30000;
+            b.end = if (s.boolWeighted(1, 6)) s.value(u32) else b.start +% s.valueRangeAtMost(u16, 0, 9000);
+        }
+        opts.sack = sk;
+        // Fit the 40-byte option space.
+        while (opts.len() > wire.tcp_max_options_len) {
+            if (opts.timestamp != null) {
+                opts.timestamp = null;
+            } else if (opts.sack.?.len > 1) {
+                opts.sack.?.len -= 1;
+            } else break;
+        }
+    };
     const len: usize = if (s.boolWeighted(1, 1)) 0 else s.valueRangeAtMost(u16, 1, 1380);
     for (m.payload[0..len], 0..) |*b, i| b.* = peerByte(pi, seq_final +% @as(u32, @intCast(i)));
     return p.packet(&m.pkt, .{
