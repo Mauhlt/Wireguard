@@ -187,4 +187,3 @@ test "keys: cross-checked against wg.exe (WireGuard for Windows) genkey/pubkey" 
     clamp(&k);
     try std.testing.expectEqual(before, k);
 }
-

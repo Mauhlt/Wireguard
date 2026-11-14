@@ -117,8 +117,8 @@ test "tunnel names" {
     const t = std.testing;
     for ([_][]const u8{ "wg0", "laptop", "Home-VPN_2", "a", "x=y+z", "a.b", "con1", "CONx" }) |n| try t.expect(isValid(n));
     for ([_][]const u8{
-        "",                                  "a b",  "a/b", "a\\b", "a:b", "a$b", "a%b", "\"a\"", "a\x00",
-        "123456789012345678901234567890123", ".",    "..",  ".a",   "a.",  "CON", "con", "nul.x", "COM1",
+        "",                                  "a b",      "a/b", "a\\b", "a:b", "a$b", "a%b", "\"a\"", "a\x00",
+        "123456789012345678901234567890123", ".",        "..",  ".a",   "a.",  "CON", "con", "nul.x", "COM1",
         "lpt9",                              "\xc3\xa9",
     }) |n| try t.expect(!isValid(n));
     try t.expectEqualStrings("laptop", fromPath("C:\\tunnels\\laptop.conf"));
@@ -148,9 +148,8 @@ test "SID strings" {
     try t.expect(isValidSidString("S-1-5-18"));
     try t.expect(isValidSidString("S-1-5-21-1004336348-1177238915-682003330-1001"));
     for ([_][]const u8{
-        "",                         "S-1-",          "S-1-5",  "S-1-5-", "S-1-5--1", "S-2-5-18", "s-1-5-18",
-        "S-1-5-21-1)(A;;GA;;;WD)", "S-1-5-18;",     "S-1-5-x", "S-1-5-18 ", "S-1-5-12345678901",
-        "S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16",
+        "",                        "S-1-",      "S-1-5",   "S-1-5-",    "S-1-5--1",          "S-2-5-18",                                     "s-1-5-18",
+        "S-1-5-21-1)(A;;GA;;;WD)", "S-1-5-18;", "S-1-5-x", "S-1-5-18 ", "S-1-5-12345678901", "S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16",
     }) |s| try t.expect(!isValidSidString(s));
 }
 

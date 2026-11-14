@@ -325,4 +325,3 @@ test "shared slots: host names are bounded" {
     try testing.expectError(error.InvalidHost, Shared.create(testing.io, .{}, &.{&long}, &.{1}));
     try testing.expectError(error.InvalidHost, Shared.create(testing.io, .{}, &.{""}, &.{1}));
 }
-

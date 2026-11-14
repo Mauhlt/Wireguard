@@ -93,8 +93,8 @@ fn writeTimestamp(w: *std.Io.Writer) !void {
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
     try w.print("{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}Z ", .{
-        yd.year,                   md.month.numeric(),           md.day_index + 1,
-        ds.getHoursIntoDay(),      ds.getMinutesIntoHour(),      ds.getSecondsIntoMinute(),
+        yd.year,              md.month.numeric(),      md.day_index + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     });
 }
 

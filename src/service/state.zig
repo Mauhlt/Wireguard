@@ -143,7 +143,7 @@ pub const Machine = struct {
             .state = .stopped,
             .controls_accepted = 0,
             .win32_exit_code = if (exit == .ok) 0 else error_service_specific,
-            .service_exit_code = @intFromEnum(exit),
+            .service_exit_code = @backingInt(exit),
         });
     }
 
@@ -262,7 +262,7 @@ test "failure while starting reports a service-specific exit code" {
     var buf: [32]State = undefined;
     try std.testing.expectEqualSlices(State, &.{ .start_pending, .stopped }, f.states(&buf));
     try std.testing.expectEqual(error_service_specific, f.reports[1].win32_exit_code);
-    try std.testing.expectEqual(@intFromEnum(Exit.adapter_failed), f.reports[1].service_exit_code);
+    try std.testing.expectEqual(@backingInt(Exit.adapter_failed), f.reports[1].service_exit_code);
     try f.check();
 }
 
@@ -284,7 +284,7 @@ test "interrogate repeats the current state; unknown controls are refused" {
     m.starting();
     m.running();
     try std.testing.expectEqual(Machine.ControlResult.handled, m.control(.interrogate));
-    try std.testing.expectEqual(Machine.ControlResult.not_implemented, m.control(@enumFromInt(0x7f)));
+    try std.testing.expectEqual(Machine.ControlResult.not_implemented, m.control(@fromBackingInt(@intCast(0x7f))));
     try std.testing.expectEqual(Machine.ControlResult.handled_stop, m.control(.stop));
     try std.testing.expectEqual(Machine.ControlResult.handled_stop, m.control(.stop)); // repeated: still stopping
     m.stopped(.ok);

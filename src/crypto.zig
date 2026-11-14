@@ -266,7 +266,6 @@ test "X25519: low-order public keys are rejected" {
     try testing.expectError(error.IdentityElement, dh(priv, one));
 }
 
-
 test "BLAKE2s-256: RFC 7693 appendix B ('abc'), split parts" {
     const want = hexTo(32, "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982");
     try testing.expectEqual(want, hash(&.{"abc"}));

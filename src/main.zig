@@ -37,7 +37,8 @@ const usage =
     \\  up <file.conf> --tun udp:<port>
     \\                         test mode: the TUN is a 127.0.0.1 UDP socket (tests/interop)
     \\
-else "") ++
+else
+    "") ++
     \\  down <name|file.conf>  stop a tunnel started with `zwg up`
     \\
 ++ (if (is_windows) "\nInstalled tunnels (Windows service; nothing else runs elevated):\n" ++ wg.service.cli.usage else "");
@@ -139,7 +140,6 @@ fn interfaceName(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
     return if (std.ascii.endsWithIgnoreCase(base, ".conf")) base[0 .. base.len - 5] else base;
 }
-
 
 fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Config, test_tun_arg: ?u16, out: *std.Io.Writer, errw: *std.Io.Writer) !u8 {
     // Comptime-known null without -Dtest-tun: the UdpTun path is not compiled in.
@@ -246,5 +246,3 @@ fn up(gpa: std.mem.Allocator, io: std.Io, name: []const u8, c: *const config.Con
     try out.print("\ninterface {s} down\n", .{name});
     return 0;
 }
-
-

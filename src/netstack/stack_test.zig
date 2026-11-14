@@ -1527,7 +1527,6 @@ fn tlpRackNoDoubleReduction(f: Fam) !void {
 // ICMP echo and the two-stack transfers run over both families above
 // (`families`); what follows is IPv6-specific.
 
-
 test "IPv6: MSS 1360 at MTU 1420 (SYN-ACK, our SYN, full-size segments fill the MTU)" {
     var r: Rig = undefined;
     try r.initFor(fam6, .{});

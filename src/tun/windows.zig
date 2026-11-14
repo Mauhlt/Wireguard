@@ -504,7 +504,7 @@ const ERROR_NOT_FOUND: u32 = 1168;
 const ERROR_OBJECT_ALREADY_EXISTS: u32 = 5010;
 
 fn lastError() u32 {
-    return @intFromEnum(std.os.windows.GetLastError());
+    return @backingInt(std.os.windows.GetLastError());
 }
 
 const k32 = struct {

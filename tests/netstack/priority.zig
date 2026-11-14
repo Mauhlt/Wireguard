@@ -138,10 +138,9 @@ fn run(o: pair.Options, bulk_n: usize, bytes: u64, label: []const u8) !Result {
     };
     const ds = p.stack.stats();
     std.debug.print("{s}: {d} bulk x {d} MiB in {d:.2} s ({d:.1} MiB/s); keystroke latency p50 {d:.2} ms, p99 {d:.2} ms, max {d:.2} ms over {d} keys; dev retransmits {d} fast {d}, ring drops {d}\n", .{
-        label,                        bulk_n,                         bytes / (1024 * 1024),     secs,
-        @as(f64, @floatFromInt(bytes * bulk_n)) / (1024.0 * 1024.0) / secs,
-        ms(r.p50),                    ms(r.p99),                      ms(r.max),                 r.samples,
-        ds.retransmits,               ds.fast_retransmits,            ds.dropped_ring_full,
+        label,                                                              bulk_n,         bytes / (1024 * 1024), secs,
+        @as(f64, @floatFromInt(bytes * bulk_n)) / (1024.0 * 1024.0) / secs, ms(r.p50),      ms(r.p99),             ms(r.max),
+        r.samples,                                                          ds.retransmits, ds.fast_retransmits,   ds.dropped_ring_full,
     });
     // Small -Dnetstack-e2e-mib runs end before many keystrokes; 50 MiB gives thousands.
     try t.expect(r.samples >= @min(@as(usize, 10), @as(usize, @intCast(mib / 8 + 1))));

@@ -988,7 +988,6 @@ pub const Conn = struct {
         return n;
     }
 
-
     fn usingSack(c: *const Conn) bool {
         return c.sack_ok and !c.sack_degraded;
     }

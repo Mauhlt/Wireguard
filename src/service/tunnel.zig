@@ -68,7 +68,7 @@ fn report(ctx: *anyopaque, r: state.Report) void {
     const h = gl.status_handle orelse return;
     const st: win.SERVICE_STATUS = .{
         .service_type = win.SERVICE_WIN32_OWN_PROCESS,
-        .current_state = @intFromEnum(r.state),
+        .current_state = @backingInt(r.state),
         .controls_accepted = r.controls_accepted,
         .win32_exit_code = r.win32_exit_code,
         .service_specific_exit_code = r.service_exit_code,
@@ -89,7 +89,7 @@ fn handler(control: u32, event_type: u32, event_data: ?*anyopaque, context: ?*an
     _ = event_data;
     _ = context;
     win.AcquireSRWLockExclusive(&g.lock);
-    const r = g.machine.control(@enumFromInt(control));
+    const r = g.machine.control(@fromBackingInt(@intCast(control)));
     win.ReleaseSRWLockExclusive(&g.lock);
     switch (r) {
         .handled_stop => {
@@ -212,4 +212,3 @@ fn runTunnel(paths: ?*const store.Paths) state.Exit {
     log.print("tunnel {s} going down", .{g.name});
     return .ok;
 }
-

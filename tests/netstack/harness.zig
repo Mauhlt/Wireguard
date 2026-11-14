@@ -59,14 +59,14 @@ pub fn skip(comptime reason: []const u8) error{SkipZigTest} {
 
 /// What the manual-drive tests need.
 pub const manual_api: []const []const u8 = &.{
-    "Stack.create",  "Stack.destroy", "Stack.input",     "Stack.output",    "Stack.runTimers",
-    "Stack.listen",  "Stack.dial",    "Stack.stats",     "Listener.accept", "Listener.close",
-    "Listener.port", "Stream.read",   "Stream.write",    "Stream.status",   "Stream.shutdown",
+    "Stack.create",  "Stack.destroy", "Stack.input",  "Stack.output",    "Stack.runTimers",
+    "Stack.listen",  "Stack.dial",    "Stack.stats",  "Listener.accept", "Listener.close",
+    "Listener.port", "Stream.read",   "Stream.write", "Stream.status",   "Stream.shutdown",
     "Stream.close",  "Stream.abort",
 };
 /// What the threaded tests (Node, blocking calls) need on top.
 pub const threaded_api: []const []const u8 = &.{
-    "Node.start",      "Node.destroy",   "Stack.dialWait",       "Listener.acceptWait",
+    "Node.start",      "Node.destroy",    "Stack.dialWait",       "Listener.acceptWait",
     "Stream.readWait", "Stream.writeAll", "Stream.waitConnected", "Stack.tun",
     "Stack.start",     "Stack.stop",
 };

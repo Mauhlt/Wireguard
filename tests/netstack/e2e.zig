@@ -91,9 +91,9 @@ pub fn printReport(label: []const u8, p: *Pair, total: u64, r: Report) void {
     const secs = @as(f64, @floatFromInt(r.elapsed_ns)) / 1e9;
     const mbps = @as(f64, @floatFromInt(2 * total)) / (1024.0 * 1024.0) / secs;
     std.debug.print("e2e {s}: {d} MiB each way in {d:.2} s = {d:.1} MiB/s total; retransmits dev {d} hub {d}, fast dev {d} hub {d}, timeouts {d}/{d}, ring drops {d}/{d}", .{
-        label,                    total / (1024 * 1024),     secs,                     mbps,
-        r.dev.retransmits,        r.hub.retransmits,         r.dev.fast_retransmits,   r.hub.fast_retransmits,
-        r.dev.timeouts,           r.hub.timeouts,            r.dev.dropped_ring_full,  r.hub.dropped_ring_full,
+        label,             total / (1024 * 1024), secs,                    mbps,
+        r.dev.retransmits, r.hub.retransmits,     r.dev.fast_retransmits,  r.hub.fast_retransmits,
+        r.dev.timeouts,    r.hub.timeouts,        r.dev.dropped_ring_full, r.hub.dropped_ring_full,
     });
     if (p.impaired) |it| std.debug.print("; impaired: dropped {d}, reordered {d}, duplicated {d}, passed {d}", .{ it.counts.dropped, it.counts.reordered, it.counts.duplicated, it.counts.passed });
     std.debug.print("\n", .{});

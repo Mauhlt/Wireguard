@@ -75,11 +75,11 @@ pub const Result = enum(u8) {
     /// is 0 = ok) is a failure, never truncated into another result.
     pub fn fromExitCode(code: u32) Result {
         if (code > std.math.maxInt(u8)) return .failed;
-        return @enumFromInt(@as(u8, @intCast(code)));
+        return @fromBackingInt(@intCast(@as(u8, @intCast(code))));
     }
 
     fn fromExit(e: state.Exit) Result {
-        return @enumFromInt(32 + @as(u8, @intCast(@intFromEnum(e))));
+        return @fromBackingInt(@intCast(32 + @as(u8, @intCast(@backingInt(e)))));
     }
 
     pub fn message(r: Result) []const u8 {
@@ -103,8 +103,8 @@ pub const Result = enum(u8) {
             .cancelled => "the UAC prompt was declined; nothing changed",
             .wintun_untrusted => tun.windows.untrusted_hint,
             .image_changed => "zwg.exe on disk is no longer the program that is running (replaced during the install?); nothing installed",
-            else => if (@intFromEnum(r) >= 32 and @intFromEnum(r) - 32 <= @intFromEnum(state.Exit.bad_arguments))
-                @as(state.Exit, @enumFromInt(@intFromEnum(r) - 32)).message()
+            else => if (@backingInt(r) >= 32 and @backingInt(r) - 32 <= @backingInt(state.Exit.bad_arguments))
+                @as(state.Exit, @fromBackingInt(@intCast(@backingInt(r) - 32))).message()
             else
                 "failed",
         };
@@ -130,9 +130,9 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8, ou
         return try controlTunnel(args[1], .start, out, errw);
 
     if (eql(u8, cmd, "/installtunnel-elevated") and args.len == 4)
-        return @intFromEnum(elevatedInstall(gpa, io, args[1], args[2], eql(u8, args[3], "1")));
+        return @backingInt(elevatedInstall(gpa, io, args[1], args[2], eql(u8, args[3], "1")));
     if (eql(u8, cmd, "/uninstalltunnel-elevated") and args.len == 2)
-        return @intFromEnum(elevatedUninstall(args[1]));
+        return @backingInt(elevatedUninstall(args[1]));
     if (eql(u8, cmd, "/tunnelservice") and args.len == 3)
         return try tunnel.serviceProcess(gpa, io, args[1], args[2], errw);
     return null;
@@ -195,7 +195,6 @@ fn fail(errw: *std.Io.Writer, r: Result) !u8 {
     try errw.print("zwg: {s}\n", .{r.message()});
     return 1;
 }
-
 
 /// Re-launch this executable elevated ("runas": the UAC prompt) with
 /// `params`, wait for it (blocking on its process handle) and return its
@@ -337,7 +336,7 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
     if (st.status.current_state != win.SERVICE_RUNNING) {
         const code = st.status.service_specific_exit_code;
         log.print("service stopped while starting: exit {d}", .{code});
-        if (code >= 1 and code <= @intFromEnum(state.Exit.bad_arguments)) return .fromExit(@enumFromInt(code));
+        if (code >= 1 and code <= @backingInt(state.Exit.bad_arguments)) return .fromExit(@fromBackingInt(@intCast(code)));
         return .service_failed;
     }
     keep_service = true;
@@ -515,7 +514,7 @@ pub fn controlTunnel(name: []const u8, action: Action, out: *std.Io.Writer, errw
                 return try waitFailed(&s, name, .start, err, watch_code, out, errw);
             if (st.status.current_state != win.SERVICE_RUNNING) {
                 const code = st.status.service_specific_exit_code;
-                const msg = if (code >= 1 and code <= @intFromEnum(state.Exit.bad_arguments)) @as(state.Exit, @enumFromInt(code)).message() else "stopped";
+                const msg = if (code >= 1 and code <= @backingInt(state.Exit.bad_arguments)) @as(state.Exit, @fromBackingInt(@intCast(code))).message() else "stopped";
                 try errw.print("zwg: {s}: the service stopped: {s}\n", .{ name, msg });
                 return 1;
             }
@@ -606,5 +605,5 @@ test "elevated child exit codes: never truncated into success" {
 test "result messages" {
     try std.testing.expectEqualStrings(state.Exit.wintun_missing.message(), Result.fromExit(.wintun_missing).message());
     try std.testing.expect(std.mem.indexOf(u8, Result.cancelled.message(), "nothing changed") != null);
-    try std.testing.expectEqualStrings("failed", @as(Result, @enumFromInt(200)).message());
+    try std.testing.expectEqualStrings("failed", @as(Result, @fromBackingInt(@intCast(200))).message());
 }
