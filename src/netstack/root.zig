@@ -64,7 +64,11 @@ pub const Limits = struct {
     /// Half-open (SYN-RECEIVED) connections per listener. A SYN beyond it
     /// is dropped (the peer retransmits). ISNs are a keyed hash (RFC 6528).
     syn_backlog: u16 = 16,
-    /// Established connections waiting for `accept`, per listener.
+    /// Established connections waiting for `accept`, per listener. While
+    /// the queue is full, the final ACK of a handshake is dropped (Linux
+    /// style): the connection stays SYN-RECEIVED without buffers, the
+    /// SYN-ACK retransmissions give it another chance, and it is dropped
+    /// after their limit.
     accept_backlog: u16 = 16,
     /// Out-of-order segments held per connection (each a byte range of
     /// the receive buffer; only the range bookkeeping is capped here).
@@ -73,6 +77,11 @@ pub const Limits = struct {
     ring_packets: u32 = 512,
     /// TIME-WAIT duration (2*MSL; short: both ends are ours, one hop).
     time_wait_ns: u64 = 2 * std.time.ns_per_s,
+    /// An orphaned FIN-WAIT-2 (the application closed, the peer ACKed our
+    /// FIN but never sends its own) is freed after this long (like Linux
+    /// tcp_fin_timeout). A half-closed stream the application still holds
+    /// (shutdown) keeps waiting.
+    fin_wait2_ns: u64 = 30 * std.time.ns_per_s,
     /// A connect or a retransmission that gets no answer for this long
     /// fails the connection with error.ConnectionTimedOut.
     user_timeout_ns: u64 = 60 * std.time.ns_per_s,
@@ -150,6 +159,8 @@ pub const Stats = struct {
     dropped_not_for_us: u64 = 0,
     dropped_ring_full: u64 = 0,
     dropped_syn_backlog: u64 = 0,
+    /// Handshake-completing ACKs dropped because the accept queue was full.
+    dropped_accept_backlog: u64 = 0,
     dropped_ooo: u64 = 0,
     rst_sent: u64 = 0,
     retransmits: u64 = 0,

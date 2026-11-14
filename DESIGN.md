@@ -183,7 +183,8 @@ host threads: Stream / Listener calls under the stack mutex; blocking calls
 ```
 
 No polling, no ticks: retransmit, delayed ACK, persist (zero window),
-keepalive and TIME-WAIT are deadlines on the device clock (`.boot`).
+keepalive, TIME-WAIT, orphaned FIN-WAIT-2 and the user timeout are
+deadlines on the device clock (`.boot`).
 A full ring drops the packet (like a NIC); TCP recovers.
 
 Public API (`const ns = @import("WireGuard").netstack;`):
@@ -193,7 +194,7 @@ ns.Addr = device.ip.Addr                  // .v4 or .v6
 ns.Endpoint { addr: Addr, port: u16 }
 ns.Limits { max_connections=64, max_listeners=8, send_buffer=256K, recv_buffer=256K,
             syn_backlog=16, accept_backlog=16, max_ooo_segments=32, ring_packets=512,
-            time_wait_ns=2s, user_timeout_ns=60s, bulk_unsent_lowat=64K }
+            time_wait_ns=2s, fin_wait2_ns=30s, user_timeout_ns=60s, bulk_unsent_lowat=64K }
 ns.Priority = enum { interactive, bulk }
 ns.Options { address: Addr, address6: ?Addr=null, mtu=1420, limits, keepalive_idle_ns: ?u64=null, icmp_echo=true }
           // address: IPv4 (or IPv6 for a v6-only stack); address6: IPv6 next to an IPv4 address
@@ -264,7 +265,10 @@ either family), `icmpPacket`, `withExtHeaders6` and `ImpairedTun`
 tests/netstack and fuzzers alike.
 
 TCP: RFC 9293 state machine (both handshakes, simultaneous open, FIN/RST,
-TIME-WAIT bounded by Limits.time_wait_ns), MSS from the MTU (1420 ->
+TIME-WAIT bounded by Limits.time_wait_ns, an orphaned FIN-WAIT-2 (closed
+by the application, the peer never sends its FIN) by Limits.fin_wait2_ns;
+the user timeout counts from the first unanswered transmission and is a
+deadline of its own), MSS from the MTU (1420 ->
 1380 over IPv4, 1360 over IPv6), window scale (RFC 7323; timestamps parsed
 and ignored), RTO per RFC 6298 with Karn's rule, SACK (below), NewReno
 (RFC 5681/6582) when the peer has no SACK, Limited Transmit (RFC 3042),
@@ -278,7 +282,11 @@ avoidance, no Nagle. Pure ACKs carry snd_max, not snd_nxt (as BSD): after
 an RTO rolls snd_nxt back, a peer that already has everything would drop
 an ACK at snd_nxt as unacceptable, and two such peers deadlock. ISNs:
 keyed SipHash-2-4 over the 4-tuple plus a 4 us clock (RFC 6528); per-
-listener SYN backlog cap; half-open connections get no buffers.
+listener SYN backlog cap; half-open connections get no buffers. While a
+listener's accept queue holds accept_backlog connections, the ACK that
+would complete another handshake is dropped (Linux style): it stays
+SYN-RECEIVED, bufferless, until a SYN-ACK retransmission finds room or
+the retries run out.
 
 Minimum RTO: 200 ms, not RFC 6298's 1 s. A deliberate deviation (Linux
 does the same): both ends are ours, one hop through the tunnel, and a
@@ -354,9 +362,12 @@ per tail; an ACK of new data disarms or re-arms it.
 Validation: IPv4 IHL, total length, header checksum; IPv6 version,
 payload length and the extension-header walk (below); TCP data offset,
 options, TCP checksum (pseudo-header of the packet's family); fragments
-dropped; packets not addressed to one of our addresses dropped; IPv6
-packets from ::, ::1, ff00::/8, ::ffff:0:0/96 or our own address dropped
-before TCP or ICMPv6 see them (no RST or echo reply to such a source).
+dropped; packets not addressed to one of our addresses dropped; packets
+from a source that cannot be a peer dropped before TCP or ICMP see them
+(no SYN-ACK, RST or echo reply to it; RFC 1122 3.2.1.3, RFC 9293
+3.10.7.2), by one filter for both families: our own address, IPv4
+0.0.0.0, 255.255.255.255, 224.0.0.0/4; IPv6 ::, ::1, ff00::/8,
+::ffff:0:0/96.
 The device already drops inner packets whose source is not in the
 peer's AllowedIPs. Memory: buffers allocated per established
 connection, bounded by Limits (defaults: ~33 MiB worst case, rings ~1.4 MiB

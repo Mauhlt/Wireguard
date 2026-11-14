@@ -71,8 +71,8 @@ fn isV4Mapped(a: Addr) bool {
 
 /// IPv6 addresses that are never a unicast peer on the tunnel: the
 /// unspecified address (::), loopback (::1), multicast (ff00::/8) and
-/// v4-mapped (::ffff:0:0/96). False for IPv4 (its checks live with the
-/// SYN handling). Packets from them are dropped before TCP or ICMPv6 see
+/// v4-mapped (::ffff:0:0/96). False for IPv4 (Stack.bogusSource holds the
+/// IPv4 side). Packets from them are dropped before TCP or ICMPv6 see
 /// them (so no RST and no echo reply goes to such an address), and dial
 /// refuses them.
 fn notUnicastPeer6(a: Addr) bool {
@@ -310,6 +310,38 @@ pub const Stack = struct {
         return mine.eql(a);
     }
 
+    /// The one source filter, either family (RFC 1122 3.2.1.3, RFC 9293
+    /// 3.10.7.2: a SYN from such a source gets no SYN-ACK, nothing else
+    /// gets a reply either): one of our own addresses; IPv4 0.0.0.0,
+    /// 255.255.255.255 and 224.0.0.0/4; IPv6 per notUnicastPeer6. No
+    /// prefix is configured (the device's tunSetAddress is a no-op), so
+    /// there is no subnet broadcast to know.
+    fn bogusSource(s: *const Stack, a: Addr) bool {
+        if (s.isOurs(a)) return true;
+        return switch (a) {
+            .v4 => |b| std.mem.allEqual(u8, &b, 0) or std.mem.allEqual(u8, &b, 0xff) or
+                b[0] & 0xf0 == 224, // 224.0.0.0/4
+            .v6 => notUnicastPeer6(a),
+        };
+    }
+
+    test bogusSource {
+        var clock: root.Clock = .{ .io = std.testing.io };
+        const own6: Addr = .{ .v6 = .{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+        const s = try Stack.create(std.testing.allocator, &clock, .{ .address = .{ .v4 = .{ 10, 8, 0, 1 } }, .address6 = own6 });
+        defer s.destroy();
+        for ([_]Addr{
+            .{ .v4 = .{ 0, 0, 0, 0 } },                                           .{ .v4 = .{ 255, 255, 255, 255 } },
+            .{ .v4 = .{ 224, 0, 0, 5 } },                                         .{ .v4 = .{ 239, 255, 255, 250 } },
+            .{ .v4 = .{ 10, 8, 0, 1 } },                                          .{ .v6 = @splat(0) },
+            .{ .v6 = .{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } }, own6,
+        }) |a| try std.testing.expect(s.bogusSource(a));
+        for ([_]Addr{
+            .{ .v4 = .{ 10, 8, 0, 2 } },  .{ .v4 = .{ 223, 255, 255, 255 } },
+            .{ .v4 = .{ 240, 0, 0, 1 } }, .{ .v6 = .{ 0xfd, 0x0a, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 } },
+        }) |a| try std.testing.expect(!s.bogusSource(a));
+    }
+
     fn env(s: *Stack, now: i64) tcp.Env {
         return .{
             .now = now,
@@ -439,9 +471,9 @@ pub const Stack = struct {
             s.st.dropped_not_for_us += 1;
             return;
         }
-        // IPv6: a source that cannot be a peer (::, ::1, multicast,
-        // v4-mapped) or that is our own address: spoofed or looped.
-        if (ip.src == .v6 and (notUnicastPeer6(ip.src) or s.isOurs(ip.src))) {
+        // A source that cannot be a peer, or our own address: spoofed or
+        // looped (either family, see bogusSource).
+        if (s.bogusSource(ip.src)) {
             s.st.dropped_not_for_us += 1;
             return;
         }
@@ -491,6 +523,10 @@ pub const Stack = struct {
         const now = s.clock.now();
         var e = s.env(now);
         if (s.findConn(local, remote)) |i| {
+            if (s.acceptQueueFull(i, seg)) {
+                s.st.dropped_accept_backlog += 1;
+                return;
+            }
             const out = s.slots[i].conn.input(&e, seg);
             s.afterOutcome(i, out);
             return;
@@ -531,7 +567,15 @@ pub const Stack = struct {
             }
         }
         if (out.notify) s.notifySlot(sl);
+        s.orphanTimers(sl);
         s.maybeRelease(i);
+    }
+
+    /// Arms the orphaned FIN-WAIT-2 deadline once the host has let go.
+    fn orphanTimers(s: *Stack, sl: *Slot) void {
+        if (sl.handle_open or sl.conn.state != .fin_wait_2) return;
+        const e = s.env(s.clock.now());
+        sl.conn.orphanFinWait2(&e);
     }
 
     /// RST the peer (if it knows the connection) and fail it locally.
@@ -614,6 +658,21 @@ pub const Stack = struct {
             n += 1;
         };
         return n;
+    }
+
+    /// Limits.accept_backlog: an ACK that would complete a passive
+    /// handshake while the listener's accept queue is full is dropped, so
+    /// the connection stays SYN-RECEIVED (no buffers) and the SYN-ACK
+    /// retransmission retries it.
+    fn acceptQueueFull(s: *Stack, i: usize, seg: wire.Tcp) bool {
+        const sl = &s.slots[i];
+        const li = sl.listener orelse return false;
+        if (sl.conn.state != .syn_received or !seg.flags.ack or seg.flags.rst or seg.flags.syn) return false;
+        var n: usize = 0;
+        for (s.slots) |*o| if (o.used and o.queued and o.listener == li) {
+            n += 1;
+        };
+        return n >= s.options.limits.accept_backlog;
     }
 
     fn allocSlot(s: *Stack) ?usize {
@@ -1085,6 +1144,7 @@ pub const Stream = struct {
         sl.handle_open = false;
         sl.gen +%= 1;
         s.notifySlot(sl);
+        s.orphanTimers(sl);
         s.maybeRelease(i);
         s.kickThread();
     }

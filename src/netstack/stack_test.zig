@@ -262,6 +262,59 @@ fn userTimeoutDial(f: Fam) !void {
     try t.expectEqual(@as(u16, 0), r.stack.stats().connections);
 }
 
+test "user timeout: unACKed data fails at the deadline, not at the next backed-off RTO" {
+    const sec = std.time.ns_per_s;
+    var r: Rig = undefined;
+    try r.init(.{ .user_timeout_ns = 20 * sec });
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try r.established(l);
+    defer e.st.close();
+    const t0 = r.clock.now();
+    _ = try e.st.write("abc");
+    var n: usize = 0;
+    while (n < 50) : (n += 1) {
+        while (r.stack.output(&r.out)) |_| {}
+        r.fireNext() catch break;
+    }
+    try t.expectError(error.ConnectionTimedOut, e.st.read(&one));
+    // RTOs of 0.2, 0.4, ... 12.8 s would next fire at 25.4 s.
+    const elapsed = r.clock.now() - t0;
+    try t.expect(elapsed >= 20 * sec and elapsed < 20 * sec + 100 * std.time.ns_per_ms);
+}
+
+test "orphaned FIN-WAIT-2 is freed after fin_wait2_ns; a half-closed stream still held waits" {
+    const sec = std.time.ns_per_s;
+    var r: Rig = undefined;
+    try r.init(.{ .fin_wait2_ns = 5 * sec });
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+
+    // Held: shutdown, the peer ACKs the FIN and never sends its own.
+    const h = try r.established(l);
+    h.st.shutdown();
+    const fin1 = try r.recv();
+    try t.expect(fin1.flags.fin);
+    r.send(.{ .seq = h.rcv, .ack = h.snd + 1, .flags = .{ .ack = true }, .window = 2048 });
+    try t.expectEqual(root.State.fin_wait_2, h.st.status().state);
+    try t.expectEqual(@as(?i64, null), r.stack.runTimers()); // no deadline
+
+    // Orphaned: close, the peer ACKs the FIN and never sends its own.
+    r.peer.peer.port = 40001;
+    const o = try r.established(l);
+    o.st.close();
+    const fin2 = try r.recv();
+    try t.expect(fin2.flags.fin);
+    r.send(.{ .seq = o.rcv, .ack = o.snd + 1, .flags = .{ .ack = true }, .window = 2048 });
+    try t.expectEqual(@as(u16, 2), r.stack.stats().connections);
+    const t0 = r.clock.now();
+    while (r.stack.stats().connections == 2) try r.fireNext();
+    try t.expect(r.clock.now() - t0 >= 5 * sec);
+    try t.expectEqual(root.State.fin_wait_2, h.st.status().state);
+    h.st.close(); // now orphaned too
+    while (r.stack.stats().connections != 0) try r.fireNext();
+}
+
 test "out-of-order segments: dup ACK, then both delivered in order" {
     var r: Rig = undefined;
     try r.init(.{});
@@ -402,6 +455,36 @@ test "SYN backlog cap, half-open expiry" {
         while (r.stack.output(&r.out)) |_| {}
     }
     try t.expectEqual(@as(u16, 0), r.stack.stats().connections);
+}
+
+test "accept backlog full: the final ACK is dropped, the SYN-ACK retry completes it later" {
+    var r: Rig = undefined;
+    try r.init(.{ .accept_backlog = 1 });
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    var isns: [2]u32 = undefined;
+    for (0..2) |i| {
+        r.peer.peer.port = @intCast(41000 + i);
+        r.send(.{ .seq = 1, .flags = .{ .syn = true } });
+        const sa = try r.recv();
+        try t.expect(sa.flags.syn and sa.flags.ack);
+        isns[i] = sa.seq;
+        r.send(.{ .seq = 2, .ack = sa.seq +% 1, .flags = .{ .ack = true }, .window = 2048 });
+    }
+    try t.expectEqual(@as(u64, 1), r.stack.stats().dropped_accept_backlog);
+    const a = try l.accept();
+    defer a.close();
+    try t.expectEqual(@as(u16, 41000), a.remote().port);
+    try t.expectError(error.WouldBlock, l.accept());
+    // The second is still SYN-RECEIVED: its SYN-ACK is retransmitted, and
+    // the peer's ACK now finds room.
+    try r.fireNext();
+    const sa = try r.recv();
+    try t.expect(sa.flags.syn and sa.flags.ack);
+    r.send(.{ .seq = 2, .ack = isns[1] +% 1, .flags = .{ .ack = true }, .window = 2048 });
+    const b = try l.accept();
+    defer b.close();
+    try t.expectEqual(@as(u16, 41001), b.remote().port);
 }
 
 test "malformed and foreign packets are dropped silently" {
