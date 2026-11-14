@@ -323,7 +323,7 @@ test "conformance: in-window RST not at RCV.NXT -> challenge ACK (RFC 5961 / RFC
 
 /// Retransmission intervals of one 100-byte segment the peer never ACKs.
 fn retransmitIntervals(h: *H, c: *hz.Conn, out: []u64) !void {
-    _ = try c.stream.write("x" ** 100);
+    _ = try c.stream.write(&@as([100]u8, @splat('x')));
     const first = (try h.seg(&c.peer)) orelse return error.NoData;
     try t.expectEqual(c.rcv_nxt, first.seq);
     var last = h.now();
@@ -364,14 +364,14 @@ test "conformance: Karn: an ACK after a retransmission gives no RTT sample, back
     defer c.stream.abort();
 
     // Clean round: sample ~0, RTO at its floor.
-    _ = try c.stream.write("a" ** 100);
+    _ = try c.stream.write(&@as([100]u8, @splat('a')));
     _ = (try h.seg(&c.peer)) orelse return error.NoData;
     const r0 = h.nextDeadline() orelse return error.NoTimer;
     c.rcv_nxt +%= 100;
     c.ack(h);
 
     // Ambiguous round: timeout, retransmission, then the ACK 1 ms later.
-    _ = try c.stream.write("b" ** 100);
+    _ = try c.stream.write(&@as([100]u8, @splat('b')));
     _ = (try h.seg(&c.peer)) orelse return error.NoData;
     const t0 = h.now();
     const re = (try h.waitSeg(&c.peer, 60 * sec)) orelse return error.NoRetransmit;
@@ -384,7 +384,7 @@ test "conformance: Karn: an ACK after a retransmission gives no RTT sample, back
 
     // Next segment: its timer must still be the backed-off RTO (RFC 6298
     // section 5: it only collapses after a new valid RTT measurement).
-    _ = try c.stream.write("c" ** 100);
+    _ = try c.stream.write(&@as([100]u8, @splat('c')));
     _ = (try h.seg(&c.peer)) orelse return error.NoData;
     const r2 = h.nextDeadline() orelse return error.NoTimer;
     std.debug.print("Karn: clean RTO {d} ms, first timeout {d} ms, after the ambiguous ACK {d} ms\n", .{ r0 / ms, rto1 / ms, r2 / ms });
@@ -727,7 +727,7 @@ test "conformance: ISNs: distinct per 4-tuple, spread over the space, keyed per 
     _ = try h.stack.listen(8420);
     _ = try h2.stack.listen(8420);
     var isns: [64]u32 = undefined;
-    var top: std.StaticBitSet(256) = .initEmpty();
+    var top: std.StaticBitSet(256) = .empty;
     var same_as_other: usize = 0;
     for (&isns, 0..) |*isn, i| {
         const port: u16 = @intCast(41000 + i);

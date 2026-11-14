@@ -168,7 +168,10 @@ pub const H = struct {
         var spins: u32 = 0;
         while (true) {
             if (h.out()) |p| return p;
-            const d = h.nextDeadline() orelse return null;
+            const d_opt = h.nextDeadline();
+            // Timers that fired may have queued output (and armed nothing yet).
+            if (h.out()) |p| return p;
+            const d = d_opt orelse return null;
             if (d == 0) {
                 spins += 1;
                 if (spins > 1000) @panic("netstack: runTimers keeps returning a past deadline and sends nothing");
