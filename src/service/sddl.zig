@@ -2,8 +2,8 @@
 //! here (pure, testable anywhere) and parsed by Windows at the point of use.
 //!
 //!   store directory  SYSTEM + Administrators full control, protected (no
-//!                    inherited ACEs from %ProgramData%, whose default ACL
-//!                    lets Users create and read files), inherited by
+//!                    inherited ACEs from %ProgramFiles%, whose default ACL
+//!                    lets Users read and run files), inherited by
 //!                    everything below: tunnels\<name>\tunnel.conf.dpapi,
 //!                    the service's copy of zwg.exe / wintun.dll, logs.
 //!   control pipe     (owner: the creating service, i.e. SYSTEM)

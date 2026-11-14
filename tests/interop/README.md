@@ -220,7 +220,7 @@ The elevated child re-reads and re-validates everything it is handed.
 **Storage** (`store.zig`):
 
 ```
-%ProgramData%\zwg\                       O:BA, D:PAI (SYSTEM, Administrators: full; inherited)
+%ProgramFiles%\zwg\                      O:BA, D:PAI (SYSTEM, Administrators: full; inherited)
   tunnels\<name>\tunnel.conf.dpapi       the .conf, DPAPI machine scope + fixed entropy
   tunnels\<name>\zwg.exe, wintun.dll     what the service runs (copied at install)
   logs\<name>.log (+ .old)               bounded to 1 MiB each, never keys
@@ -231,11 +231,26 @@ The ACL is the access control: no non-admin process can open the files. DPAPI
 image without the machine's LSA secrets) is ciphertext; machine scope because
 the installer (elevated user) writes and the service (SYSTEM) reads. The
 service binary is copied into the protected tree so LocalSystem never runs an
-executable a user could replace (zig-out\bin is user-writable). %ProgramData%
-comes from `SHGetKnownFolderPath`, never the environment. Users may create
-folders in %ProgramData%, so a pre-existing `zwg` folder is used only if it is a
-real directory (no junction/symlink) owned by Administrators or SYSTEM; its DACL
-is reset either way.
+executable a user could replace (zig-out\bin is user-writable). %ProgramFiles%
+comes from `SHGetKnownFolderPath`, never the environment.
+
+Why %ProgramFiles% (as WireGuard for Windows' `%ProgramFiles%\WireGuard\Data`)
+and not %ProgramData%: Users may create folders in %ProgramData%, so a user
+could pre-create `%ProgramData%\zwg` and, between the elevated installer's
+checks and its writes, swap it for a junction — redirecting what SYSTEM writes
+and later runs (zwg.exe) and where the decrypted key goes. Only administrators
+(and TrustedInstaller) can create anything in %ProgramFiles%. On top of that the
+elevated installer and uninstaller (`store.Dirs`) resolve each store directory
+exactly once — the root by path, each subdirectory relative to its verified
+parent handle, never through a reparse point (`FILE_FLAG_OPEN_REPARSE_POINT`) —
+check that very handle (a plain directory per
+`GetFileInformationByHandleEx(FileAttributeTagInfo)`, owner Administrators or
+SYSTEM per `GetSecurityInfo`), reset owner and DACL on it (`SetSecurityInfo`),
+and keep the handles open without `FILE_SHARE_DELETE` until they are done, so
+nothing on the path can be renamed, deleted or replaced meanwhile. The files
+(conf, zwg.exe, wintun.dll) are written, wiped and deleted relative to those
+handles. An install made by an older zwg under `%ProgramData%\zwg` must be
+removed with that older zwg (`zwg uninstalltunnel <name>`) first.
 
 **Service** (`scm.zig`): `zwgTunnel$<name>`, SERVICE_WIN32_OWN_PROCESS,
 LocalSystem, demand start (or automatic with `--auto`), depends on Nsi and
@@ -301,11 +316,14 @@ zig-out\bin\zwg-service-live.exe --zwg zig-out\bin\zwg.exe
 
 It installs `zwgTunnel$zwgsvctest` (10.79.0.1/24, peer 10.79.0.2 = a plain
 `zwg up --tun udp:<port>` process on 127.0.0.1), checks the store's DACL and
-encryption, then — impersonating an ordinary-user version of your token
+encryption (every store directory under the Program Files known folder, a plain
+directory owned by Administrators with the protected DACL; the installer's
+verifier `Dirs.openExisting` accepts it; an ordinary user can neither read the
+conf nor create anything in the store), then — impersonating an ordinary-user version of your token
 (Administrators deny-only, medium integrity) — reads the handshake over the
 pipe, sends UDP both ways through the real Wintun adapter, checks another
 user is refused, runs `down` and `up`, then `zwg uninstalltunnel` and checks
-the service, `%ProgramData%\zwg\tunnels\zwgsvctest`, the log and the adapter
+the service, `%ProgramFiles%\zwg\tunnels\zwgsvctest`, the log and the adapter
 are gone. On any failure it uninstalls anyway, kills the peer and shreds both
 temporary .conf files in %TEMP%. Source: `service_live.zig` (separate from
 `live.zig` so the two can be folded into one live run later).

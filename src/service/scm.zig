@@ -20,7 +20,7 @@
 //!   name           zwgTunnel$<name>, display "zwg tunnel: <name>"
 //!   type           SERVICE_WIN32_OWN_PROCESS, LocalSystem
 //!   start          demand (default) or automatic (`--auto`)
-//!   binary         "<%ProgramData%\zwg\tunnels\<name>\zwg.exe>" /tunnelservice <name> <user SID>
+//!   binary         "<%ProgramFiles%\zwg\tunnels\<name>\zwg.exe>" /tunnelservice <name> <user SID>
 //!   dependencies   Nsi, TcpIp (adapters and routes need both)
 //!   SID type       unrestricted: the service gets its own SID
 //!                  (NT SERVICE\zwgTunnel$<name>) for firewall rules, while

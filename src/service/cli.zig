@@ -75,7 +75,7 @@ pub const Result = enum(u8) {
     pub fn message(r: Result) []const u8 {
         return switch (r) {
             .ok => "done",
-            .failed => "failed (see %ProgramData%\\zwg\\logs, readable by administrators)",
+            .failed => "failed (see %ProgramFiles%\\zwg\\logs, readable by administrators)",
             .bad_args => "bad internal arguments",
             .not_elevated => "the elevated step is not elevated",
             .invalid_name => "invalid tunnel name: 1-32 of A-Z a-z 0-9 _ = + . - (the file name without .conf)",
@@ -84,8 +84,8 @@ pub const Result = enum(u8) {
             .already_installed => "a tunnel with that name is already installed (zwg uninstalltunnel <name> first)",
             .not_installed => "no tunnel with that name is installed",
             .wintun_missing => tun.windows.wintun_hint,
-            .untrusted_dir => "%ProgramData%\\zwg exists but is a link or not owned by Administrators/SYSTEM; remove it and retry",
-            .store_failed => "cannot write the protected store under %ProgramData%\\zwg",
+            .untrusted_dir => "a directory under %ProgramFiles%\\zwg is a link, not a directory, or not owned by Administrators/SYSTEM; remove it and retry",
+            .store_failed => "cannot write the protected store under %ProgramFiles%\\zwg",
             .service_failed => "the service could not be created or configured",
             .start_timeout => "the service did not reach RUNNING in time (it was removed again)",
             .stop_timeout => "the service did not stop in time (it is marked for deletion)",
@@ -263,7 +263,11 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
     // directory, where we copy the DLL from next to us, or System32).
     _ = tun.windows.probe() catch return .wintun_missing;
 
-    store.prepare(&paths) catch |err| return if (err == error.UntrustedDirectory) .untrusted_dir else storeFail("create the store directories", err);
+    // Each store directory is opened and verified once, and stays open
+    // (not deletable, not renamable) until this function returns; every
+    // file below is written relative to those handles.
+    var dirs = store.Dirs.prepare(&paths) catch |err| return if (err == error.UntrustedDirectory) .untrusted_dir else storeFail("create the store directories", err);
+    defer dirs.close();
     log.open(paths.log()) catch {};
     defer log.close();
     log.print("installtunnel {s}: for user {s}, start {s}", .{ name, user_sid, if (auto) "automatic" else "on demand" });
@@ -271,7 +275,7 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
     var installed = false;
     defer if (!installed) {
         log.print("installtunnel {s}: rolled back", .{name});
-        removeFiles(&paths);
+        removeFiles(&dirs, &paths);
     };
 
     // What the service runs: copies in the protected tree.
@@ -282,20 +286,19 @@ pub fn elevatedInstall(gpa: std.mem.Allocator, io: std.Io, conf_path: []const u8
     const self_path = self_buf[0..self_n];
     var exe_buf: [400]u8 = undefined;
     const exe_path = paths.inDir(&exe_buf, store.exe_file) catch return .store_failed;
-    store.copyInto(gpa, self_path, exe_path) catch |err| {
+    copyFile(gpa, self_path, &dirs, store.exe_file) catch |err| {
         log.print("copy zwg.exe: {s}", .{@errorName(err)});
         return storeFail("copy zwg.exe", err);
     };
     var dll_src_buf: [1800]u8 = undefined;
     const dll_src = std.fmt.bufPrint(&dll_src_buf, "{s}\\" ++ store.wintun_file, .{std.fs.path.dirname(self_path) orelse "."}) catch return .store_failed;
     if (store.exists(dll_src)) {
-        var dll_buf: [400]u8 = undefined;
-        store.copyInto(gpa, dll_src, paths.inDir(&dll_buf, store.wintun_file) catch return .store_failed) catch |err| {
+        copyFile(gpa, dll_src, &dirs, store.wintun_file) catch |err| {
             log.print("copy wintun.dll: {s}", .{@errorName(err)});
             return storeFail("copy wintun.dll", err);
         };
     }
-    store.storeConfig(gpa, &paths, text) catch |err| {
+    store.storeConfig(gpa, &dirs, text) catch |err| {
         log.print("store configuration: {s}", .{@errorName(err)});
         return storeFail("store the encrypted configuration", err);
     };
@@ -368,12 +371,19 @@ pub fn elevatedUninstall(name: []const u8) Result {
         s.delete() catch return .service_failed;
         break :blk true;
     };
-    const had_files = store.exists(paths.dir());
-    removeFiles(&paths);
-    var old_buf: [300]u8 = undefined;
-    store.delete(paths.log()) catch {};
-    store.delete(std.fmt.bufPrint(&old_buf, "{s}.old", .{paths.log()}) catch paths.log()) catch {};
-    store.removeDirs(&paths);
+    // The store, verified and held as at install (never through a link).
+    var dirs = store.Dirs.openExisting(&paths) catch |err| {
+        _ = storeFail("open the store directories", err);
+        return if (err == error.UntrustedDirectory) .untrusted_dir else .store_failed;
+    };
+    defer dirs.close();
+    const had_files = dirs.dir != null;
+    if (dirs.logs) |l| {
+        var log_buf: [64]u8 = undefined;
+        if (std.fmt.bufPrint(&log_buf, "{s}.log", .{name})) |f| store.deleteAt(l, f) catch {} else |_| {}
+        if (std.fmt.bufPrint(&log_buf, "{s}.log.old", .{name})) |f| store.deleteAt(l, f) catch {} else |_| {}
+    }
+    removeFiles(&dirs, &paths);
     if (!had_service and !had_files) return .not_installed;
     return result;
 }
@@ -387,12 +397,23 @@ fn storeFail(step: []const u8, err: anyerror) Result {
     return .store_failed;
 }
 
-fn removeFiles(paths: *const store.Paths) void {
-    store.wipe(paths.conf()) catch {};
-    var buf: [400]u8 = undefined;
-    if (paths.inDir(&buf, store.exe_file)) |p| store.delete(p) catch {} else |_| {}
-    if (paths.inDir(&buf, store.wintun_file)) |p| store.delete(p) catch {} else |_| {}
-    store.removeDirs(paths);
+fn removeFiles(dirs: *store.Dirs, paths: *const store.Paths) void {
+    if (dirs.dir) |d| {
+        store.wipeAt(d, store.conf_file) catch {};
+        store.deleteAt(d, store.exe_file) catch {};
+        store.deleteAt(d, store.wintun_file) catch {};
+    }
+    dirs.remove(paths);
+}
+
+/// Copy `from` (a path outside the store) into the tunnel's open directory.
+fn copyFile(gpa: std.mem.Allocator, from: []const u8, dirs: *const store.Dirs, file: []const u8) store.Error!void {
+    var wbuf: [600]u16 = undefined;
+    const w = win.W(&wbuf, from) catch return error.NameTooLong;
+    const h = win.CreateFileW(w.ptr, win.GENERIC_READ, win.FILE_SHARE_READ, null, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, null);
+    if (h == win.INVALID_HANDLE_VALUE) return error.NotFound;
+    defer _ = win.CloseHandle(h);
+    try store.copyInto(gpa, h, dirs.dir orelse return error.NotFound, file);
 }
 
 // ---- unelevated: list, show, down, up ----------------------------------------------

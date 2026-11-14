@@ -1,5 +1,5 @@
 //! The tunnel service's log: one bounded file per tunnel under
-//! %ProgramData%\zwg\logs (protected directory), rotated to `<name>.log.old`
+//! %ProgramFiles%\zwg\logs (protected directory), rotated to `<name>.log.old`
 //! when it reaches `store.max_log_bytes`, so at most twice that on disk.
 //! Messages are zwg's own text: configuration values that could be secret
 //! (keys) are never formatted into them. Thread-safe (the service thread,

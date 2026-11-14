@@ -146,6 +146,17 @@ crypto/handshake step, a two-device in-process loopback test (no TUN: a fake
 Tun), and a live interop test against the installed official WireGuard for
 Windows (wg.exe / wireguard.exe), documented step by step (needs admin once).
 
+## service (src/service, Windows only)
+
+`zwg installtunnel` runs a tunnel as a LocalSystem service (full design:
+tests/interop/README.md, "The tunnel service"). Its store is
+`%ProgramFiles%\zwg` (the known folder, never the environment): only
+administrators can create anything there, unlike %ProgramData%, where a user
+could pre-create the folder and swap it for a junction under the elevated
+installer. The installer resolves each store directory once, never through a
+reparse point, verifies and secures that same handle and keeps it open
+(no FILE_SHARE_DELETE) while it writes the files relative to it.
+
 ## Rules
 
 * Pure Zig, std only (Wintun is the one runtime-loaded OS component).

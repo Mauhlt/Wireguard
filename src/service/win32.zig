@@ -78,11 +78,16 @@ pub const GENERIC_WRITE: u32 = 0x4000_0000;
 pub const DELETE: u32 = 0x0001_0000;
 pub const READ_CONTROL: u32 = 0x0002_0000;
 pub const WRITE_DAC: u32 = 0x0004_0000;
+pub const WRITE_OWNER: u32 = 0x0008_0000;
 pub const SYNCHRONIZE: u32 = 0x0010_0000;
 pub const FILE_READ_DATA: u32 = 0x0001;
 pub const FILE_WRITE_DATA: u32 = 0x0002;
 pub const FILE_APPEND_DATA: u32 = 0x0004; // = FILE_CREATE_PIPE_INSTANCE on a pipe
 pub const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+pub const FILE_LIST_DIRECTORY: u32 = 0x0001;
+pub const FILE_ADD_FILE: u32 = 0x0002;
+pub const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+pub const FILE_TRAVERSE: u32 = 0x0020;
 pub const FILE_SHARE_READ: u32 = 1;
 pub const FILE_SHARE_WRITE: u32 = 2;
 pub const FILE_SHARE_DELETE: u32 = 4;
@@ -97,6 +102,7 @@ pub const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 pub const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
 pub const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 pub const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
 pub const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 pub const MOVEFILE_REPLACE_EXISTING: u32 = 1;
@@ -149,6 +155,14 @@ pub extern "kernel32" fn GetOverlappedResult(h: HANDLE, ov: *OVERLAPPED, n: *u32
 pub extern "kernel32" fn CancelIoEx(h: HANDLE, ov: ?*OVERLAPPED) callconv(.winapi) BOOL;
 pub extern "kernel32" fn CreatePipe(read: *HANDLE, write: *HANDLE, sa: ?*SECURITY_ATTRIBUTES, size: u32) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetSystemDirectoryW(buf: [*]u16, len: u32) callconv(.winapi) u32;
+pub extern "kernel32" fn GetFileInformationByHandleEx(h: HANDLE, class: c_int, info: *anyopaque, len: u32) callconv(.winapi) BOOL;
+pub extern "kernel32" fn SetFileInformationByHandle(h: HANDLE, class: c_int, info: *const anyopaque, len: u32) callconv(.winapi) BOOL;
+
+pub const FileBasicInfo: c_int = 0;
+pub const FileDispositionInfo: c_int = 4;
+pub const FileAttributeTagInfo: c_int = 9;
+pub const FILE_ATTRIBUTE_TAG_INFO = extern struct { attributes: u32, reparse_tag: u32 };
+pub const FILE_DISPOSITION_INFO = extern struct { delete_file: u8 };
 
 // Child processes under another token (the end-to-end driver runs zwg.exe
 // as an ordinary user).
@@ -246,6 +260,8 @@ pub extern "advapi32" fn GetSecurityDescriptorControl(sd: PSECURITY_DESCRIPTOR, 
 pub extern "advapi32" fn GetAce(acl: *ACL, index: u32, ace: *?*anyopaque) callconv(.winapi) BOOL;
 pub extern "advapi32" fn GetNamedSecurityInfoW(name: LPCWSTR, kind: c_int, info: u32, owner: ?*?PSID, group: ?*?PSID, dacl: ?*?*ACL, sacl: ?*?*ACL, sd: *?PSECURITY_DESCRIPTOR) callconv(.winapi) u32;
 pub extern "advapi32" fn SetNamedSecurityInfoW(name: LPWSTR, kind: c_int, info: u32, owner: ?PSID, group: ?PSID, dacl: ?*ACL, sacl: ?*ACL) callconv(.winapi) u32;
+pub extern "advapi32" fn GetSecurityInfo(h: HANDLE, kind: c_int, info: u32, owner: ?*?PSID, group: ?*?PSID, dacl: ?*?*ACL, sacl: ?*?*ACL, sd: *?PSECURITY_DESCRIPTOR) callconv(.winapi) u32;
+pub extern "advapi32" fn SetSecurityInfo(h: HANDLE, kind: c_int, info: u32, owner: ?PSID, group: ?PSID, dacl: ?*ACL, sacl: ?*ACL) callconv(.winapi) u32;
 
 // ---- advapi32: service control manager -------------------------------------
 
@@ -406,6 +422,8 @@ pub const SHELLEXECUTEINFOW = extern struct {
 pub const GUID = extern struct { data1: u32, data2: u16, data3: u16, data4: [8]u8 };
 /// FOLDERID_ProgramData {62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}
 pub const FOLDERID_ProgramData: GUID = .{ .data1 = 0x62AB5D82, .data2 = 0xFDC1, .data3 = 0x4DC3, .data4 = .{ 0xA9, 0xDD, 0x07, 0x0D, 0x1D, 0x49, 0x5D, 0x97 } };
+/// FOLDERID_ProgramFiles {905E63B6-C1BF-494E-B29C-65B732D3D21A}
+pub const FOLDERID_ProgramFiles: GUID = .{ .data1 = 0x905E63B6, .data2 = 0xC1BF, .data3 = 0x494E, .data4 = .{ 0xB2, 0x9C, 0x65, 0xB7, 0x32, 0xD3, 0xD2, 0x1A } };
 
 pub extern "shell32" fn ShellExecuteExW(info: *SHELLEXECUTEINFOW) callconv(.winapi) BOOL;
 pub extern "shell32" fn SHGetKnownFolderPath(id: *const GUID, flags: u32, token: ?HANDLE, path: *?LPWSTR) callconv(.winapi) i32;
