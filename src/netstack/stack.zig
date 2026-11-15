@@ -608,11 +608,15 @@ pub const Stack = struct {
         s.maybeRelease(i);
     }
 
-    /// Arms the orphaned FIN-WAIT-2 deadline once the host has let go.
+    /// Arms the orphan deadlines (tcp.Conn.orphan) once the host has let go.
     fn orphanTimers(s: *Stack, sl: *Slot) void {
-        if (sl.handle_open or sl.conn.state != .fin_wait_2) return;
+        if (sl.handle_open) return;
+        switch (sl.conn.state) {
+            .fin_wait_1, .fin_wait_2, .closing, .last_ack => {},
+            else => return,
+        }
         const e = s.env(s.clock.now());
-        sl.conn.orphanFinWait2(&e);
+        sl.conn.orphan(&e);
     }
 
     /// RST the peer (if it knows the connection) and fail it locally.

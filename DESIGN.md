@@ -186,7 +186,7 @@ host threads: Stream / Listener calls under the stack mutex; blocking calls
 ```
 
 No polling, no ticks: retransmit, delayed ACK, persist (zero window),
-keepalive, TIME-WAIT, orphaned FIN-WAIT-2 and the user timeout are
+keepalive, TIME-WAIT, the orphan deadlines and the user timeout are
 deadlines on the device clock (`.boot`).
 A full ring drops the packet (like a NIC); TCP recovers.
 
@@ -274,8 +274,13 @@ tests/netstack and fuzzers alike.
 
 TCP: RFC 9293 state machine (both handshakes, simultaneous open, FIN/RST,
 TIME-WAIT bounded by Limits.time_wait_ns, an orphaned FIN-WAIT-2 (closed
-by the application, the peer never sends its FIN) by Limits.fin_wait2_ns;
-the user timeout counts from the first unanswered transmission and is a
+by the application, the peer never sends its FIN) by Limits.fin_wait2_ns,
+an orphaned FIN-WAIT-1, CLOSING or LAST-ACK (our data or FIN still
+undelivered) reset and freed Limits.user_timeout_ns after the
+application let go, and after 8 zero-window probes (Linux
+tcp_orphan_retries), whatever the peer does: a peer that ACKs every
+probe with window 0 keeps the retransmission timer and so the user
+timeout from ever running; the user timeout counts from the first unanswered transmission and is a
 deadline of its own), MSS from the MTU (1420 ->
 1380 over IPv4, 1360 over IPv6), window scale (RFC 7323; timestamps parsed
 and ignored), RTO per RFC 6298 with Karn's rule, SACK (below), NewReno

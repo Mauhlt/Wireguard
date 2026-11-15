@@ -315,6 +315,91 @@ test "orphaned FIN-WAIT-2 is freed after fin_wait2_ns; a half-closed stream stil
     while (r.stack.stats().connections != 0) try r.fireNext();
 }
 
+/// A closing connection with unsent data whose peer holds its window at 0
+/// and ACKs every zero-window probe (so neither the retransmission timer
+/// nor the user timeout ever runs). `last_ack`: the peer's FIN came first.
+/// Stops when the connection is freed (returns the probes it saw and
+/// whether an RST came) or after `max_probes` probes.
+const ZeroWindowEnd = struct { probes: usize, rst: bool, freed: bool, elapsed: i64 };
+
+fn closeIntoZeroWindow(r: *Rig, last_ack: bool, orphan: bool, max_probes: usize) !ZeroWindowEnd {
+    const l = try r.stack.listen(8420);
+    defer l.close();
+    const e = try r.established(l);
+    var rcv = e.rcv;
+    if (last_ack) {
+        r.send(.{ .seq = rcv, .ack = e.snd, .flags = .{ .ack = true, .fin = true }, .window = 0 });
+        rcv += 1;
+        try t.expectEqual(rcv, (try r.recv()).ack);
+        try t.expectEqual(root.State.close_wait, e.st.status().state);
+    } else {
+        r.send(.{ .seq = rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0 });
+    }
+    try t.expectEqual(@as(usize, 7), try e.st.write("blocked"));
+    if (orphan) e.st.close() else e.st.shutdown();
+    try r.expectSilent(); // zero window: no data, no FIN behind it
+    const conn = r.stack.slots[e.st.id & 0xffff].conn;
+    try t.expectEqual(if (last_ack) root.State.last_ack else root.State.fin_wait_1, conn.state);
+    const t0 = r.clock.now();
+    var end: ZeroWindowEnd = .{ .probes = 0, .rst = false, .freed = false, .elapsed = 0 };
+    while (end.probes < max_probes) {
+        try r.fireNext();
+        while (r.stack.output(&r.out)) |p| {
+            const s = try r.peer.expect(p);
+            if (s.flags.rst) {
+                try t.expectEqual(e.snd, s.seq); // everything sent was ACKed
+                end.rst = true;
+                continue;
+            }
+            try t.expectEqual(e.snd -% 1, s.seq); // a probe, no data
+            try t.expectEqual(@as(usize, 0), s.payload.len);
+            end.probes += 1;
+            r.send(.{ .seq = rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0 });
+        }
+        if (r.stack.stats().connections == 0) {
+            end.freed = true;
+            break;
+        }
+    }
+    end.elapsed = r.clock.now() - t0;
+    if (!orphan) e.st.abort();
+    return end;
+}
+
+test "orphaned FIN-WAIT-1 / LAST-ACK under a zero window: reset and freed at the user timeout" {
+    const sec = std.time.ns_per_s;
+    for ([_]bool{ false, true }) |last_ack| {
+        var r: Rig = undefined;
+        try r.init(.{ .user_timeout_ns = 10 * sec });
+        defer r.deinit();
+        // Without a deadline the probes would go on forever (every ~60 s).
+        const end = try closeIntoZeroWindow(&r, last_ack, true, 1000);
+        try t.expect(end.freed and end.rst);
+        try t.expect(end.probes > 0 and end.probes < tcp.max_orphan_probes);
+        try t.expect(end.elapsed >= 10 * sec and end.elapsed < 11 * sec);
+    }
+}
+
+test "orphan under a zero window: after max_orphan_probes probes, RST; a held stream keeps probing" {
+    const sec = std.time.ns_per_s;
+    for ([_]bool{ false, true }) |last_ack| {
+        var r: Rig = undefined;
+        try r.init(.{ .user_timeout_ns = 3600 * sec });
+        defer r.deinit();
+        const end = try closeIntoZeroWindow(&r, last_ack, true, 1000);
+        try t.expect(end.freed and end.rst);
+        try t.expectEqual(@as(usize, tcp.max_orphan_probes), end.probes);
+        try t.expect(end.elapsed < 3600 * sec);
+    }
+    // The application still holds it (shutdown, not close): it may wait.
+    var r: Rig = undefined;
+    try r.init(.{ .user_timeout_ns = 10 * sec });
+    defer r.deinit();
+    const end = try closeIntoZeroWindow(&r, false, false, 2 * tcp.max_orphan_probes);
+    try t.expect(!end.freed and !end.rst);
+    try t.expect(end.elapsed > 10 * sec);
+}
+
 test "out-of-order segments: dup ACK, then both delivered in order" {
     var r: Rig = undefined;
     try r.init(.{});

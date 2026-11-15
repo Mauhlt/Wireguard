@@ -95,7 +95,10 @@ pub const Limits = struct {
     /// (shutdown) keeps waiting.
     fin_wait2_ns: u64 = 30 * std.time.ns_per_s,
     /// A connect or a retransmission that gets no answer for this long
-    /// fails the connection with error.ConnectionTimedOut.
+    /// fails the connection with error.ConnectionTimedOut. Also the most
+    /// an orphaned FIN-WAIT-1, CLOSING or LAST-ACK connection (closed and
+    /// released by the application, data or FIN still undelivered) lives
+    /// before it is reset, whatever the peer does.
     user_timeout_ns: u64 = 60 * std.time.ns_per_s,
     /// A bulk stream accepts writes only while it has fewer unsent bytes
     /// than this (like TCP_NOTSENT_LOWAT): its backlog stays in the

@@ -39,6 +39,10 @@ pub const undo_min_interval_ns: i64 = 1 * sec;
 pub const max_synack_retries = 3;
 pub const keepalive_interval_ns: i64 = 10 * sec;
 pub const keepalive_probes = 6;
+/// Zero-window probes an orphaned connection (the application closed it)
+/// sends before it gives up with an RST (Linux tcp_orphan_retries' default).
+/// A peer that answers every probe with window 0 cannot hold it open.
+pub const max_orphan_probes = 8;
 /// RFC 9293 3.7.1 default when the peer sends no MSS option.
 pub const default_peer_mss: u16 = 536;
 /// Smallest MSS we accept from a peer (RFC 9293 3.7.1: IPv4 minimum 536,
@@ -246,6 +250,12 @@ pub const Conn = struct {
     keepalive_at: ?i64 = null,
     timewait_at: ?i64 = null,
     tlp_at: ?i64 = null,
+    /// Orphaned FIN-WAIT-1, CLOSING or LAST-ACK: the connection is reset
+    /// and freed at this deadline whatever the peer does (see `orphan`).
+    orphan_at: ?i64 = null,
+    /// The application released the connection after closing it: nobody
+    /// is left to see an error, so zero-window probing is capped.
+    orphaned: bool = false,
 
     // RTT (RFC 6298)
     srtt: i64 = 0,
@@ -618,7 +628,12 @@ pub const Conn = struct {
 
         // Our FIN acknowledged.
         if (c.finAcked()) switch (c.state) {
-            .fin_wait_1 => c.state = .fin_wait_2,
+            .fin_wait_1 => {
+                // Everything delivered: an orphan now waits only for the
+                // peer's FIN, under Limits.fin_wait2_ns (see `orphan`).
+                c.state = .fin_wait_2;
+                c.orphan_at = null;
+            },
             .closing => c.enterTimeWait(env),
             .last_ack => {
                 c.state = .closed;
@@ -1214,14 +1229,45 @@ pub const Conn = struct {
         c.delack_at = null;
         c.timewait_at = env.now +| nsI64(env.limits.time_wait_ns);
         c.giveup_at = null;
+        c.orphan_at = null;
     }
 
-    /// The application released the connection: an orphaned FIN-WAIT-2
-    /// ends after Limits.fin_wait2_ns (the TIME-WAIT deadline is reused; a
-    /// FIN from the peer moves it to TIME-WAIT as usual).
-    pub fn orphanFinWait2(c: *Conn, env: *const Env) void {
-        if (c.state != .fin_wait_2 or c.timewait_at != null) return;
-        c.timewait_at = env.now +| nsI64(env.limits.fin_wait2_ns);
+    /// The application closed and released the connection (the stack calls
+    /// this after every change while no handle is held; a connection still
+    /// waiting in an accept queue is in none of these states). Each closing
+    /// state gets a deadline nobody can extend:
+    ///   FIN-WAIT-2          Limits.fin_wait2_ns (the TIME-WAIT deadline is
+    ///                       reused; a FIN from the peer moves it to
+    ///                       TIME-WAIT as usual), then freed silently.
+    ///   FIN-WAIT-1, CLOSING Limits.user_timeout_ns from the release, then
+    ///   LAST-ACK            reset (RST) and freed. Our data or FIN is still
+    ///                       undelivered; the user timeout is the bound the
+    ///                       stack already puts on delivering anything, and a
+    ///                       peer that ACKs probes while holding its window
+    ///                       at 0 (or opens it a byte at a time) would
+    ///                       otherwise keep the retransmission and user
+    ///                       timeouts from ever applying.
+    pub fn orphan(c: *Conn, env: *const Env) void {
+        switch (c.state) {
+            .fin_wait_2 => {
+                c.orphaned = true;
+                if (c.timewait_at == null) c.timewait_at = env.now +| nsI64(env.limits.fin_wait2_ns);
+            },
+            .fin_wait_1, .closing, .last_ack => {
+                c.orphaned = true;
+                if (c.orphan_at == null) c.orphan_at = env.now +| nsI64(env.limits.user_timeout_ns);
+            },
+            else => {},
+        }
+    }
+
+    /// An orphan past its deadline or its probe budget: the peer gets an
+    /// RST (it may still hold the connection) and the slot is freed.
+    fn abortOrphan(c: *Conn, env: *const Env) Outcome {
+        env.stats.timeouts += 1;
+        const rst: Rst = .{ .seq = c.snd_max, .ack = null };
+        c.fail(error.ConnectionTimedOut);
+        return .{ .rst = rst, .notify = true };
     }
 
     pub fn fail(c: *Conn, e: ConnError) void {
@@ -1241,6 +1287,7 @@ pub const Conn = struct {
         c.tlp_at = null;
         c.tlp_now = false;
         c.giveup_at = null;
+        c.orphan_at = null;
         c.rack.timer_at = null;
         c.ack_now = false;
         c.send_syn = false;
@@ -1279,7 +1326,7 @@ pub const Conn = struct {
         var d: ?i64 = null;
         // giveup_at is stale once an ACK cleared stalled_since: no wakeup.
         const giveup = if (c.stalled_since != null) c.giveup_at else null;
-        for ([_]?i64{ c.rto_at, c.delack_at, c.persist_at, c.keepalive_at, c.timewait_at, c.tlp_at, c.rack.timer_at, giveup }) |t| {
+        for ([_]?i64{ c.rto_at, c.delack_at, c.persist_at, c.keepalive_at, c.timewait_at, c.tlp_at, c.rack.timer_at, giveup, c.orphan_at }) |t| {
             if (t) |v| d = if (d) |x| @min(x, v) else v;
         }
         return d;
@@ -1294,6 +1341,7 @@ pub const Conn = struct {
             out.notify = true;
             return out;
         };
+        if (c.orphan_at) |t| if (now >= t) return c.abortOrphan(env);
         if (c.delack_at) |t| if (now >= t) {
             c.delack_at = null;
             c.ack_now = true;
@@ -1353,6 +1401,9 @@ pub const Conn = struct {
         };
         if (c.persist_at) |t| if (now >= t) {
             c.persist_at = null;
+            // Probes re-arm for as long as the peer answers them with a
+            // zero window: an orphan gets a fixed number.
+            if (c.orphaned and c.persist_backoff >= max_orphan_probes) return c.abortOrphan(env);
             c.probe_now = true;
             c.persist_backoff +|= 1;
             out.output = true;
