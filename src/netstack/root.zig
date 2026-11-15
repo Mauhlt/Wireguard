@@ -11,7 +11,7 @@
 //!                  timer}; runs TCP input, timers and output
 //!   host threads   Stream / Listener calls, thread-safe, blocking with a
 //!                  timeout or non-blocking (error.WouldBlock) plus
-//!                  `readyHandle()` for an event loop
+//!                  `Stack.setReadyCallback` for an event loop
 //!
 //!   Device --Tun.write--> [inbound Channel]  --> stack thread
 //!   Device <--Tun.read--- [outbound Channel] <-- stack thread
@@ -30,7 +30,6 @@ const stack_impl = @import("stack.zig");
 /// Interface addresses are the device's own type (raw network-order bytes).
 pub const Addr = dev.ip.Addr;
 pub const Clock = dev.device.Clock;
-pub const WaitHandle = wg_tun.WaitHandle;
 
 pub const Endpoint = struct {
     addr: Addr,

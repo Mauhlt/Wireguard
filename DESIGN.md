@@ -220,8 +220,7 @@ stack.listen(port) !Listener              // on every configured address (addres
 stack.dial(Endpoint) !Stream              // returns at once (SYN sent); .interactive; our address by the destination's family
 stack.dialWith(Endpoint, Priority) !Stream
 stack.dialWait(Endpoint, timeout_ns: ?u64) !Stream
-stack.readyHandle() WaitHandle; stack.clearReady()   // event-loop hosts
-stack.setReadyCallback(ctx, ?*const fn (?*anyopaque) void) // called when readyHandle is signalled
+stack.setReadyCallback(ctx, ?*const fn (?*anyopaque) void) // event-loop hosts: a stream / listener may be ready
 stack.abortAll()                          // RST everything, wake every blocked call
 stack.stats() Stats
 

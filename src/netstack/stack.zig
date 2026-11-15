@@ -120,7 +120,6 @@ pub const Stack = struct {
     outbound: queue.Channel,
     ctl: queue.PacketRing,
     kick: queue.Waker,
-    ready: queue.Waker,
     timer: os.DeadlineTimer,
     armed: ?i64 = null,
     /// The stack stopped filling the outbound ring (full, or bulk at its
@@ -181,8 +180,6 @@ pub const Stack = struct {
         errdefer ctl.deinit(gpa);
         var kick = try queue.Waker.init();
         errdefer kick.deinit();
-        var ready = try queue.Waker.init();
-        errdefer ready.deinit();
         var timer = os.DeadlineTimer.init() catch return error.SystemResources;
         errdefer timer.deinit();
         const bufs = try gpa.alloc(u8, 3 * @as(usize, options.mtu));
@@ -204,7 +201,6 @@ pub const Stack = struct {
             .outbound = outbound,
             .ctl = ctl,
             .kick = kick,
-            .ready = ready,
             .timer = timer,
             .isn_key = key,
             .next_port = std.mem.readInt(u32, &port_seed, .little) % ephemeral_count,
@@ -233,7 +229,6 @@ pub const Stack = struct {
         s.outbound.deinit(gpa);
         s.ctl.deinit(gpa);
         s.kick.deinit();
-        s.ready.deinit();
         s.timer.deinit();
         const bufs = s.in_buf.ptr[0 .. 3 * @as(usize, s.options.mtu)];
         std.crypto.secureZero(u8, bufs);
@@ -291,12 +286,14 @@ pub const Stack = struct {
         s.mutex.lockUncancelable(s.io);
     }
 
+    /// Unlocks, then runs the ready callback if a host-visible change
+    /// happened while locked (blocked host calls wait on their slot's
+    /// condition instead; nothing else needs waking).
     fn unlock(s: *Stack) void {
         const notify = s.notify_host;
         s.notify_host = false;
         const f = s.ready_fn;
         const ctx = s.ready_ctx;
-        if (notify) s.ready.signal();
         s.mutex.unlock(s.io);
         if (notify) if (f) |cb| cb(ctx);
     }
@@ -927,14 +924,10 @@ pub const Stack = struct {
         return st;
     }
 
-    pub fn readyHandle(s: *Stack) root.WaitHandle {
-        return s.ready.handle;
-    }
-
-    /// Calls `f(ctx)` whenever `readyHandle` is signalled (a stream or
-    /// listener may have become readable, writable, acceptable, connected
-    /// or closed). It runs on the stack thread, or on a host thread whose
-    /// call changed state (e.g. close), after the stack's lock is released.
+    /// Calls `f(ctx)` whenever a stream or listener may have become
+    /// readable, writable, acceptable, connected or closed. It runs on the
+    /// stack thread, or on a host thread whose call changed state (e.g.
+    /// close), after the stack's lock is released.
     /// It must be quick and must not block; it should only wake the host
     /// (signal a condition / event) and not call back into the stack.
     /// null removes it.
@@ -943,10 +936,6 @@ pub const Stack = struct {
         defer s.unlock();
         s.ready_ctx = ctx;
         s.ready_fn = f;
-    }
-
-    pub fn clearReady(s: *Stack) void {
-        s.ready.clear();
     }
 
     pub fn stats(s: *Stack) root.Stats {
