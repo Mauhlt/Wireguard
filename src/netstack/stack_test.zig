@@ -557,6 +557,30 @@ test "bulk stream: write stops at the unsent low-watermark; interactive goes fir
     try t.expectEqualStrings("key", first.payload);
 }
 
+test "interactive stream: its own unsent low-watermark, set and cleared" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const e = try r.established(l);
+    // Zero window from the peer: nothing leaves, so nothing is "sent".
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0 });
+    var big: [40 * 1024]u8 = @splat('m');
+    e.st.setUnsentLowat(16 * 1024 + 512);
+    try t.expectEqual(@as(usize, 16 * 1024 + 512), try e.st.write(&big));
+    try t.expectError(error.WouldBlock, e.st.write(&big));
+    try t.expect(!e.st.status().writable);
+    // A segment leaves: below the mark, the writer may go on.
+    r.send(.{ .seq = e.rcv, .ack = e.snd, .flags = .{ .ack = true }, .window = 0xffff });
+    _ = try r.recv();
+    try t.expect(e.st.status().writable);
+    // Back to the default (none for interactive): the send buffer is the
+    // only limit again, and the waiting writer may go on.
+    e.st.setUnsentLowat(null);
+    try t.expect(e.st.status().writable);
+    try t.expect(try e.st.write(&big) > 0);
+}
+
 /// Two manually driven stacks joined by an in-process link with seeded
 /// loss and reordering. When the link is idle the shared clock jumps to
 /// the earliest timer deadline, so a run is fast and deterministic.

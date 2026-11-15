@@ -246,7 +246,11 @@ bulk data; round-robin inside each class. Bulk data may occupy at most
 half of the stack -> device ring, so an interactive packet always finds
 room. A bulk stream accepts writes only while it has fewer than
 `bulk_unsent_lowat` unsent bytes (like TCP_NOTSENT_LOWAT), so its backlog
-stays in the application. No Nagle, no delayed sends for anything.
+stays in the application. Any stream may set its own mark
+(`Stream.setUnsentLowat`; null goes back to the default): an
+interactive stream that sends large messages in parts keeps all but
+about one part in the application, so what it sends next is never
+queued behind more than that. No Nagle, no delayed sends for anything.
 
 The ready callback runs on the stack thread (or on a host thread whose
 call changed state, e.g. close), after the stack lock is released; it

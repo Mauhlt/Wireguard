@@ -99,7 +99,8 @@ pub const Limits = struct {
     user_timeout_ns: u64 = 60 * std.time.ns_per_s,
     /// A bulk stream accepts writes only while it has fewer unsent bytes
     /// than this (like TCP_NOTSENT_LOWAT): its backlog stays in the
-    /// application, not in front of other traffic.
+    /// application, not in front of other traffic. Any stream may set its
+    /// own (Stream.setUnsentLowat).
     bulk_unsent_lowat: u32 = 64 * 1024,
 };
 

@@ -173,6 +173,10 @@ pub const Conn = struct {
     local: Endpoint,
     remote: Endpoint,
     priority: root.Priority = .interactive,
+    /// Writes stop at this many unsent bytes (Stream.setUnsentLowat); null:
+    /// the priority's default (bulk: Limits.bulk_unsent_lowat, interactive:
+    /// none).
+    unsent_lowat: ?u32 = null,
 
     /// One allocation: send buffer ++ receive buffer (empty until needed).
     mem: []u8 = &.{},
@@ -423,9 +427,16 @@ pub const Conn = struct {
         return c.rcv.len > 0 or c.eof or c.err != null or c.state == .closed;
     }
 
-    /// Bytes `hostWrite` would accept now. Bulk streams stop at
-    /// Limits.bulk_unsent_lowat unsent bytes (TCP_NOTSENT_LOWAT): the
-    /// backlog stays in the application, not in front of other traffic.
+    /// The unsent low-watermark in force (TCP_NOTSENT_LOWAT), if any.
+    pub fn unsentLowat(c: *const Conn, limits: *const root.Limits) ?u32 {
+        if (c.unsent_lowat) |n| return n;
+        return if (c.priority == .bulk) limits.bulk_unsent_lowat else null;
+    }
+
+    /// Bytes `hostWrite` would accept now. A stream with an unsent
+    /// low-watermark (unsentLowat: every bulk stream, and any stream that
+    /// set one) stops there: the backlog stays in the application, not in
+    /// the send buffer in front of what the application sends next.
     pub fn writeRoom(c: *const Conn, limits: *const root.Limits) usize {
         if (c.fin_queued) return 0;
         switch (c.state) {
@@ -433,7 +444,7 @@ pub const Conn = struct {
             else => return 0,
         }
         var room = c.snd.free();
-        if (c.priority == .bulk) room = @min(room, limits.bulk_unsent_lowat -| c.unsent());
+        if (c.unsentLowat(limits)) |lw| room = @min(room, lw -| c.unsent());
         return room;
     }
 

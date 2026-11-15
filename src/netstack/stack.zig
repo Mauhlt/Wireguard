@@ -852,7 +852,7 @@ pub const Stack = struct {
                 const p = sl.conn.output(&e, buf, s.ip_id, pass.class) orelse continue;
                 s.rr = i + 1;
                 s.st.tx_packets += 1;
-                // A bulk writer blocked on the unsent low-watermark may go on.
+                // A writer blocked on the unsent low-watermark may go on.
                 if (was_full and sl.conn.writeRoom(&s.options.limits) > 0) s.notifySlot(sl);
                 return p;
             }
@@ -1275,6 +1275,21 @@ pub const Stream = struct {
         defer s.unlock();
         const sl = s.slotOf(st.id) orelse return;
         sl.conn.priority = priority;
+        s.notifySlot(sl);
+        s.kickThread();
+    }
+
+    /// Writes accept bytes only while fewer than `n` are unsent (like
+    /// TCP_NOTSENT_LOWAT), so a large message waits in the application
+    /// and what it sends next (a keystroke's echo) is never queued behind
+    /// more than about `n` bytes. Null: the priority's default (bulk:
+    /// Limits.bulk_unsent_lowat; interactive: none, only the send buffer).
+    pub fn setUnsentLowat(st: Stream, n: ?u32) void {
+        const s = st.stack;
+        s.lock();
+        defer s.unlock();
+        const sl = s.slotOf(st.id) orelse return;
+        sl.conn.unsent_lowat = n;
         s.notifySlot(sl);
         s.kickThread();
     }
