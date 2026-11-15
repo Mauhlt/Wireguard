@@ -49,10 +49,6 @@ pub const Peer = struct {
         return self.timers.start();
     }
 
-    pub fn stop(self: *Peer) void {
-        self.timers.stop();
-    }
-
     pub fn setPersistentKeepalive(self: *Peer, seconds: u16) Actions {
         return self.timers.setPersistentKeepalive(seconds);
     }

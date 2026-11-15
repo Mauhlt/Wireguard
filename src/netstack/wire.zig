@@ -342,7 +342,9 @@ pub const TcpOptions = struct {
     /// Shift count as sent; parse clamps values above 14 to 14 (RFC 7323 2.3).
     window_scale: ?u8 = null,
     sack_permitted: bool = false,
-    /// TSval, TSecr. Parsed (validated) but not used by the stack.
+    /// TSval, TSecr. Parsed (validated) but not used by the stack, which
+    /// never sends it; test peers (testing.Peer, the fuzzers) write it to
+    /// act like Linux peers, which send it on every segment.
     timestamp: ?[2]u32 = null,
     /// SACK blocks (kind 5). A malformed SACK option is ignored (null),
     /// not trusted and not fatal.

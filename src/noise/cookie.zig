@@ -64,12 +64,6 @@ pub const CookieChecker = struct {
         };
     }
 
-    /// Re-key after the local static key changed (keeps nothing).
-    pub fn reset(self: *CookieChecker, local_public: *const crypto.PublicKey) void {
-        self.wipe();
-        self.* = init(local_public);
-    }
-
     pub fn wipe(self: *CookieChecker) void {
         crypto.wipe(self);
     }

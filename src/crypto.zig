@@ -228,9 +228,6 @@ pub fn wipe(ptr: anytype) void {
     }
 }
 
-/// Alias for the name used in DESIGN.md.
-pub const secureZero = wipe;
-
 /// Comptime hex literal to bytes (test vectors).
 pub fn hexTo(comptime n: usize, comptime s: []const u8) [n]u8 {
     const bytes = comptime blk: {

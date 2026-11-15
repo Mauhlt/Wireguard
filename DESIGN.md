@@ -64,7 +64,7 @@ pub fn tai64n(now_ns: i96) Tai64n;                                    // wall cl
 pub fn tai64nAfter(a: *const Tai64n, b: *const Tai64n) bool;          // constant-time a > b
 pub fn eql(comptime n: usize, a: *const [n]u8, b: *const [n]u8) bool; // constant time
 pub fn isZero(comptime n: usize, a: *const [n]u8) bool;               // constant time
-pub fn wipe(ptr: anytype) void;                                       // *T or []T; secureZero is an alias
+pub fn wipe(ptr: anytype) void;                                       // *T or []T
 // Key text (base64, 44 chars): device/keys.zig encode / decode, constant time.
 pub fn hexTo(comptime n: usize, comptime s: []const u8) [n]u8;        // test-vector helper
 ```
@@ -273,7 +273,8 @@ either family; `wire.mssFor(addr, mtu)` is the one MSS derivation.
 `netstack.testing` holds the packet-crafting fake peer (`testing.Peer`,
 either family), `icmpPacket`, `withExtHeaders6` and `ImpairedTun`
 (seeded loss / reorder / duplication, either family), for unit tests,
-tests/netstack and fuzzers alike.
+tests/netstack and fuzzers alike; it exists only in test builds
+(`builtin.is_test`), so no program can reach it.
 
 TCP: RFC 9293 state machine (both handshakes, simultaneous open, FIN/RST,
 TIME-WAIT bounded by Limits.time_wait_ns, an orphaned FIN-WAIT-2 (closed

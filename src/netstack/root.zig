@@ -24,7 +24,9 @@ const wg_tun = @import("../tun/root.zig");
 const dev = @import("../device/root.zig");
 
 pub const wire = @import("wire.zig");
-pub const testing = @import("testing.zig");
+/// Test helpers (the crafted TCP peer, ImpairedTun): only in test builds
+/// (unit tests, tests/netstack, the fuzzers), never in a program's API.
+pub const testing = if (@import("builtin").is_test) @import("testing.zig") else struct {};
 const stack_impl = @import("stack.zig");
 
 /// Interface addresses are the device's own type (raw network-order bytes).

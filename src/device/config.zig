@@ -547,8 +547,10 @@ fn expectInvalid(text: []const u8, line: u32, needle: []const u8) !void {
 }
 
 /// Test helper: wraps testing.allocator and remembers whether any block given back
-/// still contained one of `needles` (key bytes).
-pub const FreeSpy = struct {
+/// still contained one of `needles` (key bytes). Only in test builds.
+pub const FreeSpy = if (@import("builtin").is_test) FreeSpyImpl else void;
+
+const FreeSpyImpl = struct {
     needles: []const []const u8,
     leaked: bool = false,
 

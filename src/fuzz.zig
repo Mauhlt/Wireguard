@@ -552,7 +552,7 @@ const Harness = struct {
     from: net.IpAddress,
     remote: noise.Local,
     hs: noise.Handshake,
-    keys: ?noise.Seed = null,
+    keys: ?noise.Keys = null,
     counter: u64 = 0,
 
     const allowed = [_]ip.Cidr{
