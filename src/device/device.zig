@@ -1090,12 +1090,6 @@ pub const Device = struct {
             return;
         };
         const p = d.peers.items[id];
-        // The replay check (strictly newer timestamp) only knows what this
-        // process has accepted. Until then a recorded initiation replayed
-        // by an on-path observer passes it, so the first one must not move
-        // a known endpoint: the reply still goes to `from`, and the
-        // endpoint follows once a transport packet authenticates.
-        const timestamp_known = !crypto.isZero(crypto.tai64n_len, &p.hs.latest_timestamp);
         p.hs.consumeInitiation(&start, now) catch {
             d.stats.dropped_invalid += 1;
             return;
@@ -1117,8 +1111,18 @@ pub const Device = struct {
         if (p.handshake_index) |old| d.indices.remove(old);
         p.handshake_index = null;
         d.retire(p.sess.responderSession(&seed, now));
-        if (timestamp_known or p.endpoint == null) p.endpoint = from;
-        p.last_authenticated = now;
+        // An initiation alone proves nothing about its sender: the replay
+        // check (strictly newer timestamp) only knows what this process has
+        // accepted, so after a restart a recorded initiation replayed by an
+        // on-path observer passes it, and any initiation can be copied to
+        // another source address. So it neither moves the endpoint nor
+        // counts as authenticated traffic: the response goes to `from`,
+        // and the endpoint follows the first transport packet of the new
+        // session (handleTransport), which only the real initiator can
+        // send. Initiators send one at once (kernel, wireguard-go and zwg
+        // all confirm a new session with data or a keepalive), and the
+        // responder may not send on the new session before it arrives
+        // anyway (whitepaper 5.4.6).
         d.sendUdp(from, resp.asBytes());
         p.rx_bytes += msg.len;
         p.tx_bytes += noise.Response.size;

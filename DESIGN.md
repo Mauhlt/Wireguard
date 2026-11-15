@@ -127,7 +127,11 @@ expire keys, zero keys). The device waits until that deadline; nothing ticks.
 Peers (public key, psk, endpoint, allowed IPs, persistent keepalive), a
 cryptokey-routing table (longest-prefix-match trie for IPv4 + IPv6), the
 `[Interface]/[Peer]` .conf format (as wg-quick / WireGuard for Windows write
-it), endpoint roaming (update endpoint from authenticated packets), endpoint
+it), endpoint roaming (update endpoint from authenticated transport packets
+and handshake responses; an initiation alone, which an on-path observer can
+replay after a restart, is answered where it came from but neither moves
+the endpoint nor counts as authenticated; the initiator's confirming
+transport packet does), endpoint
 DNS names looked up again while handshakes go unanswered or after a failed
 lookup (resolver.zig: a detached lookup thread, deadlines, no ticks), handshake
 rate limiting / under-load detection, UDP sockets (IPv4 + IPv6) and the main

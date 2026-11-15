@@ -288,44 +288,78 @@ test "bind: an IPv6 port already held by another socket fails the device" {
     try testing.expect(d.udp4 != null and d.udp6 != null);
 }
 
-test "first initiation since start does not move a known endpoint (replay after restart)" {
+test "an initiation alone never moves the endpoint (replay after restart); the session's first transport packet does" {
+    const session = @import("../session/root.zig");
+    const noise = @import("../noise/root.zig");
     const gpa = testing.allocator;
     var clock: dev.Clock = .{ .io = testing.io };
-    const noise = @import("../noise/root.zig");
     var priv: crypto.PrivateKey = undefined;
     testing.io.random(&priv);
     var peer_priv: crypto.PrivateKey = undefined;
     testing.io.random(&peer_priv);
     var peer_local = noise.Local.init(peer_priv);
     defer peer_local.wipe();
+    // The initiator's real address: a loopback socket that receives the
+    // responses. `known` is where the device last saw the peer.
+    var sock = try os.Udp.open(.v4, 0);
+    defer sock.close();
+    const elsewhere: std.Io.net.IpAddress = .{ .ip4 = .loopback(sock.localPort()) };
     const known: std.Io.net.IpAddress = .{ .ip4 = .loopback(9) };
-    const elsewhere: std.Io.net.IpAddress = .{ .ip4 = .loopback(10) };
-    var fake: tun.FakeTun = try .init(gpa, .{});
-    defer fake.deinit();
-    const d = try Device.create(gpa, &clock, fake.tun(), .{
-        .private_key = priv,
-        .peers = &.{.{ .public_key = peer_local.public, .endpoint = known }},
-    });
-    defer d.destroy();
-    const p = d.peerByKey(peer_local.public).?;
 
-    var hs = noise.Handshake.init(&peer_local, d.local.public, @splat(0));
-    defer hs.wipe();
-    var prng = std.Random.DefaultPrng.init(5);
-    const now = clock.now();
-    // A valid initiation (as an observer could have recorded it before a
-    // restart) from another address: answered, but the endpoint stays.
-    const m1 = try hs.createInitiation(&peer_local, clock.wall(), now, 91, prng.random());
-    var b1 = m1.asBytes().*;
-    d.handleDatagram(&b1, elsewhere, now);
-    try testing.expect(!crypto.isZero(crypto.tai64n_len, &p.hs.latest_timestamp));
-    try testing.expect(p.endpoint.?.eql(&known));
-    // With a timestamp on record, a newer initiation roams as usual.
-    const later = now + std.time.ns_per_s;
-    const m2 = try hs.createInitiation(&peer_local, clock.wall() + std.time.ns_per_s, later, 92, prng.random());
-    var b2 = m2.asBytes().*;
-    d.handleDatagram(&b2, elsewhere, later);
-    try testing.expect(p.endpoint.?.eql(&elsewhere));
+    for ([_]?std.Io.net.IpAddress{ known, null }) |configured| {
+        var fake: tun.FakeTun = try .init(gpa, .{});
+        defer fake.deinit();
+        const d = try Device.create(gpa, &clock, fake.tun(), .{
+            .private_key = priv,
+            .loopback_only = true,
+            .peers = &.{.{ .public_key = peer_local.public, .endpoint = configured }},
+        });
+        defer d.destroy();
+        const p = d.peerByKey(peer_local.public).?;
+
+        var hs = noise.Handshake.init(&peer_local, d.local.public, @splat(0));
+        defer hs.wipe();
+        var prng = std.Random.DefaultPrng.init(5);
+        const now = clock.now();
+        // A valid initiation (as an observer could have recorded it before
+        // a restart) from another address: answered there, but the endpoint
+        // stays and nothing counts as authenticated.
+        const m1 = try hs.createInitiation(&peer_local, clock.wall(), now, 91, prng.random());
+        var b1 = m1.asBytes().*;
+        d.handleDatagram(&b1, elsewhere, now);
+        try testing.expect(!crypto.isZero(crypto.tai64n_len, &p.hs.latest_timestamp));
+        try testing.expectEqual(configured, p.endpoint);
+        try testing.expectEqual(@as(?i64, null), p.last_authenticated);
+        // A newer one (the timestamp is on record now) does not either.
+        const later = now + std.time.ns_per_s;
+        const m2 = try hs.createInitiation(&peer_local, clock.wall() + std.time.ns_per_s, later, 92, prng.random());
+        var b2 = m2.asBytes().*;
+        d.handleDatagram(&b2, elsewhere, later);
+        try testing.expectEqual(configured, p.endpoint);
+        try testing.expectEqual(@as(?i64, null), p.last_authenticated);
+
+        // The real initiator takes the second response and confirms the
+        // session with a keepalive: now the endpoint follows.
+        var rbuf: [256]u8 = undefined;
+        const resp = wait: while (true) {
+            _ = (try os.wait(&.{sock.waitHandle()}, 2 * std.time.ns_per_s)) orelse return error.NoResponse;
+            sock.beginDrain();
+            while (try sock.recv(&rbuf)) |dg| {
+                const r = try noise.Response.parse(rbuf[0..dg.len]);
+                if (r.receiverIndex() == 92) break :wait r; // the answer to m2
+            }
+        };
+        try hs.consumeResponse(&peer_local, resp);
+        var keys = try hs.deriveKeys();
+        var ini = session.Peer.init(.none);
+        _ = ini.initiatorSession(&keys, later);
+        var kbuf: [128]u8 = undefined;
+        const ka = try ini.encrypt(later, &.{}, 1420, &kbuf);
+        _ = ini.deinit();
+        d.handleDatagram(kbuf[0..ka.len], elsewhere, later);
+        try testing.expect(p.endpoint.?.eql(&elsewhere));
+        try testing.expectEqual(@as(?i64, later), p.last_authenticated);
+    }
 }
 
 test "run returns when the external stop handle (zwg down) is signaled" {
