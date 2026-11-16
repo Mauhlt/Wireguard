@@ -317,7 +317,8 @@ test "conformance: no listener: SYN gets RST+ACK, ACK gets RST, RST gets nothing
 }
 
 test "conformance: in-window RST not at RCV.NXT -> challenge ACK; exact RST resets (RFC 5961 3)" {
-    const h = try H.create(gpa, .{});
+    // A full-size window from the start (offsets up to 30000 are in it).
+    const h = try H.create(gpa, .{ .limits = .{ .initial_buffer = 256 * 1024 } });
     defer h.destroy();
     const l = try h.stack.listen(8420);
     var c = try hz.openPassive(h, l, .{});

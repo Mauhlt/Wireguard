@@ -199,10 +199,12 @@ Public API (`const ns = @import("WireGuard").netstack;`):
 ```zig
 ns.Addr = device.ip.Addr                  // .v4 or .v6
 ns.Endpoint { addr: Addr, port: u16 }
-ns.Limits { max_connections=64, max_listeners=8, send_buffer=256K, recv_buffer=256K,
-            syn_backlog=16, accept_backlog=16, syn_backlog_per_source=4,
-            max_connections_per_source=16, max_ooo_segments=32, ring_packets=512,
+ns.Limits { max_connections=2048, max_listeners=8, send_buffer=256K, recv_buffer=256K,
+            initial_buffer=8K, syn_backlog=128, accept_backlog=128, syn_backlog_per_source=4,
+            max_connections_per_source=8, max_ooo_segments=32, ring_packets=512,
             time_wait_ns=2s, fin_wait2_ns=30s, user_timeout_ns=60s, bulk_unsent_lowat=64K }
+ns.lab_devices = 250, ns.connections_per_device = 8   // what the defaults are sized for
+ns.Memory { slots, slot_bytes, buffer_bytes }          // stack.memory(): what connections hold now
 ns.Priority = enum { interactive, bulk }
 ns.Options { address: Addr, address6: ?Addr=null, mtu=1420, limits, keepalive_idle_ns: ?u64=null, icmp_echo=true }
           // address: IPv4 (or IPv6 for a v6-only stack); address6: IPv6 next to an IPv4 address
@@ -239,6 +241,38 @@ stream.local() / remote() Endpoint
 stream.reader(buf, timeout_ns) Stream.Reader   // .interface: std.Io.Reader, .err
 stream.writer(buf, timeout_ns) Stream.Writer   // .interface: std.Io.Writer, .err
 ```
+
+Sized for a lab (owner, 2026-11-15): one desk's stack serves up to 250
+devices (`lab_devices`), each with a few connections (Portal: one
+interactive WebSocket, a bulk one while it syncs, a reconnect overlapping
+a dying one; its desk lets a device upgrade at most 4 interactive + 2 bulk
+connections), so `max_connections_per_source = connections_per_device = 8`
+and `max_connections = 2048` (250 x 8, rounded up). The per-source caps and
+the orphan protections are unchanged; the SYN and accept backlogs (128
+each) stay bounded but let a lab's devices reconnect together after a desk
+restart. Memory follows use, not the caps:
+
+* **Slots** (`Stack.slot_ptrs`): a table of `max_connections` pointers; a
+  slot (the connection's state, ~7.5 KiB, mostly RACK's 256-record ring)
+  is created the first time the table has no free one and kept for reuse
+  until `destroy` (a woken waiter may still touch its condition). A desk
+  pays for the most connections it has had at once.
+* **Buffers** (`tcp.Conn.allocBuffers`): each established connection starts
+  with `initial_buffer` (8 KiB) to send and 8 KiB to receive. The send
+  buffer doubles when a write needs more (`growSend`, never past the
+  unsent low-watermark, up to `send_buffer`) and goes back to 8 KiB once
+  everything sent was acknowledged (`shrinkSend`). The receive buffer
+  doubles once what it holds, out-of-order data included, reaches half of
+  it (`growRecv`, up to `recv_buffer`), and the ACK that follows carries
+  the wider window; the window offered never shrinks (a SYN-ACK offers
+  the first buffer's size, not `recv_buffer`). A resize copies the ring in
+  logical order and wipes the old buffer. Out of memory, a buffer stays as
+  it is: a write takes what fits and waits for ACKs, data beyond the window
+  is dropped as before.
+* Measured (src/netstack/stack_test.zig, "a lab: 250 devices"): 500 idle
+  connections hold 11.5 MiB, 24080 bytes each (slot 7696 + buffers 16384);
+  a device with two connections about 47 KiB. The caps alone would allow
+  2048 x 512 KiB; network input still never allocates beyond them.
 
 Interactive vs bulk (a large transfer must never delay a keystroke; bytes in
 one stream are ordered, so Portal uses separate connections). Output

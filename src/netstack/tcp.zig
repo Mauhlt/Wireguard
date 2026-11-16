@@ -182,8 +182,7 @@ pub const Conn = struct {
     /// none).
     unsent_lowat: ?u32 = null,
 
-    /// One allocation: send buffer ++ receive buffer (empty until needed).
-    mem: []u8 = &.{},
+    /// The send and receive buffers (empty until needed; see allocBuffers).
     snd: ByteRing = .{},
     rcv: ByteRing = .{},
 
@@ -317,22 +316,92 @@ pub const Conn = struct {
         return sh;
     }
 
+    /// The send and receive buffers, each `initialBuffer` to start with:
+    /// they grow as the connection needs them (`growSend` on a write,
+    /// `growRecv` as data arrives) up to Limits.send_buffer and
+    /// recv_buffer, and the send buffer goes back to its first size once
+    /// everything sent was acknowledged (`shrinkSend`). An idle connection
+    /// holds only the two small ones.
     pub fn allocBuffers(c: *Conn, env: *const Env) error{OutOfMemory}!void {
-        if (c.mem.len != 0) return;
-        const sb = env.limits.send_buffer;
-        const rb = env.limits.recv_buffer;
-        c.mem = try env.gpa.alloc(u8, @as(usize, sb) + rb);
-        c.snd = .{ .buf = c.mem[0..sb] };
-        c.rcv = .{ .buf = c.mem[sb..] };
+        if (c.snd.cap() != 0 or c.rcv.cap() != 0) return;
+        const sb = initialBuffer(env.limits, env.limits.send_buffer);
+        const rb = initialBuffer(env.limits, env.limits.recv_buffer);
+        const s = try env.gpa.alloc(u8, sb);
+        errdefer env.gpa.free(s);
+        const r = try env.gpa.alloc(u8, rb);
+        c.snd = .{ .buf = s };
+        c.rcv = .{ .buf = r };
+    }
+
+    /// A buffer's first size: Limits.initial_buffer, at most `max`.
+    pub fn initialBuffer(limits: *const root.Limits, max: u32) usize {
+        return @min(@max(limits.initial_buffer, 1), max);
     }
 
     pub fn freeBuffers(c: *Conn, gpa: std.mem.Allocator) void {
-        if (c.mem.len == 0) return;
-        std.crypto.secureZero(u8, c.mem);
-        gpa.free(c.mem);
-        c.mem = &.{};
-        c.snd = .{};
-        c.rcv = .{};
+        freeRing(gpa, &c.snd);
+        freeRing(gpa, &c.rcv);
+    }
+
+    /// Bytes of buffer this connection holds now (send + receive).
+    pub fn bufferBytes(c: *const Conn) usize {
+        return c.snd.cap() + c.rcv.cap();
+    }
+
+    fn freeRing(gpa: std.mem.Allocator, r: *ByteRing) void {
+        if (r.buf.len == 0) return;
+        std.crypto.secureZero(u8, r.buf);
+        gpa.free(r.buf);
+        r.* = .{};
+    }
+
+    /// `r` moved into a buffer of `new_cap` bytes (at least its logical
+    /// contents: the bytes held and, past them, the out-of-order area up
+    /// to `keep`), in logical order from 0. False (unchanged): no memory.
+    fn resizeRing(gpa: std.mem.Allocator, r: *ByteRing, new_cap: usize, keep: usize) bool {
+        std.debug.assert(keep <= new_cap and keep <= r.buf.len);
+        const nb = gpa.alloc(u8, new_cap) catch return false;
+        if (keep > 0) r.readAt(0, nb[0..keep]);
+        const len = r.len;
+        freeRing(gpa, r);
+        r.* = .{ .buf = nb, .len = len };
+        return true;
+    }
+
+    /// The send buffer made big enough for `want` more bytes, by doubling,
+    /// up to Limits.send_buffer. Out of memory it stays as it is (the write
+    /// takes what fits now; the rest waits for ACKs as before).
+    fn growSend(c: *Conn, gpa: std.mem.Allocator, limits: *const root.Limits, want: usize) void {
+        const max: usize = limits.send_buffer;
+        if (c.snd.cap() == 0 or c.snd.free() >= want or c.snd.cap() >= max) return;
+        var cap = c.snd.cap();
+        while (cap - c.snd.len < want and cap < max) cap = @min(max, cap * 2);
+        _ = resizeRing(gpa, &c.snd, cap, c.snd.len);
+    }
+
+    /// Back to the first size once nothing is left to send or to be
+    /// acknowledged (the bulk transfer is over).
+    fn shrinkSend(c: *Conn, env: *const Env) void {
+        const first = initialBuffer(env.limits, env.limits.send_buffer);
+        if (c.snd.len != 0 or c.snd.cap() <= first or c.fin_queued) return;
+        _ = resizeRing(env.gpa, &c.snd, first, 0);
+    }
+
+    /// The receive buffer doubled (up to Limits.recv_buffer) once what it
+    /// holds, the out-of-order data included, reaches half of it: the
+    /// window then opens further (never shrinks: it only grows). Out of
+    /// memory it stays as it is.
+    fn growRecv(c: *Conn, env: *const Env) void {
+        const max: usize = env.limits.recv_buffer;
+        const cap = c.rcv.cap();
+        if (cap == 0 or cap >= max) return;
+        var used: usize = c.rcv.len;
+        for (c.ooo[0..c.ooo_len]) |r| used = @max(used, c.rcv.len + (r.end -% c.rcv_nxt));
+        if (used * 2 < cap) return;
+        if (resizeRing(env.gpa, &c.rcv, @min(max, cap * 2), cap)) {
+            env.stats.buffer_grows += 1;
+            c.ack_now = true; // tell the peer the window opened
+        }
     }
 
     /// Active open: buffers allocated, SYN queued.
@@ -414,7 +483,9 @@ pub const Conn = struct {
     }
     /// Receive space: what the window may cover from rcv_nxt.
     fn rcvSpace(c: *const Conn, env: *const Env) u32 {
-        if (c.rcv.cap() == 0) return env.limits.recv_buffer;
+        // No buffer yet (SYN-RECEIVED): the one it will start with, so the
+        // window offered never shrinks once it exists.
+        if (c.rcv.cap() == 0) return len32(initialBuffer(env.limits, env.limits.recv_buffer));
         return len32(c.rcv.free());
     }
     fn synchronized(c: *const Conn) bool {
@@ -480,7 +551,13 @@ pub const Conn = struct {
         return n;
     }
 
-    pub fn hostWrite(c: *Conn, limits: *const root.Limits, data: []const u8) usize {
+    /// Host write: the send buffer grows first if `data` does not fit
+    /// (growSend; never past the unsent low-watermark).
+    pub fn hostWrite(c: *Conn, gpa: std.mem.Allocator, limits: *const root.Limits, data: []const u8) usize {
+        if (c.writeRoom(limits) == 0 and c.snd.free() > 0) return 0; // at the low-watermark
+        var want = data.len;
+        if (c.unsentLowat(limits)) |lw| want = @min(want, lw -| c.unsent());
+        c.growSend(gpa, limits, want);
         const room = c.writeRoom(limits);
         return c.snd.append(data[0..@min(data.len, room)]);
     }
@@ -790,6 +867,7 @@ pub const Conn = struct {
             const n = @min(ack -% c.snd_base, len32(c.snd.len));
             c.snd.consume(n);
             c.snd_base +%= n;
+            c.shrinkSend(env);
         }
         c.snd_una = ack;
         if (seqLt(c.snd_nxt, ack)) c.snd_nxt = ack;
@@ -825,8 +903,9 @@ pub const Conn = struct {
             }
             if (rack_lost and c.mayRecover(ack)) c.enterRecovery(env);
         }
-        // No point growing past what the buffer can ever have in flight.
-        const cwnd_cap = len32(c.snd.cap()) +| 2 * @as(u32, c.mss);
+        // No point growing past what the buffer can ever have in flight
+        // (its most: it grows on demand).
+        const cwnd_cap = env.limits.send_buffer +| 2 * @as(u32, c.mss);
         if (c.cwnd > cwnd_cap) c.cwnd = cwnd_cap;
 
         c.rto_at = if (c.snd_una == c.snd_max) null else env.now + c.rto;
@@ -1068,7 +1147,7 @@ pub const Conn = struct {
     /// undoing a spurious recovery.
     fn onDsack(c: *Conn, env: *const Env, b: wire.SackBlock) void {
         const len = b.end -% b.start;
-        const floor = c.snd_una -% len32(c.snd.cap());
+        const floor = c.snd_una -% env.limits.send_buffer;
         if (len == 0 or len > 0xffff or seqLt(b.start, floor) or seqLt(c.snd_max, b.end)) {
             env.stats.sack_blocks_ignored += 1;
             return;
@@ -1174,6 +1253,7 @@ pub const Conn = struct {
             }
             c.rcv.writeAt(c.rcv.len + off, data);
         }
+        c.growRecv(env);
     }
 
     fn addRange(c: *Conn, env: *const Env, start: u32, end: u32) bool {

@@ -235,8 +235,13 @@ pub fn runSender(o: RunOpts) !RunResult {
     std.debug.print("sack {t}{s}{s}: {d} KiB intact in {d:.2} virtual s; retransmits {d} (RTO {d}, fast {d}); SACK blocks ignored {d}; max {d} packets per ACK (burst average)\n", .{
         o.strategy, if (o.offer_sack) "" else " (no SACK)", o.label, o.total / 1024, @as(f64, @floatFromInt(virt)) / 1e9, st.retransmits, st.rto_expirations, st.fast_retransmits, st.sack_blocks_ignored, max_out,
     });
-    // Network input after establishment allocates nothing.
-    try t.expectEqual(allocs0, h.fa.allocations);
+    // After establishment only the buffers resize (the send buffer grows
+    // with the writes up to its cap, and goes back once drained): a few
+    // allocations, however many blocks the peer sends.
+    const lim = h.cfg.limits;
+    const doublings = std.math.log2_int_ceil(u32, lim.send_buffer / @min(lim.initial_buffer, lim.send_buffer)) +
+        std.math.log2_int_ceil(u32, lim.recv_buffer / @min(lim.initial_buffer, lim.recv_buffer));
+    try t.expect(h.fa.allocations - allocs0 <= 2 * (@as(usize, doublings) + 1));
     // Work per ACK bounded by what cwnd / the send buffer allow, never by
     // what the peer's blocks claim.
     try t.expect(max_out <= 256);

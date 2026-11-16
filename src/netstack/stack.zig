@@ -111,7 +111,13 @@ pub const Stack = struct {
     options: Options,
 
     mutex: std.Io.Mutex = .init,
-    slots: []Slot,
+    /// The connection table: room for Limits.max_connections slot
+    /// pointers, of which the first `n_slots` exist. A slot is created the
+    /// first time the table has no free one (allocSlot) and lives until
+    /// `destroy` (a woken waiter may still touch its condition), so a desk
+    /// pays for the most connections it has had at once, not for its cap.
+    slot_ptrs: []*Slot,
+    n_slots: usize = 0,
     listeners: []ListenSlot,
 
     /// device -> stack (consumer: stack thread).
@@ -166,9 +172,8 @@ pub const Stack = struct {
 
         const s = try gpa.create(Stack);
         errdefer gpa.destroy(s);
-        const slots = try gpa.alloc(Slot, l.max_connections);
+        const slots = try gpa.alloc(*Slot, l.max_connections);
         errdefer gpa.free(slots);
-        @memset(slots, .{});
         const listeners = try gpa.alloc(ListenSlot, l.max_listeners);
         errdefer gpa.free(listeners);
         @memset(listeners, .{});
@@ -195,7 +200,7 @@ pub const Stack = struct {
             .clock = clock,
             .io = clock.io,
             .options = options,
-            .slots = slots,
+            .slot_ptrs = slots,
             .listeners = listeners,
             .inbound = inbound,
             .outbound = outbound,
@@ -218,8 +223,11 @@ pub const Stack = struct {
     pub fn destroy(s: *Stack) void {
         s.stop();
         const gpa = s.gpa;
-        for (s.slots) |*sl| sl.conn.freeBuffers(gpa);
-        gpa.free(s.slots);
+        for (s.live()) |sl| {
+            sl.conn.freeBuffers(gpa);
+            gpa.destroy(sl);
+        }
+        gpa.free(s.slot_ptrs);
         gpa.free(s.listeners);
         // Plaintext packets may sit in the rings: zero, not just free.
         std.crypto.secureZero(u8, s.inbound.ring.storage);
@@ -235,6 +243,11 @@ pub const Stack = struct {
         gpa.free(bufs);
         std.crypto.secureZero(u8, &s.isn_key);
         gpa.destroy(s);
+    }
+
+    /// The slots created so far (see slot_ptrs).
+    fn live(s: *Stack) []*Slot {
+        return s.slot_ptrs[0..s.n_slots];
     }
 
     pub fn tun(s: *Stack) wg_tun.Tun {
@@ -261,7 +274,7 @@ pub const Stack = struct {
     pub fn abortAll(s: *Stack) void {
         s.lock();
         defer s.unlock();
-        for (s.slots, 0..) |*sl, i| {
+        for (s.live(), 0..) |sl, i| {
             if (!sl.used) continue;
             const c = &sl.conn;
             if (c.state != .closed and c.state != .syn_sent) s.sendRst(c.local, c.remote, .{ .seq = c.snd_max, .ack = null });
@@ -546,7 +559,7 @@ pub const Stack = struct {
                 s.st.dropped_accept_backlog += 1;
                 return;
             }
-            const out = s.slots[i].conn.input(&e, seg);
+            const out = s.slot_ptrs[i].conn.input(&e, seg);
             s.afterOutcome(i, out);
             return;
         }
@@ -577,7 +590,7 @@ pub const Stack = struct {
                     s.st.dropped_syn_backlog += 1;
                     return;
                 };
-                const sl = &s.slots[i];
+                const sl = s.slot_ptrs[i];
                 sl.listener = li;
                 sl.passive = true;
                 sl.conn = .{ .local = local, .remote = remote };
@@ -589,7 +602,7 @@ pub const Stack = struct {
     }
 
     fn afterOutcome(s: *Stack, i: usize, out: tcp.Outcome) void {
-        const sl = &s.slots[i];
+        const sl = s.slot_ptrs[i];
         if (out.rst) |r| s.sendRst(sl.conn.local, sl.conn.remote, r);
         if (out.established) {
             if (sl.listener) |li| {
@@ -627,7 +640,7 @@ pub const Stack = struct {
     }
 
     fn maybeRelease(s: *Stack, i: usize) void {
-        const sl = &s.slots[i];
+        const sl = s.slot_ptrs[i];
         if (!sl.used or sl.conn.state != .closed or sl.handle_open) return;
         sl.conn.freeBuffers(s.gpa);
         sl.used = false;
@@ -665,10 +678,10 @@ pub const Stack = struct {
         return f +% m;
     }
 
-    // ---- table lookups (linear: max_connections is small) ---------------------
+    // ---- table lookups (linear over the slots that exist: a few hundred for a lab) ---
 
     fn findConn(s: *Stack, local: Endpoint, remote: Endpoint) ?usize {
-        for (s.slots, 0..) |*sl, i| {
+        for (s.live(), 0..) |sl, i| {
             if (!sl.used or sl.conn.state == .closed) continue;
             const c = &sl.conn;
             if (c.local.port == local.port and c.remote.port == remote.port and
@@ -684,7 +697,7 @@ pub const Stack = struct {
 
     fn countForListener(s: *Stack, li: u8) usize {
         var n: usize = 0;
-        for (s.slots) |*sl| if (sl.used and sl.listener == li) {
+        for (s.live()) |sl| if (sl.used and sl.listener == li) {
             n += 1;
         };
         return n;
@@ -692,7 +705,7 @@ pub const Stack = struct {
 
     fn countHalfOpen(s: *Stack, li: u8) usize {
         var n: usize = 0;
-        for (s.slots) |*sl| if (sl.used and sl.listener == li and sl.conn.state == .syn_received) {
+        for (s.live()) |sl| if (sl.used and sl.listener == li and sl.conn.state == .syn_received) {
             n += 1;
         };
         return n;
@@ -703,28 +716,30 @@ pub const Stack = struct {
     /// the connection stays SYN-RECEIVED (no buffers) and the SYN-ACK
     /// retransmission retries it.
     fn acceptQueueFull(s: *Stack, i: usize, seg: wire.Tcp) bool {
-        const sl = &s.slots[i];
+        const sl = s.slot_ptrs[i];
         const li = sl.listener orelse return false;
         if (sl.conn.state != .syn_received or !seg.flags.ack or seg.flags.rst or seg.flags.syn) return false;
         var n: usize = 0;
-        for (s.slots) |*o| if (o.used and o.queued and o.listener == li) {
+        for (s.live()) |o| if (o.used and o.queued and o.listener == li) {
             n += 1;
         };
         return n >= s.options.limits.accept_backlog;
     }
 
-    /// A free slot; when the table is full, the oldest TIME-WAIT slot the
-    /// host has released is reclaimed for it (TIME-WAIT churn must not
-    /// lock out new connections; both ends are ours, one hop away).
+    /// A free slot: a free one there is, else a new one (while the table
+    /// is under Limits.max_connections and memory allows), else the oldest
+    /// TIME-WAIT slot the host has released is reclaimed for it (TIME-WAIT
+    /// churn must not lock out new connections; both ends are ours, one
+    /// hop away).
     fn allocSlot(s: *Stack) ?usize {
-        const i = for (s.slots, 0..) |*sl, i| {
+        const i = for (s.live(), 0..) |sl, i| {
             if (!sl.used) break i;
-        } else blk: {
+        } else if (s.newSlot()) |i| i else blk: {
             const old = s.oldestReleasedTimeWait() orelse return null;
             s.evict(old);
             break :blk old;
         };
-        const sl = &s.slots[i];
+        const sl = s.slot_ptrs[i];
         std.debug.assert(!sl.used);
         sl.used = true;
         sl.gen +%= 1;
@@ -736,6 +751,17 @@ pub const Stack = struct {
         sl.born = s.alloc_counter;
         s.st.connections += 1;
         return i;
+    }
+
+    /// Creates the table's next slot (unused); null at the cap or out of
+    /// memory (the caller then falls back to reclaiming one).
+    fn newSlot(s: *Stack) ?usize {
+        if (s.n_slots == s.slot_ptrs.len) return null;
+        const sl = s.gpa.create(Slot) catch return null;
+        sl.* = .{};
+        s.slot_ptrs[s.n_slots] = sl;
+        s.n_slots += 1;
+        return s.n_slots - 1;
     }
 
     const SourceClass = enum {
@@ -758,7 +784,7 @@ pub const Stack = struct {
 
     fn countFromSource(s: *Stack, addr: Addr, class: SourceClass) usize {
         var n: usize = 0;
-        for (s.slots) |*sl| if (inClass(sl, class) and sl.conn.remote.addr.eql(addr)) {
+        for (s.live()) |sl| if (inClass(sl, class) and sl.conn.remote.addr.eql(addr)) {
             n += 1;
         };
         return n;
@@ -766,9 +792,9 @@ pub const Stack = struct {
 
     fn oldestFromSource(s: *Stack, addr: Addr, class: SourceClass) ?usize {
         var best: ?usize = null;
-        for (s.slots, 0..) |*sl, i| {
+        for (s.live(), 0..) |sl, i| {
             if (!inClass(sl, class) or !sl.conn.remote.addr.eql(addr)) continue;
-            if (best == null or sl.born < s.slots[best.?].born) best = i;
+            if (best == null or sl.born < s.slot_ptrs[best.?].born) best = i;
         }
         return best;
     }
@@ -776,9 +802,9 @@ pub const Stack = struct {
     /// Oldest TIME-WAIT slot (any direction) the host no longer holds.
     fn oldestReleasedTimeWait(s: *Stack) ?usize {
         var best: ?usize = null;
-        for (s.slots, 0..) |*sl, i| {
+        for (s.live(), 0..) |sl, i| {
             if (!sl.used or sl.handle_open or sl.conn.state != .time_wait) continue;
-            if (best == null or sl.born < s.slots[best.?].born) best = i;
+            if (best == null or sl.born < s.slot_ptrs[best.?].born) best = i;
         }
         return best;
     }
@@ -786,7 +812,7 @@ pub const Stack = struct {
     /// Frees a half-open slot (RST to the peer) or a released TIME-WAIT
     /// one (silently) to make room.
     fn evict(s: *Stack, i: usize) void {
-        const sl = &s.slots[i];
+        const sl = s.slot_ptrs[i];
         std.debug.assert(sl.used and !sl.handle_open);
         if (sl.conn.state == .syn_received) s.resetLocked(sl) else sl.conn.fail(error.ConnectionReset);
         sl.queued = false;
@@ -797,7 +823,7 @@ pub const Stack = struct {
     }
 
     fn portInUse(s: *Stack, port: u16) bool {
-        for (s.slots) |*sl| if (sl.used and sl.conn.local.port == port) return true;
+        for (s.live()) |sl| if (sl.used and sl.conn.local.port == port) return true;
         for (s.listeners) |*l| if (l.open and l.port == port) return true;
         return false;
     }
@@ -806,7 +832,7 @@ pub const Stack = struct {
 
     fn earliestDeadline(s: *Stack) ?i64 {
         var earliest: ?i64 = null;
-        for (s.slots) |*sl| {
+        for (s.live()) |sl| {
             if (!sl.used) continue;
             if (sl.conn.nextDeadline()) |d| earliest = if (earliest) |x| @min(x, d) else d;
         }
@@ -816,7 +842,7 @@ pub const Stack = struct {
     fn timersLocked(s: *Stack, now: i64) ?i64 {
         var e = s.env(now);
         var earliest: ?i64 = null;
-        for (s.slots, 0..) |*sl, i| {
+        for (s.live(), 0..) |sl, i| {
             if (!sl.used) continue;
             if (sl.conn.nextDeadline()) |d| if (d <= now) {
                 const out = sl.conn.onTimers(&e);
@@ -843,10 +869,10 @@ pub const Stack = struct {
         };
         for (passes) |pass| {
             if (pass.prio == .bulk and pass.class == .any and !bulk_ok) break;
-            const n = s.slots.len;
+            const n = s.n_slots;
             for (0..n) |k| {
                 const i = (s.rr + k) % n;
-                const sl = &s.slots[i];
+                const sl = s.slot_ptrs[i];
                 if (!sl.used or sl.conn.priority != pass.prio) continue;
                 const was_full = sl.handle_open and sl.conn.writeRoom(&s.options.limits) == 0;
                 s.ip_id +%= 1;
@@ -890,7 +916,7 @@ pub const Stack = struct {
         defer s.unlock();
         const port = s.pickPort() orelse return error.NoPortsAvailable;
         const i = s.allocSlot() orelse return error.TooManyConnections;
-        const sl = &s.slots[i];
+        const sl = s.slot_ptrs[i];
         const local: Endpoint = .{ .addr = local_addr, .port = port };
         sl.conn = .{ .local = local, .remote = to, .priority = priority };
         const now = s.clock.now();
@@ -946,12 +972,22 @@ pub const Stack = struct {
         return r;
     }
 
+    /// What the connections hold now (the rings and the slot pointer
+    /// table, fixed at create, not counted).
+    pub fn memory(s: *Stack) root.Memory {
+        s.lock();
+        defer s.unlock();
+        var m: root.Memory = .{ .slots = s.n_slots, .slot_bytes = s.n_slots * @sizeOf(Slot) };
+        for (s.live()) |sl| m.buffer_bytes += sl.conn.bufferBytes();
+        return m;
+    }
+
     // ---- handle validation ------------------------------------------------------
 
     fn slotOf(s: *Stack, id: u32) ?*Slot {
         const i: usize = id & 0xffff;
-        if (i >= s.slots.len) return null;
-        const sl = &s.slots[i];
+        if (i >= s.n_slots) return null;
+        const sl = s.slot_ptrs[i];
         if (!sl.used or !sl.handle_open or sl.gen != @as(u16, @truncate(id >> 16))) return null;
         return sl;
     }
@@ -1049,12 +1085,12 @@ pub const Listener = struct {
         _ = s.listenerOf(l.id) orelse return error.Closed;
         const li: u8 = @intCast(l.id & 0xffff);
         var best: ?usize = null;
-        for (s.slots, 0..) |*sl, i| {
+        for (s.live(), 0..) |sl, i| {
             if (!sl.used or !sl.queued or sl.listener != li) continue;
-            if (best == null or sl.accept_seq < s.slots[best.?].accept_seq) best = i;
+            if (best == null or sl.accept_seq < s.slot_ptrs[best.?].accept_seq) best = i;
         }
         const i = best orelse return error.WouldBlock;
-        const sl = &s.slots[i];
+        const sl = s.slot_ptrs[i];
         sl.queued = false;
         sl.listener = null;
         sl.handle_open = true;
@@ -1087,7 +1123,7 @@ pub const Listener = struct {
         ls.open = false;
         ls.gen +%= 1;
         ls.cond.broadcast(s.io);
-        for (s.slots, 0..) |*sl, i| {
+        for (s.live(), 0..) |sl, i| {
             if (!sl.used or sl.listener != li) continue;
             const c = &sl.conn;
             s.sendRst(c.local, c.remote, .{ .seq = c.snd_max, .ack = c.rcv_nxt });
@@ -1168,7 +1204,7 @@ pub const Stream = struct {
         }
         if (c.fin_queued) return error.BrokenPipe;
         if (data.len == 0) return 0;
-        const n = c.hostWrite(&s.options.limits, data);
+        const n = c.hostWrite(s.gpa, &s.options.limits, data);
         if (n == 0) return error.WouldBlock;
         s.kickThread();
         return n;

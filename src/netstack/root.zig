@@ -46,31 +46,57 @@ pub const Endpoint = struct {
     }
 };
 
-/// Hard bounds. Worst-case memory is about
-///   max_connections * (send_buffer + recv_buffer)       stream buffers
-/// + 2 * ring_packets * mtu                               the two rings
-/// + max_connections * fixed state (~8 KiB: @sizeOf(tcp.Conn), mostly RACK's 256-record ring)
-/// (64 * 512 KiB + 2 * 512 * 1420 = ~33.4 MiB with the defaults; buffers
-/// are allocated when a connection is established and freed when it ends,
-/// so an idle stack holds only the rings).
+/// Sized for a lab: one desk's stack serving `lab_devices` devices, each
+/// with up to `connections_per_device` connections at once (Portal: one
+/// interactive WebSocket, a bulk one while it syncs, and room for a
+/// reconnect overlapping a dying one; its desk caps a device at 4
+/// interactive + 2 bulk upgraded connections). An institution raising its
+/// device count raises `lab_devices` (and Portal's devices.max_devices).
+pub const lab_devices = 250;
+pub const connections_per_device = 8;
+
+/// Hard bounds. What a stack holds:
+///   2 * ring_packets * mtu                     the two rings, at create
+/// + per connection that exists: its slot (fixed state, ~8 KiB:
+///   @sizeOf(tcp.Conn), mostly RACK's 256-record ring), created the first
+///   time the table needs it and kept for reuse, never more than
+///   max_connections of them
+/// + per established connection: 2 * initial_buffer (16 KiB) while idle;
+///   a buffer grows (doubling) only while data needs it, up to
+///   send_buffer / recv_buffer, and the send buffer shrinks back once
+///   everything sent was acknowledged.
+/// So 250 idle devices with 2 connections each cost about 250 * 2 *
+/// (8 + 16) KiB = ~12 MiB, not the 2048 * 512 KiB = 1 GiB the caps allow.
+/// The worst case (every connection at both buffer caps at once) is still
+/// max_connections * (send_buffer + recv_buffer): network input never
+/// allocates beyond these bounds.
 pub const Limits = struct {
-    /// Connections in any state except LISTEN (half-open ones included).
-    max_connections: u16 = 64,
+    /// Connections in any state except LISTEN (half-open ones included):
+    /// lab_devices * connections_per_device, rounded up (2048). Slots are
+    /// created as needed, so the cap costs nothing until it is used.
+    max_connections: u16 = 2048,
     max_listeners: u8 = 8,
-    /// Per-connection send buffer: unacknowledged + not yet sent bytes.
+    /// Per-connection send buffer at most: unacknowledged + not yet sent
+    /// bytes. It starts at `initial_buffer` and doubles while a write
+    /// needs more.
     send_buffer: u32 = 256 * 1024,
-    /// Per-connection receive buffer: in order, not yet read by the host,
-    /// plus out-of-order data (the advertised window is what is left).
+    /// Per-connection receive buffer at most: in order, not yet read by
+    /// the host, plus out-of-order data (the advertised window is what is
+    /// left). It starts at `initial_buffer` and doubles when half full.
     recv_buffer: u32 = 256 * 1024,
+    /// Each buffer's first size (at most send_buffer / recv_buffer).
+    initial_buffer: u32 = 8 * 1024,
     /// Half-open (SYN-RECEIVED) connections per listener. A SYN beyond it
     /// is dropped (the peer retransmits). ISNs are a keyed hash (RFC 6528).
-    syn_backlog: u16 = 16,
+    /// Bounded, but enough for a lab's devices reconnecting together (a
+    /// desk restart: each device's first SYN at about the same time).
+    syn_backlog: u16 = 128,
     /// Established connections waiting for `accept`, per listener. While
     /// the queue is full, the final ACK of a handshake is dropped (Linux
     /// style): the connection stays SYN-RECEIVED without buffers, the
     /// SYN-ACK retransmissions give it another chance, and it is dropped
     /// after their limit.
-    accept_backlog: u16 = 16,
+    accept_backlog: u16 = 128,
     /// Half-open (SYN-RECEIVED) connections from one remote address, over
     /// all listeners. A SYN beyond it replaces that address's oldest
     /// half-open connection, so one peer cannot fill `syn_backlog` for
@@ -81,8 +107,8 @@ pub const Limits = struct {
     /// cap a SYN from that address takes the place of its oldest TIME-WAIT
     /// connection the application has let go of, or is dropped (counted in
     /// `Stats.dropped_source_limit`). Connections this side dials are not
-    /// counted.
-    max_connections_per_source: u16 = 16,
+    /// counted. One device's share: connections_per_device.
+    max_connections_per_source: u16 = connections_per_device,
     /// Out-of-order segments held per connection (each a byte range of
     /// the receive buffer; only the range bookkeeping is capped here).
     max_ooo_segments: u16 = 32,
@@ -186,6 +212,8 @@ pub const Stats = struct {
     /// Handshake-completing ACKs dropped because the accept queue was full.
     dropped_accept_backlog: u64 = 0,
     dropped_ooo: u64 = 0,
+    /// Receive buffers doubled because data filled half of one.
+    buffer_grows: u64 = 0,
     rst_sent: u64 = 0,
     retransmits: u64 = 0,
     fast_retransmits: u64 = 0,
@@ -211,6 +239,19 @@ pub const Stats = struct {
     /// ICMP and ICMPv6 echo replies sent.
     icmp_echo_replies: u64 = 0,
     connections: u16 = 0,
+};
+
+/// Stack.memory: what its connections hold.
+pub const Memory = struct {
+    /// Connection slots created so far (each kept for reuse).
+    slots: usize = 0,
+    slot_bytes: usize = 0,
+    /// Every connection's send and receive buffers now.
+    buffer_bytes: usize = 0,
+
+    pub fn total(m: Memory) usize {
+        return m.slot_bytes + m.buffer_bytes;
+    }
 };
 
 /// The stack. Heap-allocated; it must outlive every Stream and Listener

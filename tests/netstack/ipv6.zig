@@ -385,6 +385,6 @@ test "ipv6: mutation sweep (valid SYN / data, edited and re-checksummed): no pan
             try t.expect(ip.src.eql(hz.stack_addr6) or ip.src.eql(hz.stack_addr));
         }
         if (i % 1000 == 0) h.advance(r.uintAtMost(u64, 2 * sec));
-        try t.expect(h.stats().connections <= 64);
+        try t.expect(h.stats().connections <= h.cfg.limits.max_connections);
     }
 }

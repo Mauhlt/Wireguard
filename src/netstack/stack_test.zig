@@ -338,7 +338,7 @@ fn closeIntoZeroWindow(r: *Rig, last_ack: bool, orphan: bool, max_probes: usize)
     try t.expectEqual(@as(usize, 7), try e.st.write("blocked"));
     if (orphan) e.st.close() else e.st.shutdown();
     try r.expectSilent(); // zero window: no data, no FIN behind it
-    const conn = r.stack.slots[e.st.id & 0xffff].conn;
+    const conn = r.stack.slot_ptrs[e.st.id & 0xffff].conn;
     try t.expectEqual(if (last_ack) root.State.last_ack else root.State.fin_wait_1, conn.state);
     const t0 = r.clock.now();
     var end: ZeroWindowEnd = .{ .probes = 0, .rst = false, .freed = false, .elapsed = 0 };
@@ -820,7 +820,9 @@ fn bothWaysOver(f: Fam, seed: u64, loss_ppm: u32, reorder_ppm: u32, dup_ppm: u32
 
 test "both ends in go-back-N after a blackout still recover (pure ACKs at snd_max)" {
     var l: Link = undefined;
-    try l.init(99, 0, 0, .{});
+    // Full-size buffers from the start: both ends send all 8 segments at
+    // once (a small first window would hold them back).
+    try l.init(99, 0, 0, .{ .initial_buffer = 256 * 1024 });
     defer l.deinit();
     const lis = try l.b.listen(8420);
     const c = try l.a.dial(.{ .addr = peer_addr, .port = 8420 });
@@ -1872,4 +1874,155 @@ test "IPv6: a single-family stack refuses and ignores the other family" {
     r6.stack.input(icmpPacket(&r6.buf, peer_addr, stack_addr, wire.icmp_echo_request, "x"));
     try r6.expectSilent();
     try t.expectEqual(@as(u64, 2), r6.stack.stats().dropped_not_for_us);
+}
+
+// ---- a lab's desk: many sources, lazy slots and buffers -----------------------
+
+/// One passive connection from `addr`:`port` through the handshake, accepted.
+fn openFrom(r: *Rig, l: root.Listener, addr: root.Addr, port: u16) !root.Stream {
+    r.peer.peer = .{ .addr = addr, .port = port };
+    r.send(.{ .seq = 1000, .flags = .{ .syn = true }, .options = .{ .mss = 1380, .window_scale = 7 } });
+    const sa = try r.recv();
+    try t.expect(sa.flags.syn and sa.flags.ack);
+    r.send(.{ .seq = 1001, .ack = sa.seq +% 1, .flags = .{ .ack = true }, .window = 2048 });
+    return l.accept();
+}
+
+test "a lab: 250 devices with two connections each; a source past its cap is refused while the others connect; idle cost bounded" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    const devices = root.lab_devices;
+    // No connection yet: no slot, no buffer.
+    try t.expectEqual(@as(usize, 0), r.stack.memory().total());
+    var streams: std.ArrayList(root.Stream) = .empty;
+    defer {
+        for (streams.items) |st| st.close();
+        streams.deinit(t.allocator);
+    }
+    for (0..devices) |i| {
+        const addr = otherHost(peer_addr, @intCast(2 + i));
+        for (0..2) |k| try streams.append(t.allocator, try openFrom(&r, l, addr, @intCast(40000 + k)));
+    }
+    try t.expectEqual(@as(u16, 2 * devices), r.stack.stats().connections);
+    // Idle: a slot and the two first-size buffers per connection.
+    const m = r.stack.memory();
+    try t.expectEqual(@as(usize, 2 * devices), m.slots);
+    const per_conn = m.total() / (2 * devices);
+    std.debug.print("netstack: {d} idle connections hold {d} KiB ({d} bytes each: slot {d} + buffers {d}); per device (2 connections) {d} KiB\n", .{
+        2 * devices, m.total() / 1024, per_conn, m.slot_bytes / m.slots, m.buffer_bytes / m.slots, 2 * per_conn / 1024,
+    });
+    try t.expectEqual(@as(usize, 2 * devices * 2 * r.stack.options.limits.initial_buffer), m.buffer_bytes);
+    try t.expect(per_conn <= 32 * 1024);
+    // One device opens up to its cap: the next SYN from it is dropped,
+    // while another device still connects.
+    const busy = otherHost(peer_addr, 2);
+    for (2..root.connections_per_device) |k| try streams.append(t.allocator, try openFrom(&r, l, busy, @intCast(40000 + k)));
+    r.peer.peer = .{ .addr = busy, .port = 49000 };
+    r.send(.{ .seq = 1000, .flags = .{ .syn = true } });
+    try r.expectSilent();
+    try t.expectEqual(@as(u64, 1), r.stack.stats().dropped_source_limit);
+    try streams.append(t.allocator, try openFrom(&r, l, otherHost(peer_addr, 252), 40000));
+    // Closing them frees the buffers; the slots stay for reuse.
+    for (streams.items) |st| st.close();
+    streams.clearRetainingCapacity();
+    _ = r.stack.runTimers();
+    try t.expect(r.stack.memory().buffer_bytes <= r.stack.memory().slots * 2 * r.stack.options.limits.initial_buffer);
+}
+
+test "the table's total cap holds with many sources; its slots are created only as needed" {
+    var r: Rig = undefined;
+    try r.init(.{ .max_connections = 40, .syn_backlog_per_source = 1 });
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    var streams: std.ArrayList(root.Stream) = .empty;
+    defer {
+        for (streams.items) |st| st.close();
+        streams.deinit(t.allocator);
+    }
+    for (0..40) |i| try streams.append(t.allocator, try openFrom(&r, l, otherHost(peer_addr, @intCast(2 + i)), 40000));
+    try t.expectEqual(@as(usize, 40), r.stack.memory().slots);
+    // Full: a 41st source's SYN is dropped (nothing to reclaim).
+    r.peer.peer = .{ .addr = otherHost(peer_addr, 99), .port = 40000 };
+    r.send(.{ .seq = 1, .flags = .{ .syn = true } });
+    try r.expectSilent();
+    try t.expectEqual(@as(usize, 40), r.stack.memory().slots);
+    try t.expect(r.stack.stats().dropped_syn_backlog >= 1);
+}
+
+test "buffers start small, grow under a bulk transfer (data intact), and the send buffer shrinks back" {
+    var l: Link = undefined;
+    try l.init(7, 0, 0, .{});
+    defer l.deinit();
+    const lis = try l.b.listen(8420);
+    const c = try l.a.dial(.{ .addr = peer_addr, .port = 8420 });
+    _ = l.pump();
+    _ = l.pump();
+    const s = try lis.accept();
+    const first = l.a.options.limits.initial_buffer;
+    try t.expectEqual(@as(usize, 2 * first), c.debugConn().?.bufferBytes());
+    try t.expectEqual(@as(usize, 2 * first), s.debugConn().?.bufferBytes());
+    // 1 MiB one way: the sender's buffer and the receiver's window grow.
+    const total = 1024 * 1024;
+    const data = try t.allocator.alloc(u8, total);
+    defer t.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 31 +% (i >> 9));
+    const got = try t.allocator.alloc(u8, total);
+    defer t.allocator.free(got);
+    var sent: usize = 0;
+    var recvd: usize = 0;
+    var max_snd: usize = 0;
+    var max_rcv: usize = 0;
+    var guard: usize = 0;
+    while (recvd < total) : (guard += 1) {
+        if (guard > 100_000) return error.Stalled;
+        if (sent < total) sent += c.write(data[sent..]) catch |e| if (e == error.WouldBlock) 0 else return e;
+        max_snd = @max(max_snd, c.debugConn().?.snd.cap());
+        if (l.pump() == 0) {
+            if (l.a.runTimers()) |d| {
+                const now = l.clock.now();
+                if (d > now) l.clock.advance(d - now);
+                _ = l.a.runTimers();
+                _ = l.b.runTimers();
+            }
+        }
+        max_rcv = @max(max_rcv, s.debugConn().?.rcv.cap());
+        recvd += s.read(got[recvd..]) catch |e| if (e == error.WouldBlock) 0 else return e;
+    }
+    try t.expectEqualSlices(u8, data, got);
+    try t.expect(max_snd > first and max_snd <= l.a.options.limits.send_buffer);
+    try t.expect(max_rcv > first and max_rcv <= l.b.options.limits.recv_buffer);
+    try t.expect(l.b.stats().buffer_grows > 0);
+    // Everything acknowledged (a delayed ACK may still be due): the
+    // sender's buffer is back to its first size.
+    var waits: usize = 0;
+    while (c.debugConn().?.snd.len > 0) : (waits += 1) {
+        if (waits > 100) return error.Stalled;
+        if (l.pump() == 0) {
+            const d = l.b.runTimers() orelse l.a.runTimers() orelse return error.Stalled;
+            const now = l.clock.now();
+            if (d > now) l.clock.advance(d - now);
+            _ = l.a.runTimers();
+            _ = l.b.runTimers();
+        }
+    }
+    try t.expectEqual(@as(usize, first), c.debugConn().?.snd.cap());
+    c.close();
+    s.close();
+}
+
+test "a window offered in the SYN-ACK is the first buffer's: it never shrinks once the buffer exists" {
+    var r: Rig = undefined;
+    try r.init(.{});
+    defer r.deinit();
+    const l = try r.stack.listen(8420);
+    r.send(.{ .seq = 1000, .flags = .{ .syn = true }, .options = .{ .mss = 1380, .window_scale = 7 } });
+    const sa = try r.recv();
+    const first = r.stack.options.limits.initial_buffer;
+    try t.expectEqual(@as(u32, first), @as(u32, sa.window)); // a SYN-ACK's window is never scaled
+    r.send(.{ .seq = 1001, .ack = sa.seq +% 1, .flags = .{ .ack = true }, .window = 2048 });
+    const st = try l.accept();
+    defer st.close();
+    try t.expectEqual(@as(usize, first), st.debugConn().?.rcv.cap());
 }
