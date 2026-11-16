@@ -199,7 +199,7 @@ pub const Shared = struct {
         sl.result = null;
         sl.state.store(.busy, .release);
         _ = s.refs.fetchAdd(1, .acq_rel);
-        const t = std.Thread.spawn(.{ .stack_size = 256 << 10 }, work, .{ s, slot }) catch {
+        const t = std.Thread.spawn(.{ .stack_size = @import("../thread_stack.zig").threadStack(256 << 10) }, work, .{ s, slot }) catch {
             _ = s.refs.fetchSub(1, .acq_rel);
             sl.state.store(.idle, .release);
             return false;

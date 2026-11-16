@@ -130,7 +130,7 @@ pub const Server = struct {
     }
 
     pub fn start(s: *Server) std.Thread.SpawnError!void {
-        s.thread = try std.Thread.spawn(.{ .stack_size = 256 << 10 }, run, .{s});
+        s.thread = try std.Thread.spawn(.{ .stack_size = @import("../thread_stack.zig").threadStack(256 << 10) }, run, .{s});
     }
 
     pub fn deinit(s: *Server) void {

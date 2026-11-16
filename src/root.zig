@@ -12,4 +12,5 @@ pub const netstack = @import("netstack/root.zig");
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("fuzz.zig");
+    _ = @import("thread_stack.zig");
 }
